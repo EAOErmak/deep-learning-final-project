@@ -2,3 +2,12 @@ pynput==1.7.7
 demoparser2==0.41.3
 pandas==2.2.3
 pyarrow==20.0.0
+numpy==2.2.6
+scikit-learn==1.7.1
+torch==2.8.0
+matplotlib==3.10.5
+tqdm==4.67.1
+rich==14.1.0
+# Optional future RL stack:
+# gymnasium==1.2.0
+# stable-baselines3==2.7.0
