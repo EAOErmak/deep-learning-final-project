@@ -11,6 +11,7 @@ from feature_encoder import encode_state
 from game_state import GameState
 from gsi_server import GSIServer
 from input_controller import InputController
+from neural_runtime_agent import NeuralRuntimeAgent
 from runtime_agent import PipelineRuntimeAgent
 from state_reader import StateReader
 
@@ -22,17 +23,28 @@ def configure_logging() -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='CS2 AI sandbox runtime')
     parser.add_argument('--state-source', choices=['mock', 'gsi'], default='mock')
+    parser.add_argument('--agent-mode', choices=['auto', 'dummy', 'pipeline', 'neural-random'], default='auto')
     parser.add_argument('--gsi-port', type=int, default=3000)
     parser.add_argument('--hz', type=float, default=10.0)
+    parser.add_argument('--seed', type=int, default=42)
     return parser.parse_args()
 
 
-def build_agent(state_source: str) -> Any:
-    if state_source == 'gsi':
-        logging.info('Using PipelineRuntimeAgent for live GSI sandbox mode.')
+def build_agent(state_source: str, agent_mode: str, seed: int) -> Any:
+    resolved_mode = agent_mode
+    if agent_mode == 'auto':
+        resolved_mode = 'pipeline' if state_source == 'gsi' else 'dummy'
+
+    if resolved_mode == 'dummy':
+        logging.info('Using DummyAgent fallback.')
+        return DummyAgent()
+    if resolved_mode == 'pipeline':
+        logging.info('Using PipelineRuntimeAgent for live/runtime sandbox mode.')
         return PipelineRuntimeAgent()
-    logging.info('Using DummyAgent fallback for mock mode.')
-    return DummyAgent()
+    if resolved_mode == 'neural-random':
+        logging.info('Using NeuralRuntimeAgent with random untrained PyTorch weights.')
+        return NeuralRuntimeAgent(seed=seed)
+    raise ValueError(f'Unsupported agent mode: {agent_mode}')
 
 
 def main() -> int:
@@ -55,10 +67,15 @@ def main() -> int:
         gsi_server.start()
 
     state_reader = StateReader(mode=args.state_source, gsi_server=gsi_server)
-    agent = build_agent(args.state_source)
+    agent = build_agent(args.state_source, args.agent_mode, args.seed)
     input_controller = InputController()
 
-    logging.info('CS2 AI sandbox started | state_source=%s | hz=%.2f', args.state_source, args.hz)
+    logging.info(
+        'CS2 AI sandbox started | state_source=%s | agent_mode=%s | hz=%.2f',
+        args.state_source,
+        args.agent_mode,
+        args.hz,
+    )
 
     try:
         while running:

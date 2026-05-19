@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from pprint import pprint
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from feature_encoder import encode_state
 from gsi_state_reader import GSIStateReader
@@ -17,8 +22,7 @@ class _StaticServer:
 
 
 def main() -> int:
-    project_root = Path(__file__).resolve().parents[1]
-    payload_path = project_root / 'latest_gsi_payload.json'
+    payload_path = PROJECT_ROOT / 'latest_gsi_payload.json'
     if not payload_path.exists():
         print(f'latest_gsi_payload.json not found: {payload_path}')
         print('Run `python main.py --state-source gsi --gsi-port 3000` once, then rerun this script.')
@@ -57,6 +61,15 @@ def main() -> int:
 
     print('Encoded features')
     pprint(encode_state(game_state))
+    print()
+
+    if 'position' not in player_block:
+        print('Warning: player.position missing in payload.')
+    if 'forward' not in player_block:
+        print('Warning: player.forward missing in payload.')
+    if not isinstance(allplayers_block, dict) or not allplayers_block:
+        print('Warning: allplayers missing in payload.')
+        print('This usually means regular player GSI, not observer/GOTV-style full-state GSI.')
     return 0
 
 
