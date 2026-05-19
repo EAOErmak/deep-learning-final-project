@@ -6,6 +6,24 @@ from typing import Any
 from game_state import GameState, PlayerState
 
 
+ZERO_FEATURES: dict[str, float | int | bool] = {
+    'self_x': 0.0,
+    'self_y': 0.0,
+    'self_z': 0.0,
+    'self_hp': 0,
+    'self_money': 0,
+    'ammo': 0,
+    'yaw': 0.0,
+    'pitch': 0.0,
+    'enemy_visible': 0,
+    'enemy_rel_x': 0.0,
+    'enemy_rel_y': 0.0,
+    'enemy_rel_z': 0.0,
+    'enemy_hp': 0,
+    'enemy_distance': 0.0,
+}
+
+
 def encode_state(raw_state: dict[str, Any] | GameState) -> dict[str, float | int | bool]:
     if isinstance(raw_state, GameState):
         return _encode_gsi_state(raw_state)
@@ -39,56 +57,45 @@ def _encode_mock_state(raw_state: dict[str, Any]) -> dict[str, float | int | boo
 
 def _encode_gsi_state(game_state: GameState) -> dict[str, float | int | bool]:
     controlled = game_state.controlled_player
-    if controlled is None or controlled.position is None:
-        return {
-            'self_x': 0.0,
-            'self_y': 0.0,
-            'self_z': 0.0,
-            'self_hp': 0,
-            'self_money': 0,
-            'ammo': 0,
-            'yaw': 0.0,
-            'pitch': 0.0,
-            'enemy_visible': 0,
-            'enemy_rel_x': 0.0,
-            'enemy_rel_y': 0.0,
-            'enemy_rel_z': 0.0,
-            'enemy_hp': 0,
-            'enemy_distance': 0.0,
-        }
+    if controlled is None:
+        return dict(ZERO_FEATURES)
 
-    enemies = [player for player in game_state.players if _is_enemy(controlled, player) and player.position is not None and player.is_alive]
-    nearest_enemy = min(enemies, key=lambda player: _distance(controlled, player), default=None)
-
-    if nearest_enemy is None or nearest_enemy.position is None:
-        enemy_visible = 0
-        enemy_rel_x = enemy_rel_y = enemy_rel_z = 0.0
-        enemy_hp = 0
-        enemy_distance = 0.0
-    else:
-        enemy_visible = 1
-        enemy_rel_x = nearest_enemy.position.x - controlled.position.x
-        enemy_rel_y = nearest_enemy.position.y - controlled.position.y
-        enemy_rel_z = nearest_enemy.position.z - controlled.position.z
-        enemy_hp = int(nearest_enemy.health or 0)
-        enemy_distance = math.sqrt(enemy_rel_x ** 2 + enemy_rel_y ** 2 + enemy_rel_z ** 2)
-
-    return {
-        'self_x': float(controlled.position.x),
-        'self_y': float(controlled.position.y),
-        'self_z': float(controlled.position.z),
+    position = controlled.position
+    features: dict[str, float | int | bool] = {
+        'self_x': float(position.x) if position is not None else 0.0,
+        'self_y': float(position.y) if position is not None else 0.0,
+        'self_z': float(position.z) if position is not None else 0.0,
         'self_hp': int(controlled.health or 0),
         'self_money': int(controlled.money or 0),
         'ammo': int(controlled.ammo or 0),
         'yaw': 0.0,
         'pitch': 0.0,
-        'enemy_visible': enemy_visible,
-        'enemy_rel_x': enemy_rel_x,
-        'enemy_rel_y': enemy_rel_y,
-        'enemy_rel_z': enemy_rel_z,
-        'enemy_hp': enemy_hp,
-        'enemy_distance': enemy_distance,
+        'enemy_visible': 0,
+        'enemy_rel_x': 0.0,
+        'enemy_rel_y': 0.0,
+        'enemy_rel_z': 0.0,
+        'enemy_hp': 0,
+        'enemy_distance': 0.0,
     }
+    if position is None:
+        return features
+
+    enemies = [player for player in game_state.players if _is_enemy(controlled, player) and player.position is not None and player.is_alive]
+    nearest_enemy = min(enemies, key=lambda player: _distance(controlled, player), default=None)
+
+    if nearest_enemy is None or nearest_enemy.position is None:
+        return features
+
+    enemy_rel_x = nearest_enemy.position.x - position.x
+    enemy_rel_y = nearest_enemy.position.y - position.y
+    enemy_rel_z = nearest_enemy.position.z - position.z
+    features['enemy_visible'] = 1
+    features['enemy_rel_x'] = enemy_rel_x
+    features['enemy_rel_y'] = enemy_rel_y
+    features['enemy_rel_z'] = enemy_rel_z
+    features['enemy_hp'] = int(nearest_enemy.health or 0)
+    features['enemy_distance'] = math.sqrt(enemy_rel_x ** 2 + enemy_rel_y ** 2 + enemy_rel_z ** 2)
+    return features
 
 
 def _is_enemy(controlled: PlayerState, candidate: PlayerState) -> bool:

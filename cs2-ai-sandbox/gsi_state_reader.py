@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from game_state import GameState, PlayerState, Vector3
@@ -36,6 +37,7 @@ class GSIStateReader:
         match_stats = player_block.get('match_stats', {}) if isinstance(player_block.get('match_stats'), dict) else {}
         weapons = player_block.get('weapons', {}) if isinstance(player_block.get('weapons'), dict) else {}
         active_weapon_name, active_ammo = self._extract_weapon_data(weapons)
+        money_value = state_block.get('money') if state_block.get('money') is not None else match_stats.get('money')
         return PlayerState(
             id=str(player_id),
             name=name,
@@ -44,7 +46,7 @@ class GSIStateReader:
             forward=self._parse_vector(player_block.get('forward')),
             health=self._safe_int(state_block.get('health')),
             armor=self._safe_int(state_block.get('armor')),
-            money=self._safe_int(match_stats.get('money')),
+            money=self._safe_int(money_value),
             weapon=active_weapon_name,
             ammo=active_ammo,
             is_alive=self._parse_is_alive(state_block.get('health')),
@@ -62,6 +64,7 @@ class GSIStateReader:
             match_stats = player_block.get('match_stats', {}) if isinstance(player_block.get('match_stats'), dict) else {}
             weapons = player_block.get('weapons', {}) if isinstance(player_block.get('weapons'), dict) else {}
             active_weapon_name, active_ammo = self._extract_weapon_data(weapons)
+            money_value = state_block.get('money') if state_block.get('money') is not None else match_stats.get('money')
             players.append(
                 PlayerState(
                     id=str(player_block.get('steamid') or player_id),
@@ -71,7 +74,7 @@ class GSIStateReader:
                     forward=self._parse_vector(player_block.get('forward')),
                     health=self._safe_int(state_block.get('health')),
                     armor=self._safe_int(state_block.get('armor')),
-                    money=self._safe_int(match_stats.get('money')),
+                    money=self._safe_int(money_value),
                     weapon=active_weapon_name,
                     ammo=active_ammo,
                     is_alive=self._parse_is_alive(state_block.get('health')),
@@ -100,11 +103,11 @@ class GSIStateReader:
         if value is None:
             return None
         if isinstance(value, str):
-            parts = [part.strip() for part in value.split(',')]
-            if len(parts) != 3:
+            numbers = re.findall(r'-?\d+(?:\.\d+)?', value)
+            if len(numbers) < 3:
                 return None
             try:
-                return Vector3(float(parts[0]), float(parts[1]), float(parts[2]))
+                return Vector3(float(numbers[0]), float(numbers[1]), float(numbers[2]))
             except ValueError:
                 return None
         if isinstance(value, dict):
