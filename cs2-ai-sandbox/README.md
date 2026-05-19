@@ -1,4 +1,4 @@
-# CS2 AI Sandbox
+﻿# CS2 AI Sandbox
 
 Локальный research/playground проект для экспериментов с AI-агентами в Counter-Strike 2 без reverse engineering, memory reading, cheats, VAC bypass и online automation.
 
@@ -16,7 +16,7 @@
 ## Ограничения и назначение
 
 - Проект предназначен только для локального sandbox-использования.
-- Используйте его на пустой карте, с ботами, или в оффлайн-сессии.
+- Используйте его на пустой карте, с ботами или в оффлайн-сессии.
 - Проект не предназначен для online matchmaking.
 - В проекте нет memory reading, reverse engineering или обхода защит.
 
@@ -31,6 +31,13 @@ cs2-ai-sandbox/
     feature_encoder.py
     requirements.txt
     README.md
+    demos/
+    dataset/
+        parsed_demos.json
+        raw_ticks/
+        events/
+    scripts/
+        parse_one_demo.py
 ```
 
 ## Установка
@@ -48,7 +55,7 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## Запуск
+## Запуск sandbox loop
 
 ```powershell
 cd cs2-ai-sandbox
@@ -65,6 +72,30 @@ python main.py
 Loop работает примерно 10 раз в секунду и пишет в консоль:
 - текущие features
 - текущее action
+
+## Подготовка датасета из demo
+
+Скрипт `scripts/parse_one_demo.py` делает один шаг пайплайна:
+- ищет `.dem` в `demos/`
+- выбирает первую demo, которой нет в `dataset/parsed_demos.json`
+- парсит tick-level данные через `demoparser2`
+- парсит базовые events
+- сохраняет parquet-файлы в `dataset/raw_ticks/` и `dataset/events/`
+- обновляет registry только после успешного сохранения
+
+Запуск:
+
+```powershell
+cd cs2-ai-sandbox
+python scripts/parse_one_demo.py
+```
+
+Результат:
+- `dataset/raw_ticks/<demo_name>_ticks.parquet`
+- `dataset/events/<demo_name>_<event_name>.parquet`
+- `dataset/parsed_demos.json`
+
+Повторный запуск не парсит ту же demo второй раз, если она уже добавлена в registry.
 
 ## Как тестировать локально в CS2
 
