@@ -15,11 +15,26 @@ class NeuralRuntimeAgent:
         'self_x',
         'self_y',
         'self_z',
+        'self_vel_x',
+        'self_vel_y',
+        'self_vel_z',
         'self_hp',
+        'self_armor',
         'self_money',
+        'self_alive',
         'ammo',
+        'ammo_reserve',
         'yaw',
         'pitch',
+        'team_is_ct',
+        'round_live',
+        'round_freeze',
+        'round_warmup',
+        'bomb_planted',
+        'visible_players_count',
+        'available_players_count',
+        'has_spatial_state',
+        'has_enemy_context',
         'enemy_visible',
         'enemy_rel_x',
         'enemy_rel_y',
@@ -41,7 +56,7 @@ class NeuralRuntimeAgent:
         self.logger = logging.getLogger(__name__)
         self.model = DecisionDQN(input_dim=len(self.FEATURE_ORDER), action_dim=10).to(self.device)
         self.model.eval()
-        self.logger.info('NeuralRuntimeAgent initialized | device=%s | seed=%s', self.device, seed)
+        self.logger.info('NeuralRuntimeAgent initialized | device=%s | seed=%s | input_dim=%s', self.device, seed, len(self.FEATURE_ORDER))
 
     def predict(self, features: dict[str, float | int | bool]) -> ActionDict:
         return self._predict_from_features(features)

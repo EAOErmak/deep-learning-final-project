@@ -17,15 +17,25 @@ def main() -> int:
     server = GSIServer()
     payload = {
         'provider': {'name': 'Counter-Strike 2', 'timestamp': 123.0},
+        'map': {
+            'name': 'de_dust2',
+            'mode': 'competitive',
+            'phase': 'live',
+            'round': 3,
+            'team_ct': {'score': 2, 'consecutive_round_losses': 1},
+            'team_t': {'score': 0, 'consecutive_round_losses': 2},
+        },
+        'round': {'phase': 'live', 'bomb': 'planted'},
+        'phase_countdowns': {'phase_ends_in': 22.5},
         'player': {
             'steamid': '111',
             'name': 'observer',
             'team': 'CT',
             'position': '10, 20, 30',
             'forward': '1, 0, 0',
-            'state': {'health': 100, 'armor': 50},
+            'state': {'health': 100, 'armor': 50, 'money': 4300, 'helmet': True},
             'match_stats': {'money': 4200},
-            'weapons': {'weapon_0': {'name': 'M4A1-S', 'state': 'active', 'ammo_clip': 25}},
+            'weapons': {'weapon_0': {'name': 'M4A1-S', 'state': 'active', 'ammo_clip': 25, 'ammo_reserve': 60}},
         },
     }
     server._store.set_payload(payload)
@@ -36,6 +46,13 @@ def main() -> int:
     assert state.controlled_player.position.x == 10.0
     assert state.controlled_player.position.y == 20.0
     assert state.controlled_player.position.z == 30.0
+    assert state.controlled_player.money == 4300
+    assert state.controlled_player.ammo_reserve == 60
+    assert state.map_state.name == 'de_dust2'
+    assert state.round_state.phase == 'live'
+    assert state.round_state.bomb_state == 'planted'
+    assert state.capabilities.has_player_position is True
+    assert state.capabilities.has_spatial_state is True
     assert state.players
     empty_enemy_state = GameState(
         provider='test',
@@ -48,6 +65,7 @@ def main() -> int:
     assert features['enemy_visible'] == 0
     assert features['enemy_rel_x'] == 0
     assert features['enemy_distance'] == 0
+    assert features['has_spatial_state'] == 0
     print('test_parse_gsi_payload.py OK')
     return 0
 

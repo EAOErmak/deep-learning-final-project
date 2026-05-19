@@ -260,3 +260,44 @@ connect 127.0.0.1:27015
 python main.py --state-source mock
 python main.py --state-source gsi --gsi-port 3000 --hz 10
 ```
+
+## Live runtime contract
+
+For local GSI sandbox runtime the Python side now forwards all live fields that are realistically available from the official GSI payload into internal `GameState`.
+
+Current live state includes when available:
+- controlled player: position, forward, velocity estimate, hp, armor, money, weapon, ammo, ammo reserve, helmet, flashed/smoked/burning, activity
+- map state: map name, mode, phase, round number, CT/T score, losing streaks
+- round state: phase, bomb state, phase countdown
+- players: `allplayers` when the observer/GOTV scenario provides them
+- capability flags: whether position, forward, allplayers, enemy context and spatial state are actually present
+
+Important limitation:
+- regular player GSI may still omit `player.position`, `player.forward` and `allplayers`
+- in that case the runtime remains functional, but AI will see capability flags that spatial/enemy context is unavailable
+- for richer live sandbox context prefer observer / spectator / GOTV-style setups
+
+## Input safety guard
+
+By default, live input is now sent only when the current foreground window title looks like CS2.
+
+Default keywords:
+- `counter-strike`
+- `cs2`
+
+Practical effect:
+- if you `Alt+Tab` away from CS2 to the terminal or another app, the sandbox releases held keys and stops sending new input
+- this makes `Ctrl+C` and manual interruption much safer
+
+Examples:
+
+```powershell
+python main.py --state-source gsi --agent-mode neural-random
+python main.py --state-source gsi --agent-mode neural-random --window-keyword "Counter-Strike 2"
+```
+
+If you really want the old behavior, you can disable the guard explicitly:
+
+```powershell
+python main.py --state-source gsi --disable-window-guard
+```

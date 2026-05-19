@@ -27,6 +27,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--gsi-port', type=int, default=3000)
     parser.add_argument('--hz', type=float, default=10.0)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--disable-window-guard', action='store_true')
+    parser.add_argument('--window-keyword', action='append', default=None)
     return parser.parse_args()
 
 
@@ -68,13 +70,19 @@ def main() -> int:
 
     state_reader = StateReader(mode=args.state_source, gsi_server=gsi_server)
     agent = build_agent(args.state_source, args.agent_mode, args.seed)
-    input_controller = InputController()
+    window_keywords = tuple(args.window_keyword) if args.window_keyword else ('counter-strike', 'cs2')
+    input_controller = InputController(
+        window_guard_enabled=not args.disable_window_guard,
+        allowed_window_keywords=window_keywords,
+    )
 
     logging.info(
-        'CS2 AI sandbox started | state_source=%s | agent_mode=%s | hz=%.2f',
+        'CS2 AI sandbox started | state_source=%s | agent_mode=%s | hz=%.2f | window_guard=%s | window_keywords=%s',
         args.state_source,
         args.agent_mode,
         args.hz,
+        not args.disable_window_guard,
+        window_keywords,
     )
 
     try:

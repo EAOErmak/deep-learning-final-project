@@ -4,35 +4,32 @@
     "appid": 730,
     "version": 14162,
     "steamid": "76561198864890105",
-    "timestamp": 1779230792
+    "timestamp": 1779232482
   },
   "map": {
     "mode": "competitive",
     "name": "de_dust2",
-    "phase": "live",
-    "round": 10,
+    "phase": "warmup",
+    "round": 0,
     "team_ct": {
-      "score": 9,
-      "consecutive_round_losses": 0,
+      "score": 0,
+      "consecutive_round_losses": 1,
       "timeouts_remaining": 1,
       "matches_won_this_series": 0
     },
     "team_t": {
-      "score": 1,
-      "consecutive_round_losses": 8,
+      "score": 0,
+      "consecutive_round_losses": 1,
       "timeouts_remaining": 1,
       "matches_won_this_series": 0
     },
     "num_matches_to_win_series": 0
   },
-  "round": {
-    "phase": "live"
-  },
   "player": {
     "steamid": "76561198864890105",
     "name": "BATYA",
-    "observer_slot": 1,
-    "team": "T",
+    "observer_slot": 0,
+    "team": "CT",
     "activity": "playing",
     "state": {
       "health": 100,
@@ -48,31 +45,29 @@
     },
     "weapons": {
       "weapon_0": {
-        "name": "weapon_knife_t",
+        "name": "weapon_knife",
         "paintkit": "default",
         "type": "Knife",
         "state": "holstered"
       },
       "weapon_1": {
-        "name": "weapon_glock",
-        "paintkit": "cu_glock_indigo",
-        "type": "Pistol",
-        "ammo_clip": 20,
-        "ammo_clip_max": 20,
-        "ammo_reserve": 3,
-        "state": "holstered"
-      },
-      "weapon_2": {
-        "name": "weapon_c4",
+        "name": "weapon_usp_silencer",
         "paintkit": "default",
-        "type": "C4",
+        "type": "Pistol",
+        "ammo_clip": 11,
+        "ammo_clip_max": 12,
+        "ammo_reserve": 0,
         "state": "active"
       }
     }
   },
   "previously": {
-    "round": {
-      "phase": "freezetime"
+    "player": {
+      "weapons": {
+        "weapon_1": {
+          "ammo_clip": 12
+        }
+      }
     }
   }
 }

@@ -45,6 +45,14 @@ def main() -> int:
     print(f'  allplayers count: {len(allplayers_block)}')
     print()
 
+    print('Map state')
+    pprint(game_state.map_state)
+    print('Round state')
+    pprint(game_state.round_state)
+    print('Capabilities')
+    pprint(game_state.capabilities)
+    print()
+
     print('Controlled player parsed')
     pprint(game_state.controlled_player)
     print()
@@ -54,8 +62,8 @@ def main() -> int:
     for player in game_state.players[:10]:
         print(
             f'  id={player.id} name={player.name} team={player.team} '
-            f'pos={player.position} hp={player.health} money={player.money} '
-            f'weapon={player.weapon} ammo={player.ammo} alive={player.is_alive}'
+            f'pos={player.position} vel={player.velocity} hp={player.health} money={player.money} '
+            f'weapon={player.weapon} ammo={player.ammo}/{player.ammo_reserve} alive={player.is_alive}'
         )
     print()
 

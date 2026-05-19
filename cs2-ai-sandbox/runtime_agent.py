@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict
 from typing import Any
 
+from cs2_ai.config import weapon_to_id
 from cs2_ai.pipeline.offline_ai_pipeline import OfflineAIPipeline
 from cs2_ai.schemas.game_state import BombState as AIBombState
 from cs2_ai.schemas.game_state import GameState as AIGameState
@@ -11,7 +11,6 @@ from cs2_ai.schemas.game_state import PlayerInputState as AIPlayerInputState
 from cs2_ai.schemas.game_state import PlayerState as AIPlayerState
 from cs2_ai.schemas.game_state import RoundState as AIRoundState
 from cs2_ai.schemas.module_outputs import ActionPlan
-from cs2_ai.config import weapon_to_id
 from game_state import GameState, PlayerState
 
 ActionDict = dict[str, Any]
@@ -48,23 +47,22 @@ class PipelineRuntimeAgent:
             else:
                 enemies.append(ai_player)
 
-        round_block = game_state.raw.get('round', {}) if isinstance(game_state.raw.get('round'), dict) else {}
-        phase = str(round_block.get('phase', '')).lower()
+        phase = (game_state.round_state.phase or game_state.map_state.phase or '').lower()
         round_state = AIRoundState(
             tick=int(game_state.timestamp * 64) if game_state.timestamp else 0,
-            round_number=0,
+            round_number=int(game_state.map_state.round_number or 0),
             round_start_time=0.0,
             round_in_progress=phase in {'live', 'over', 'bomb'} or phase == '',
-            is_freeze_period=phase in {'freezetime', 'freeze'} or str(game_state.raw.get('phase_countdowns', {}).get('phase', '')).lower() in {'freezetime', 'freeze'},
+            is_freeze_period=phase in {'freezetime', 'freeze'},
             is_warmup_period=phase == 'warmup',
             game_phase=0,
             round_win_status=0,
             round_win_reason=0,
-            ct_losing_streak=0,
-            t_losing_streak=0,
+            ct_losing_streak=int(game_state.map_state.ct_consecutive_round_losses or 0),
+            t_losing_streak=int(game_state.map_state.t_consecutive_round_losses or 0),
         )
         bomb_state = AIBombState(
-            is_bomb_planted=str(round_block.get('bomb', '')).lower() == 'planted',
+            is_bomb_planted=(game_state.round_state.bomb_state or '').lower() == 'planted',
             is_bomb_dropped=False,
             bomb_position=None,
         )
@@ -98,22 +96,23 @@ class PipelineRuntimeAgent:
         team_num = self._team_to_num(player.team)
         position = [player.position.x, player.position.y, player.position.z] if player.position is not None else [0.0, 0.0, 0.0]
         forward = [player.forward.x, player.forward.y, player.forward.z] if player.forward is not None else [0.0, 0.0, 0.0]
+        velocity = [player.velocity.x, player.velocity.y, player.velocity.z] if player.velocity is not None else [0.0, 0.0, 0.0]
         return AIPlayerState(
             steamid=self._safe_steamid(player.id),
             name=player.name or 'unknown',
             team_num=team_num,
             position=position,
-            velocity=[0.0, 0.0, 0.0],
+            velocity=velocity,
             health=float(player.health or 0),
             armor=float(player.armor or 0),
-            has_helmet=False,
+            has_helmet=bool(player.helmet),
             is_alive=bool(player.is_alive),
             money=float(player.money or 0),
             weapon=player.weapon or 'none',
             weapon_id=weapon_to_id(player.weapon),
             ammo=float(player.ammo or 0),
-            total_ammo=float(player.ammo or 0),
-            pitch=0.0,
+            total_ammo=float((player.ammo or 0) + (player.ammo_reserve or 0)),
+            pitch=self._approximate_pitch(forward),
             yaw=self._approximate_yaw(forward),
             is_scoped=False,
             is_walking=False,
@@ -121,7 +120,7 @@ class PipelineRuntimeAgent:
             duck_amount=0.0,
             ducking=False,
             shots_fired=0,
-            flash_duration=0.0,
+            flash_duration=float(player.flashed or 0),
             spotted=True,
             last_place_name='unknown',
             in_bomb_zone=False,
@@ -186,3 +185,11 @@ class PipelineRuntimeAgent:
             return 0.0
         import math
         return math.degrees(math.atan2(y, x))
+
+    def _approximate_pitch(self, forward: list[float]) -> float:
+        x, y, z = forward
+        import math
+        horizontal = math.sqrt(x * x + y * y)
+        if horizontal == 0.0 and z == 0.0:
+            return 0.0
+        return math.degrees(math.atan2(z, horizontal))
