@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 from cs2_ai.ml.models.decision_dqn import DecisionDQN
@@ -43,7 +44,7 @@ class NeuralRuntimeAgent:
         'enemy_distance',
     ]
 
-    def __init__(self, seed: int = 42, mouse_scale: float = 18.0) -> None:
+    def __init__(self, seed: int = 42, mouse_scale: float = 18.0, checkpoint_path: str | None = None) -> None:
         if not torch_available():
             raise RuntimeError('PyTorch is not available. Install torch to use NeuralRuntimeAgent.')
 
@@ -56,7 +57,22 @@ class NeuralRuntimeAgent:
         self.logger = logging.getLogger(__name__)
         self.model = DecisionDQN(input_dim=len(self.FEATURE_ORDER), action_dim=10).to(self.device)
         self.model.eval()
-        self.logger.info('NeuralRuntimeAgent initialized | device=%s | seed=%s | input_dim=%s', self.device, seed, len(self.FEATURE_ORDER))
+        if checkpoint_path:
+            self.load_checkpoint(checkpoint_path)
+            self.logger.info('NeuralRuntimeAgent initialized | device=%s | checkpoint=%s | input_dim=%s', self.device, checkpoint_path, len(self.FEATURE_ORDER))
+        else:
+            self.logger.info('NeuralRuntimeAgent initialized | device=%s | seed=%s | input_dim=%s', self.device, seed, len(self.FEATURE_ORDER))
+
+    def load_checkpoint(self, checkpoint_path: str) -> None:
+        checkpoint_file = Path(checkpoint_path)
+        if not checkpoint_file.exists():
+            raise FileNotFoundError(f'Checkpoint not found: {checkpoint_file}')
+        checkpoint = self.torch.load(checkpoint_file, map_location=self.device)
+        state_dict = checkpoint.get('model_state_dict') if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint else checkpoint
+        if not isinstance(state_dict, dict):
+            raise ValueError(f'Unsupported checkpoint format: {checkpoint_file}')
+        self.model.load_state_dict(state_dict)
+        self.model.eval()
 
     def predict(self, features: dict[str, float | int | bool]) -> ActionDict:
         return self._predict_from_features(features)

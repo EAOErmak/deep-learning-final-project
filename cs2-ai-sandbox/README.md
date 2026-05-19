@@ -301,3 +301,26 @@ If you really want the old behavior, you can disable the guard explicitly:
 ```powershell
 python main.py --state-source gsi --disable-window-guard
 ```
+
+## Live runtime readiness
+
+The live sandbox runtime now supports explicit readiness levels for GSI-based play:
+- `basic`: controlled player exists and activity is `playing`
+- `spatial`: additionally requires `player.position` and `player.forward`
+- `observer`: additionally requires `allplayers`
+
+Examples:
+
+```powershell
+python main.py --state-source gsi --agent-mode pipeline --min-live-readiness basic
+python main.py --state-source gsi --agent-mode neural-random --min-live-readiness spatial
+python main.py --state-source gsi --agent-mode neural-checkpoint --checkpoint checkpoints\model.pt --min-live-readiness observer
+```
+
+One-shot readiness diagnostic:
+
+```powershell
+python scripts/check_live_runtime_ready.py
+```
+
+If the current GSI payload is not ready enough, the runtime now releases held inputs and waits instead of sending blind actions.

@@ -13,7 +13,7 @@ class MovementFeatureExtractor:
         return np.asarray([self._state_to_vector(state, decision, belief_state) for state in sequence.states], dtype=np.float32)
 
     def feature_dim(self) -> int:
-        return 29
+        return 28
 
     def _state_to_vector(self, state, decision: DecisionOutput | None, belief_state: BeliefStateData | None) -> list[float]:
         self_player = state.self_player

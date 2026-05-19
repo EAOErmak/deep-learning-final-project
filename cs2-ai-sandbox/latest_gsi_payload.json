@@ -4,12 +4,12 @@
     "appid": 730,
     "version": 14162,
     "steamid": "76561198864890105",
-    "timestamp": 1779232482
+    "timestamp": 1779233946
   },
   "map": {
     "mode": "competitive",
     "name": "de_dust2",
-    "phase": "warmup",
+    "phase": "live",
     "round": 0,
     "team_ct": {
       "score": 0,
@@ -25,6 +25,9 @@
     },
     "num_matches_to_win_series": 0
   },
+  "round": {
+    "phase": "live"
+  },
   "player": {
     "steamid": "76561198864890105",
     "name": "BATYA",
@@ -38,10 +41,17 @@
       "flashed": 0,
       "smoked": 0,
       "burning": 0,
-      "money": 16000,
+      "money": 800,
       "round_kills": 0,
       "round_killhs": 0,
       "equip_value": 200
+    },
+    "match_stats": {
+      "kills": 0,
+      "assists": 0,
+      "deaths": 0,
+      "mvps": 0,
+      "score": 0
     },
     "weapons": {
       "weapon_0": {
@@ -54,19 +64,10 @@
         "name": "weapon_usp_silencer",
         "paintkit": "default",
         "type": "Pistol",
-        "ammo_clip": 11,
+        "ammo_clip": 12,
         "ammo_clip_max": 12,
-        "ammo_reserve": 0,
+        "ammo_reserve": 2,
         "state": "active"
-      }
-    }
-  },
-  "previously": {
-    "player": {
-      "weapons": {
-        "weapon_1": {
-          "ammo_clip": 12
-        }
       }
     }
   }
