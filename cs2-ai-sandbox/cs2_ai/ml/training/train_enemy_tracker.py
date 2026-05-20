@@ -38,6 +38,15 @@ class TrackerTrainingBatch:
     demo_names: list[str]
 
 
+def get_base_dataset_and_index(dataset: Any, idx: int) -> tuple[Any, int]:
+    curr_dataset = dataset
+    curr_idx = idx
+    while hasattr(curr_dataset, 'dataset') and hasattr(curr_dataset, 'indices'):
+        curr_idx = curr_dataset.indices[curr_idx]
+        curr_dataset = curr_dataset.dataset
+    return curr_dataset, curr_idx
+
+
 class EnemyTrackerSequenceTorchDataset(Dataset):
     def __init__(self, base_dataset):
         self.base_dataset = base_dataset
@@ -47,12 +56,14 @@ class EnemyTrackerSequenceTorchDataset(Dataset):
         return len(self.base_dataset)
 
     def get_sample_metadata(self, idx: int) -> dict[str, object]:
-        return self.base_dataset.get_sample_metadata(idx)
+        ds, real_idx = get_base_dataset_and_index(self.base_dataset, idx)
+        return ds.get_sample_metadata(real_idx)
 
     def __getitem__(self, idx: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, str]]:
         sequence_sample = self.base_dataset[idx]
         features = self.feature_extractor.extract(sequence_sample.sequence)
-        sample_metadata = self.base_dataset.get_sample_metadata(idx)
+        ds, real_idx = get_base_dataset_and_index(self.base_dataset, idx)
+        sample_metadata = ds.get_sample_metadata(real_idx)
         tick_indices = list(sample_metadata['tick_indices'])
         target_tick = int(sample_metadata['target_tick'])
         target_ticks = tick_indices[1:] + [target_tick]
@@ -60,7 +71,7 @@ class EnemyTrackerSequenceTorchDataset(Dataset):
         target_positions = np.zeros((len(target_ticks), MAX_ENEMIES, 3), dtype=np.float32)
         target_confidences = np.zeros((len(target_ticks), MAX_ENEMIES), dtype=np.float32)
         for t_idx, tick in enumerate(target_ticks):
-            target_state = self.base_dataset.build_state_for_sample_tick(sample_metadata, tick)
+            target_state = ds.build_state_for_sample_tick(sample_metadata, tick)
             target_positions[t_idx] = build_enemy_position_target(target_state)
             for enemy_idx, enemy in enumerate(target_state.enemies[:MAX_ENEMIES]):
                 if enemy.is_alive:
