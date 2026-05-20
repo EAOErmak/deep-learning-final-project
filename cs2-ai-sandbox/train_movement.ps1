@@ -1,4 +1,5 @@
 param (
+    [string]$DatasetDir = "dataset",
     [int]$Epochs = 10,
     [int]$BatchSize = 64,
     [int]$SeqLen = 64,
@@ -14,9 +15,11 @@ param (
 )
 
 Write-Host "Training movement model..." -ForegroundColor Cyan
+Write-Host "DatasetDir=$DatasetDir Epochs=$Epochs BatchSize=$BatchSize SeqLen=$SeqLen Stride=$Stride SplitMode=$SplitMode" -ForegroundColor DarkGray
 
 $args = @(
     "cs2_ai/ml/training/train_movement.py",
+    "--dataset-dir", $DatasetDir,
     "--epochs", $Epochs,
     "--batch-size", $BatchSize,
     "--seq-len", $SeqLen,

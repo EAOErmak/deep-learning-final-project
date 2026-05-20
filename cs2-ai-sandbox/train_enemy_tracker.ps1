@@ -1,4 +1,5 @@
 param (
+    [string]$DatasetDir = "dataset",
     [int]$Epochs = 10,
     [int]$BatchSize = 64,
     [int]$SeqLen = 16,
@@ -13,9 +14,11 @@ param (
 )
 
 Write-Host "Training enemy tracker model..." -ForegroundColor Cyan
+Write-Host "DatasetDir=$DatasetDir Epochs=$Epochs BatchSize=$BatchSize SeqLen=$SeqLen Stride=$Stride SplitMode=$SplitMode" -ForegroundColor DarkGray
 
 $args = @(
     "cs2_ai/ml/training/train_enemy_tracker.py",
+    "--dataset-dir", $DatasetDir,
     "--epochs", $Epochs,
     "--batch-size", $BatchSize,
     "--seq-len", $SeqLen,

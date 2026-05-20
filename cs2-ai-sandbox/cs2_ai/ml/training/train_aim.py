@@ -544,6 +544,7 @@ def main() -> int:
     best_val_loss = math.inf
     try:
         for epoch in range(1, args.epochs + 1):
+            print(f'Starting epoch {epoch}/{args.epochs}...')
             train_metrics = trainer.train_epoch(train_loader, epoch=epoch, writer=writer)
             val_metrics = trainer.eval_epoch(val_loader, epoch=epoch, writer=writer) if len(val_dataset) > 0 else {'loss': train_metrics['loss'], 'aim_loss': train_metrics['aim_loss'], 'shoot_bce': train_metrics['shoot_bce'], 'rightclick_bce': train_metrics['rightclick_bce'], 'active_aim_loss': train_metrics['active_aim_loss'], 'active_aim_rate': train_metrics['active_aim_rate'], 'seen_sample_ids': set(), 'per_demo_loss': {}, 'per_demo_seen_counts': {}}
             print(f'Epoch {epoch}/{args.epochs} | train_loss={train_metrics["loss"]:.4f} (aim={train_metrics["aim_loss"]:.4f}, shoot_bce={train_metrics["shoot_bce"]:.4f}, rightclick_bce={train_metrics["rightclick_bce"]:.4f}) | val_loss={val_metrics["loss"]:.4f} (aim={val_metrics["aim_loss"]:.4f}, shoot_bce={val_metrics["shoot_bce"]:.4f}, rightclick_bce={val_metrics["rightclick_bce"]:.4f})')

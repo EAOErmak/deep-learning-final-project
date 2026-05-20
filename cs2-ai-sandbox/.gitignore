@@ -1,4 +1,4 @@
-dataset/
+dataset*/
 demos/
 .cache/
 __pycache__/

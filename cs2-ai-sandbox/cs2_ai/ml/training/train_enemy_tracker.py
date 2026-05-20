@@ -355,6 +355,7 @@ def main() -> int:
     best_val_loss = math.inf
     try:
         for epoch in range(1, args.epochs + 1):
+            print(f'Starting epoch {epoch}/{args.epochs}...')
             train_metrics = trainer.train_epoch(train_loader, epoch=epoch, writer=writer)
             val_metrics = trainer.eval_epoch(val_loader, epoch=epoch, writer=writer) if len(val_dataset) > 0 else {'loss': train_metrics['loss'], 'pos_loss': train_metrics['pos_loss'], 'conf_loss': train_metrics['conf_loss'], 'seen_sample_ids': set(), 'per_demo_loss': {}, 'per_demo_seen_counts': {}}
             print(f'Epoch {epoch}/{args.epochs} | train_loss={train_metrics["loss"]:.4f} (pos={train_metrics["pos_loss"]:.4f}, conf={train_metrics["conf_loss"]:.4f}) | val_loss={val_metrics["loss"]:.4f} (pos={val_metrics["pos_loss"]:.4f}, conf={val_metrics["conf_loss"]:.4f})')
