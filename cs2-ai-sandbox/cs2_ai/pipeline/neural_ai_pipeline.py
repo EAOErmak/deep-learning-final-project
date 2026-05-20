@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import logging
+
 from cs2_ai.modules.action_coordinator import ActionCoordinator
 from cs2_ai.modules.buy import RuleBasedBuyModule
 from cs2_ai.modules.decision_maker import RuleBasedDecisionMaker
 from cs2_ai.modules.input_controller import DryRunInputController
 from cs2_ai.schemas.game_state import GameState, GameStateSequence
-from cs2_ai.schemas.module_outputs import AimShootOutput, EnemyPrediction, EnemyTrackerOutput, MovementOutput
+from cs2_ai.schemas.module_outputs import ActionPlan, AimShootOutput, EnemyPrediction, EnemyTrackerOutput, MovementOutput
 from cs2_ai.state.belief_state import BeliefState
 from cs2_ai.state.memory import TickMemory
 from cs2_ai.features.enemy_tracker_features import EnemyTrackerFeatureExtractor
@@ -16,23 +18,45 @@ from cs2_ai.ml.utils.torch_utils import torch_available
 if torch_available():
     import torch
 
+
 class NeuralAIPipeline:
-    def __init__(self, aim_model, movement_model, tracker_model, memory_len: int = 16, device: str = 'cpu'):
+    def __init__(
+        self,
+        aim_model,
+        movement_model,
+        tracker_model,
+        memory_len: int = 16,
+        device: str = 'cpu',
+        *,
+        seq_lens: dict[str, int] | None = None,
+        strict_readiness: bool = True,
+    ):
         self.aim_model = aim_model
         self.movement_model = movement_model
         self.tracker_model = tracker_model
         self.device = device
+        self.logger = logging.getLogger(__name__)
+        shared_seq_len = int(memory_len)
+        self.seq_lens = {
+            'aim': int((seq_lens or {}).get('aim', shared_seq_len)),
+            'movement': int((seq_lens or {}).get('movement', shared_seq_len)),
+            'tracker': int((seq_lens or {}).get('tracker', shared_seq_len)),
+        }
+        self.strict_readiness = strict_readiness
 
-        self.memory = TickMemory(max_len=memory_len)
+        self.memories = {
+            name: TickMemory(max_len=seq_len)
+            for name, seq_len in self.seq_lens.items()
+        }
         self.belief_state = BeliefState()
         self.decision_maker = RuleBasedDecisionMaker()
         self.buy_module = RuleBasedBuyModule()
         self.coordinator = ActionCoordinator()
         self.input_controller = DryRunInputController()
         
-        self.tracker_extractor = EnemyTrackerFeatureExtractor(seq_len=memory_len)
-        self.movement_extractor = MovementFeatureExtractor(seq_len=memory_len)
-        self.aim_extractor = AimFeatureExtractor(seq_len=memory_len)
+        self.tracker_extractor = EnemyTrackerFeatureExtractor(seq_len=self.seq_lens['tracker'])
+        self.movement_extractor = MovementFeatureExtractor(seq_len=self.seq_lens['movement'])
+        self.aim_extractor = AimFeatureExtractor(seq_len=self.seq_lens['aim'])
         
         self.last_enemy_tracker_output = None
         self.last_belief_state = None
@@ -41,13 +65,62 @@ class NeuralAIPipeline:
         self.last_aim_output = None
         self.last_buy_output = None
         self.last_action_plan = None
+        self._last_readiness_signature: tuple[tuple[str, int, int], ...] | None = None
+        self._full_ready_logged = False
+
+    def get_module_readiness(self) -> dict[str, dict[str, int | bool]]:
+        readiness: dict[str, dict[str, int | bool]] = {}
+        for name, seq_len in self.seq_lens.items():
+            current_len = len(self.memories[name].get_sequence())
+            readiness[name] = {
+                'ready': current_len >= seq_len,
+                'current': current_len,
+                'required': seq_len,
+            }
+        return readiness
+
+    def is_ready(self) -> bool:
+        readiness = self.get_module_readiness()
+        return all(bool(status['ready']) for status in readiness.values())
+
+    def _log_readiness(self) -> None:
+        readiness = self.get_module_readiness()
+        signature = tuple(
+            (name, int(status['current']), int(status['required']))
+            for name, status in sorted(readiness.items())
+        )
+        if signature != self._last_readiness_signature:
+            self._last_readiness_signature = signature
+            summary = ', '.join(
+                f'{name}={int(status["current"])}/{int(status["required"])} ready={bool(status["ready"])}'
+                for name, status in sorted(readiness.items())
+            )
+            self.logger.info('Neural pipeline module readiness | %s', summary)
+        if self.is_ready() and not self._full_ready_logged:
+            self._full_ready_logged = True
+            self.logger.info('Neural pipeline fully ready | seq_lens=%s', self.seq_lens)
+
+    def _push_game_state(self, game_state: GameState) -> None:
+        for memory in self.memories.values():
+            memory.push(game_state)
+
+    def _build_sequence(self, module_name: str, game_state: GameState) -> GameStateSequence:
+        states = self.memories[module_name].get_sequence()
+        return GameStateSequence(perspective_steamid=game_state.perspective_steamid, states=states)
+
+    def _empty_action_plan(self) -> ActionPlan:
+        return ActionPlan(keyboard_inputs=[], mouse_inputs=[], duration_ms=100)
 
     def step(self, game_state: GameState, vision_target=None):
-        self.memory.push(game_state)
-        sequence = GameStateSequence(perspective_steamid=game_state.perspective_steamid, states=self.memory.get_sequence())
+        self._push_game_state(game_state)
+        self._log_readiness()
+        if self.strict_readiness and not self.is_ready():
+            self.last_action_plan = self._empty_action_plan()
+            return self.last_action_plan
         
         # 1. Enemy Tracker
-        tracker_features = torch.tensor(self.tracker_extractor.extract(sequence), dtype=torch.float32, device=self.device).unsqueeze(0)
+        tracker_sequence = self._build_sequence('tracker', game_state)
+        tracker_features = torch.tensor(self.tracker_extractor.extract(tracker_sequence), dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
             positions, confidences = self.tracker_model(tracker_features)
             # positions is [B, SeqLen, Enemies, 3], we only need the last timestep for live inference
@@ -75,7 +148,8 @@ class NeuralAIPipeline:
         self.last_decision_output = self.decision_maker.decide(game_state, self.last_belief_state)
         
         # 4. Movement
-        movement_features = torch.tensor(self.movement_extractor.extract(sequence), dtype=torch.float32, device=self.device).unsqueeze(0)
+        movement_sequence = self._build_sequence('movement', game_state)
+        movement_features = torch.tensor(self.movement_extractor.extract(movement_sequence), dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
             movement_logits = self.movement_model(movement_features)
             # movement_logits is [1, SeqLen, 6], we only need the last timestep
@@ -106,7 +180,8 @@ class NeuralAIPipeline:
         )
         
         # 5. Aim Shoot
-        aim_features = torch.tensor(self.aim_extractor.extract(sequence), dtype=torch.float32, device=self.device).unsqueeze(0)
+        aim_sequence = self._build_sequence('aim', game_state)
+        aim_features = torch.tensor(self.aim_extractor.extract(aim_sequence), dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
             aim_delta, shoot_logits, rightclick_logits = self.aim_model(aim_features)
             

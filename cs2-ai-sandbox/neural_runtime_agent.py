@@ -165,12 +165,15 @@ class FullNeuralRuntimeAgent:
             'tracker': self._load_checkpoint(Path(tracker_checkpoint), expected_model_type='enemy_tracker_lstm'),
         }
         seq_lens = {name: int(checkpoint['feature_schema']['seq_len']) for name, checkpoint in checkpoints.items()}
-        if len(set(seq_lens.values())) != 1:
-            raise ValueError(f'Checkpoint seq_len mismatch across neural pipeline modules: {seq_lens}')
-        shared_seq_len = next(iter(seq_lens.values()))
-        self.aim_extractor = AimFeatureExtractor(seq_len=shared_seq_len)
-        self.movement_extractor = MovementFeatureExtractor(seq_len=shared_seq_len)
-        self.tracker_extractor = EnemyTrackerFeatureExtractor(seq_len=shared_seq_len)
+        self.logger.info(
+            'Loaded neural pipeline seq_len metadata | aim=%s movement=%s tracker=%s',
+            seq_lens['aim'],
+            seq_lens['movement'],
+            seq_lens['tracker'],
+        )
+        self.aim_extractor = AimFeatureExtractor(seq_len=seq_lens['aim'])
+        self.movement_extractor = MovementFeatureExtractor(seq_len=seq_lens['movement'])
+        self.tracker_extractor = EnemyTrackerFeatureExtractor(seq_len=seq_lens['tracker'])
         validate_checkpoint_schema(checkpoints['aim'], self.aim_extractor.schema(), str(aim_checkpoint))
         validate_checkpoint_schema(checkpoints['movement'], self.movement_extractor.schema(), str(movement_checkpoint))
         validate_checkpoint_schema(checkpoints['tracker'], self.tracker_extractor.schema(), str(tracker_checkpoint))
@@ -186,7 +189,15 @@ class FullNeuralRuntimeAgent:
         self.movement_model.eval()
         self.tracker_model.eval()
 
-        self.pipeline = NeuralAIPipeline(self.aim_model, self.movement_model, self.tracker_model, memory_len=shared_seq_len, device=self.device)
+        self.pipeline = NeuralAIPipeline(
+            self.aim_model,
+            self.movement_model,
+            self.tracker_model,
+            memory_len=max(seq_lens.values()),
+            seq_lens=seq_lens,
+            device=self.device,
+            strict_readiness=True,
+        )
         self.runtime_adapter = None
         
         if yolo_weights and Path(yolo_weights).exists():
@@ -196,7 +207,7 @@ class FullNeuralRuntimeAgent:
         else:
             self.vision_module = None
             
-        self.logger.info('FullNeuralRuntimeAgent initialized.')
+        self.logger.info('FullNeuralRuntimeAgent initialized | seq_lens=%s', seq_lens)
 
     def _load_checkpoint(self, checkpoint_path: Path, expected_model_type: str) -> dict[str, Any]:
         if not checkpoint_path.exists():

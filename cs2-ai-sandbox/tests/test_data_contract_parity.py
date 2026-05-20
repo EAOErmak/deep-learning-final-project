@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+import shutil
 import unittest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +15,8 @@ from cs2_ai.features.aim_features import AIM_FEATURE_NAMES, AimFeatureExtractor
 from cs2_ai.features.enemy_tracker_features import TRACKER_FEATURE_NAMES, EnemyTrackerFeatureExtractor, build_enemy_confidence_target, build_enemy_position_target, build_enemy_roster
 from cs2_ai.features.feature_contract import validate_checkpoint_schema
 from cs2_ai.features.movement_features import MOVEMENT_FEATURE_NAMES, MovementFeatureExtractor
+from cs2_ai.ml.utils.torch_utils import torch_available
+from cs2_ai.pipeline.neural_ai_pipeline import NeuralAIPipeline
 from cs2_ai.schemas.game_state import GameStateSequence, VisibilityStatus
 from cs2_ai.state.game_state_builder import GameStateBuilder
 from neural_runtime_agent import FullNeuralRuntimeAgent
@@ -233,6 +236,136 @@ class DataContractParityTests(unittest.TestCase):
     def test_checkpoint_safety_fast_fail(self):
         with self.assertRaises(ValueError):
             FullNeuralRuntimeAgent(aim_checkpoint=None, movement_checkpoint=None, tracker_checkpoint=None)
+
+    def test_full_neural_runtime_agent_allows_mixed_seq_len_checkpoints(self):
+        if not torch_available():
+            self.skipTest("PyTorch not available")
+
+        import torch
+        from cs2_ai.config import MAX_ENEMIES
+        from cs2_ai.ml.models.aim_attention import AimAttentionModel
+        from cs2_ai.ml.models.decision_dqn import DecisionDQN
+        from cs2_ai.ml.models.enemy_tracker_lstm import EnemyTrackerLSTM
+
+        aim_extractor = AimFeatureExtractor(seq_len=16)
+        movement_extractor = MovementFeatureExtractor(seq_len=64)
+        tracker_extractor = EnemyTrackerFeatureExtractor(seq_len=16)
+
+        tmp_path = PROJECT_ROOT / ".cache" / "test_mixed_seq_len_checkpoints"
+        shutil.rmtree(tmp_path, ignore_errors=True)
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        try:
+            aim_path = tmp_path / "aim.pt"
+            movement_path = tmp_path / "movement.pt"
+            tracker_path = tmp_path / "tracker.pt"
+
+            torch.save(
+                {
+                    "model_type": "aim_attention",
+                    "feature_schema": aim_extractor.schema().to_metadata(),
+                    "model_state_dict": AimAttentionModel(input_dim=aim_extractor.feature_dim()).state_dict(),
+                },
+                aim_path,
+            )
+            torch.save(
+                {
+                    "model_type": "decision_dqn_movement",
+                    "feature_schema": movement_extractor.schema().to_metadata(),
+                    "model_state_dict": DecisionDQN(input_dim=movement_extractor.feature_dim(), action_dim=6).state_dict(),
+                },
+                movement_path,
+            )
+            torch.save(
+                {
+                    "model_type": "enemy_tracker_lstm",
+                    "feature_schema": tracker_extractor.schema().to_metadata(),
+                    "model_state_dict": EnemyTrackerLSTM(input_dim=tracker_extractor.feature_dim(), output_enemies=MAX_ENEMIES).state_dict(),
+                },
+                tracker_path,
+            )
+
+            agent = FullNeuralRuntimeAgent(
+                aim_checkpoint=str(aim_path),
+                movement_checkpoint=str(movement_path),
+                tracker_checkpoint=str(tracker_path),
+            )
+            self.assertEqual(agent.pipeline.seq_lens["aim"], 16)
+            self.assertEqual(agent.pipeline.seq_lens["movement"], 64)
+            self.assertEqual(agent.pipeline.seq_lens["tracker"], 16)
+        finally:
+            shutil.rmtree(tmp_path, ignore_errors=True)
+
+    def test_neural_pipeline_uses_module_specific_sequence_lengths(self):
+        if not torch_available():
+            self.skipTest("PyTorch not available")
+
+        import torch
+
+        class DummyTrackerModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.last_input_shape = None
+
+            def forward(self, x):
+                self.last_input_shape = tuple(x.shape)
+                batch, seq_len, _ = x.shape
+                return torch.zeros((batch, seq_len, 5, 3), dtype=x.dtype, device=x.device), torch.zeros((batch, seq_len, 5), dtype=x.dtype, device=x.device)
+
+        class DummyMovementModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.last_input_shape = None
+
+            def forward(self, x):
+                self.last_input_shape = tuple(x.shape)
+                batch, seq_len, _ = x.shape
+                return torch.zeros((batch, seq_len, 6), dtype=x.dtype, device=x.device)
+
+        class DummyAimModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.last_input_shape = None
+
+            def forward(self, x):
+                self.last_input_shape = tuple(x.shape)
+                batch = x.shape[0]
+                return (
+                    torch.zeros((batch, 2), dtype=x.dtype, device=x.device),
+                    torch.zeros((batch, 1), dtype=x.dtype, device=x.device),
+                    torch.zeros((batch, 1), dtype=x.dtype, device=x.device),
+                )
+
+        builder = GameStateBuilder()
+        states = [
+            builder.build_from_tick_rows(make_tick_rows(visible_enemy=True, tick=100 + idx), perspective_steamid=1)
+            for idx in range(4)
+        ]
+
+        tracker_model = DummyTrackerModel()
+        movement_model = DummyMovementModel()
+        aim_model = DummyAimModel()
+        pipeline = NeuralAIPipeline(
+            aim_model=aim_model,
+            movement_model=movement_model,
+            tracker_model=tracker_model,
+            memory_len=64,
+            seq_lens={"aim": 2, "movement": 4, "tracker": 2},
+            device="cpu",
+            strict_readiness=True,
+        )
+
+        for state in states[:3]:
+            action_plan = pipeline.step(state)
+            self.assertEqual(action_plan.keyboard_inputs, [])
+            self.assertEqual(action_plan.mouse_inputs, [])
+            self.assertFalse(pipeline.is_ready())
+
+        action_plan = pipeline.step(states[3])
+        self.assertTrue(pipeline.is_ready())
+        self.assertEqual(tracker_model.last_input_shape[:2], (1, 2))
+        self.assertEqual(movement_model.last_input_shape[:2], (1, 4))
+        self.assertEqual(aim_model.last_input_shape[:2], (1, 2))
+        self.assertGreaterEqual(action_plan.duration_ms, 0)
 
 
 if __name__ == "__main__":
