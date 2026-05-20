@@ -27,9 +27,8 @@ if torch_available():
 
         def forward(self, x):
             output, _ = self.lstm(x)
-            last_hidden = output[:, -1, :]
-            positions = self.position_head(last_hidden).view(-1, self.output_enemies, 3)
-            confidence = self.confidence_head(last_hidden)
+            positions = self.position_head(output).view(output.size(0), output.size(1), self.output_enemies, 3)
+            confidence = self.confidence_head(output)
             return positions, confidence
 else:
     class EnemyTrackerLSTM:

@@ -4,7 +4,7 @@
     "appid": 730,
     "version": 14162,
     "steamid": "76561198864890105",
-    "timestamp": 1779233946
+    "timestamp": 1779237028
   },
   "map": {
     "mode": "competitive",
@@ -69,6 +69,11 @@
         "ammo_reserve": 2,
         "state": "active"
       }
+    }
+  },
+  "previously": {
+    "round": {
+      "phase": "freezetime"
     }
   }
 }

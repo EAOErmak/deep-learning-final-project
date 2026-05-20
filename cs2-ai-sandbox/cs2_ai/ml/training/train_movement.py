@@ -73,12 +73,18 @@ class MovementSequenceTorchDataset(Dataset):
         sample_index = self.base_dataset.samples[idx]
         round_number = int(sample_index['round_number'])
         perspective_steamid = int(sample_index['perspective_steamid'])
+        tick_indices = list(sample_index['tick_indices'])
         target_tick = int(sample_index['target_tick'])
-        target_state = self.base_dataset.game_state_builder.build_from_tick_rows(
-            self.base_dataset.round_tick_rows[round_number][target_tick],
-            perspective_steamid,
-        )
-        target = build_movement_target(target_state)
+        target_ticks = tick_indices[1:] + [target_tick]
+        
+        target = np.zeros((len(target_ticks), 8), dtype=np.float32)
+        for t_idx, tick in enumerate(target_ticks):
+            target_state = self.base_dataset.game_state_builder.build_from_tick_rows(
+                self.base_dataset.round_tick_rows[round_number][tick],
+                perspective_steamid,
+            )
+            target[t_idx] = build_movement_target(target_state)
+            
         return features.astype(np.float32), target.astype(np.float32)
 
 
@@ -133,10 +139,10 @@ class MovementTrainer:
         for batch_idx, batch in enumerate(iterator, start=1):
             batch = self._to_training_batch(batch)
             logits = self.model(batch.features)
-            binary_logits = logits[:, :6]
-            move_logits = logits[:, 6:8]
-            binary_targets = batch.targets[:, :6]
-            move_targets = batch.targets[:, 6:8]
+            binary_logits = logits[..., :6]
+            move_logits = logits[..., 6:8]
+            binary_targets = batch.targets[..., :6]
+            move_targets = batch.targets[..., 6:8]
 
             binary_loss = F.binary_cross_entropy_with_logits(binary_logits, binary_targets)
             move_loss = F.mse_loss(torch.tanh(move_logits), move_targets)

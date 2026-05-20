@@ -50,8 +50,9 @@ class NeuralAIPipeline:
         tracker_features = torch.tensor(self.tracker_extractor.extract(sequence), dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
             positions, confidences = self.tracker_model(tracker_features)
-            positions = positions.squeeze(0).cpu().numpy()
-            confidences = torch.sigmoid(confidences).squeeze(0).cpu().numpy()
+            # positions is [B, SeqLen, Enemies, 3], we only need the last timestep for live inference
+            positions = positions[:, -1, :, :].squeeze(0).cpu().numpy()
+            confidences = torch.sigmoid(confidences[:, -1, :]).squeeze(0).cpu().numpy()
             
         predictions = []
         for i in range(len(confidences)):
@@ -75,7 +76,9 @@ class NeuralAIPipeline:
         # 4. Movement
         movement_features = torch.tensor(self.movement_extractor.extract(sequence, self.last_decision_output, self.last_belief_state), dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
-            movement_logits = self.movement_model(movement_features).squeeze(0)
+            movement_logits = self.movement_model(movement_features)
+            # movement_logits is [1, SeqLen, 8], we only need the last timestep
+            movement_logits = movement_logits[:, -1, :].squeeze(0)
             
         binary_probs = torch.sigmoid(movement_logits[:6])
         move_values = torch.tanh(movement_logits[6:8]) * 450.0 # Denormalize 450 max speed

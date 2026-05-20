@@ -19,8 +19,6 @@ if torch_available():
             )
 
         def forward(self, x):
-            if x.dim() == 3:
-                x = x.mean(dim=1)
             return self.net(x)
 else:
     class DecisionDQN:

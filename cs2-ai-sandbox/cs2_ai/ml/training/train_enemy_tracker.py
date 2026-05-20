@@ -60,21 +60,25 @@ class EnemyTrackerSequenceTorchDataset(Dataset):
         sample_index = self.base_dataset.samples[idx]
         round_number = int(sample_index['round_number'])
         perspective_steamid = int(sample_index['perspective_steamid'])
+        tick_indices = list(sample_index['tick_indices'])
         target_tick = int(sample_index['target_tick'])
         
-        target_state = self.base_dataset.game_state_builder.build_from_tick_rows(
-            self.base_dataset.round_tick_rows[round_number][target_tick],
-            perspective_steamid,
-        )
-
-        target_positions = build_enemy_position_target(target_state)
+        target_ticks = tick_indices[1:] + [target_tick]
         
-        target_confidences = np.zeros(MAX_ENEMIES, dtype=np.float32)
-        for i, enemy in enumerate(target_state.enemies[:MAX_ENEMIES]):
-            if enemy.is_alive:
-                target_confidences[i] = 1.0
+        target_positions = np.zeros((len(target_ticks), MAX_ENEMIES, 3), dtype=np.float32)
+        target_confidences = np.zeros((len(target_ticks), MAX_ENEMIES), dtype=np.float32)
+        
+        for t_idx, tick in enumerate(target_ticks):
+            target_state = self.base_dataset.game_state_builder.build_from_tick_rows(
+                self.base_dataset.round_tick_rows[round_number][tick],
+                perspective_steamid,
+            )
+            target_positions[t_idx] = build_enemy_position_target(target_state)
+            for i, enemy in enumerate(target_state.enemies[:MAX_ENEMIES]):
+                if enemy.is_alive:
+                    target_confidences[t_idx, i] = 1.0
 
-        return features.astype(np.float32), target_positions.astype(np.float32), target_confidences
+        return features.astype(np.float32), target_positions, target_confidences
 
 class EnemyTrackerTrainer:
     def __init__(self, model: "torch.nn.Module", device: str, learning_rate: float, log_interval: int = 100):
