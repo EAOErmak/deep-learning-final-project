@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+from project_cache import configure_project_pycache
+
+configure_project_pycache(Path(__file__).resolve().parent)
+
 import argparse
 import logging
 import signal

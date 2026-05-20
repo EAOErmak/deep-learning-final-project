@@ -3,6 +3,15 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_pycache_dir = PROJECT_ROOT / '.cache' / 'pycache'
+_pycache_dir.mkdir(parents=True, exist_ok=True)
+if getattr(sys, 'pycache_prefix', None) is None:
+    sys.pycache_prefix = str(_pycache_dir)
+
+import sys
+from pathlib import Path
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
