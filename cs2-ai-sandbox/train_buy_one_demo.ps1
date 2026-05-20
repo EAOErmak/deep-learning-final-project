@@ -5,9 +5,10 @@ param (
     [string]$SavePath = ''
 )
 
+$ErrorActionPreference = 'Stop'
+
 Write-Host "Training buy model on one demo..." -ForegroundColor Cyan
 $datasetDir = & (Join-Path $PSScriptRoot 'prepare_one_demo_dataset.ps1') -DemoName $DemoName -RequireBuyTicks
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $demoBase = Split-Path $datasetDir -Leaf
 if ([string]::IsNullOrWhiteSpace($SavePath)) {
     $SavePath = "checkpoints\buy_$demoBase.joblib"

@@ -12,9 +12,10 @@ param (
     [string]$SavePath = ''
 )
 
+$ErrorActionPreference = 'Stop'
+
 Write-Host "Training enemy tracker model on one demo..." -ForegroundColor Cyan
 $datasetDir = & (Join-Path $PSScriptRoot 'prepare_one_demo_dataset.ps1') -DemoName $DemoName
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $demoBase = Split-Path $datasetDir -Leaf
 if ([string]::IsNullOrWhiteSpace($SavePath)) {
     $SavePath = "checkpoints\enemy_tracker_$demoBase.pt"
