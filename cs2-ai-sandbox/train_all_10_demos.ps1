@@ -119,4 +119,5 @@ Invoke-TrainingStep -Title "[4/4] Running train/runtime parity check..." -Action
 Write-Host ""
 Write-Host "=========================================" -ForegroundColor Green
 Write-Host "Training finished successfully." -ForegroundColor Green
+Write-Host "TensorBoard: tensorboard --logdir=runs" -ForegroundColor Cyan
 Write-Host "=========================================" -ForegroundColor Green

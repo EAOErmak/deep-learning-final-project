@@ -112,8 +112,14 @@ class EnemyTrackerTrainer:
         per_demo_count: dict[str, int] = {}
         seen_sample_ids: set[str] = set()
         seen_demo_sample_ids: dict[str, set[str]] = {}
+        first_batch_loaded = False
+
+        print(f'{phase_name} epoch {epoch} | Preparing first batch...')
 
         for batch_idx, batch in enumerate(loader):
+            if not first_batch_loaded:
+                print(f'{phase_name} epoch {epoch} | First batch loaded.')
+                first_batch_loaded = True
             batch = self._to_training_batch(batch)
             pred_positions, pred_confidences = self.model(batch.features)
             mask = batch.target_confidences.unsqueeze(-1).expand_as(pred_positions)
@@ -293,6 +299,7 @@ def main() -> int:
     device = get_device()
 
     try:
+        print('Building dataset...')
         dataset = build_dataset(args)
     except FileNotFoundError as exc:
         print(exc)
@@ -304,12 +311,15 @@ def main() -> int:
         print('Tracker training dataset is empty.')
         return 1
 
+    print('Building train/val split...')
     train_dataset, val_dataset = split_dataset_by_group(dataset, args.val_split, args.seed, mode=args.split_mode)
     train_expected_counts = collect_expected_demo_counts(train_dataset)
     val_expected_counts = collect_expected_demo_counts(val_dataset)
+    print('Preparing dataloaders...')
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=collate_tracker_batch, pin_memory=(device == 'cuda'))
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=collate_tracker_batch, pin_memory=(device == 'cuda'))
 
+    print('Initializing model and trainer...')
     feature_extractor = EnemyTrackerFeatureExtractor(seq_len=args.seq_len)
     feature_schema = feature_extractor.schema()
     model = EnemyTrackerLSTM(input_dim=feature_extractor.feature_dim(), output_enemies=MAX_ENEMIES).to(device)

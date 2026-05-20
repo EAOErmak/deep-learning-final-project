@@ -137,6 +137,9 @@ class MovementTrainer:
         per_demo_count: dict[str, int] = {}
         seen_sample_ids: set[str] = set()
         seen_demo_sample_ids: dict[str, set[str]] = {}
+        first_batch_loaded = False
+
+        print(f'{phase} epoch {epoch_idx}/{total_epochs} | Preparing first batch...')
 
         iterator = loader
         progress = None
@@ -150,6 +153,13 @@ class MovementTrainer:
             progress = iterator
 
         for batch_idx, batch in enumerate(iterator, start=1):
+            if not first_batch_loaded:
+                first_batch_loaded = True
+                message = f'{phase} epoch {epoch_idx}/{total_epochs} | First batch loaded.'
+                if progress is not None:
+                    progress.write(message)
+                elif self.show_batch_progress:
+                    print(message)
             batch = self._to_training_batch(batch)
             logits = self.model(batch.features)
             binary_logits = logits
@@ -388,6 +398,7 @@ def main() -> int:
     device = get_device()
 
     try:
+        print('Building dataset...')
         dataset = build_dataset(args)
     except FileNotFoundError as exc:
         print(exc)
@@ -399,9 +410,11 @@ def main() -> int:
         print('Movement training dataset is empty. Try smaller seq_len/stride or another demo set.')
         return 1
 
+    print('Building train/val split...')
     train_dataset, val_dataset = split_dataset_by_group(dataset, args.val_split, args.seed, mode=args.split_mode)
     train_expected_counts = collect_expected_demo_counts(train_dataset)
     val_expected_counts = collect_expected_demo_counts(val_dataset)
+    print('Preparing dataloaders...')
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -419,6 +432,7 @@ def main() -> int:
         pin_memory=(device == 'cuda'),
     )
 
+    print('Initializing model and trainer...')
     feature_extractor = MovementFeatureExtractor(seq_len=args.seq_len)
     feature_schema = feature_extractor.schema()
     model = DecisionDQN(input_dim=feature_extractor.feature_dim(), action_dim=6, hidden_dim=args.hidden_dim).to(device)

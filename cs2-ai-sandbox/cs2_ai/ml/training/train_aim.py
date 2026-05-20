@@ -166,8 +166,14 @@ class AimTrainer:
         per_demo_count: dict[str, int] = {}
         seen_sample_ids: set[str] = set()
         seen_demo_sample_ids: dict[str, set[str]] = {}
+        first_batch_loaded = False
+
+        print(f'{phase_name} epoch {epoch} | Preparing first batch...')
 
         for batch_idx, batch in enumerate(loader):
+            if not first_batch_loaded:
+                print(f'{phase_name} epoch {epoch} | First batch loaded.')
+                first_batch_loaded = True
             batch = self._to_training_batch(batch)
             aim_delta, shoot_logits, rightclick_logits = self.model(batch.features)
             mouse_targets = batch.targets[:, 5:7]
@@ -471,6 +477,7 @@ def main() -> int:
     device = get_device()
 
     try:
+        print('Building dataset...')
         dataset = build_dataset(args)
     except FileNotFoundError as exc:
         print(exc)
@@ -482,12 +489,15 @@ def main() -> int:
         print('Aim training dataset is empty. Try smaller seq_len/stride or another demo set.')
         return 1
 
+    print('Building train/val split...')
     train_dataset, val_dataset = split_dataset_by_group(dataset, args.val_split, args.seed, mode=args.split_mode)
     train_expected_counts = collect_expected_demo_counts(train_dataset)
     val_expected_counts = collect_expected_demo_counts(val_dataset)
+    print('Preparing dataloaders...')
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=collate_aim_batch, pin_memory=(device == 'cuda'))
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=collate_aim_batch, pin_memory=(device == 'cuda'))
 
+    print('Initializing model and trainer...')
     feature_extractor = AimFeatureExtractor(seq_len=args.seq_len)
     feature_schema = feature_extractor.schema()
     model = AimAttentionModel(input_dim=feature_extractor.feature_dim()).to(device)
