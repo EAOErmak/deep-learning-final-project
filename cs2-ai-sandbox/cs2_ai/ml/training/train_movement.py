@@ -343,6 +343,15 @@ def save_checkpoint(
     torch.save(checkpoint, save_path)
 
 
+def load_checkpoint_if_available(model: 'torch.nn.Module', resume_from: Path | None, device: str) -> bool:
+    if resume_from is None or not resume_from.exists():
+        return False
+    checkpoint = torch.load(resume_from, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    print(f'Resumed model weights from: {resume_from}')
+    return True
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Train a supervised movement model from clean_play_ticks')
     parser.add_argument('--dataset-dir', type=Path, default=PROJECT_ROOT / 'dataset')
@@ -367,6 +376,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--tensorboard-run-name', type=str, default=None)
     parser.add_argument('--disable-tensorboard', action='store_true')
     parser.add_argument('--save-path', type=Path, default=PROJECT_ROOT / 'checkpoints' / 'movement_bc.pt')
+    parser.add_argument('--resume-from', type=Path, default=None)
     return parser.parse_args()
 
 
@@ -416,25 +426,28 @@ def main() -> int:
     train_expected_counts = collect_expected_demo_counts(train_dataset)
     val_expected_counts = collect_expected_demo_counts(val_dataset)
     print('Preparing dataloaders...')
+    train_loader_kwargs = build_dataloader_kwargs(device, args.num_workers, is_training=True)
+    val_loader_kwargs = build_dataloader_kwargs(device, args.num_workers, is_training=False)
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=collate_movement_batch,
-        **build_dataloader_kwargs(device, args.num_workers, is_training=True),
+        **train_loader_kwargs,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         collate_fn=collate_movement_batch,
-        **build_dataloader_kwargs(device, args.num_workers, is_training=False),
+        **val_loader_kwargs,
     )
 
     print('Initializing model and trainer...')
     feature_extractor = MovementFeatureExtractor(seq_len=args.seq_len)
     feature_schema = feature_extractor.schema()
     model = DecisionDQN(input_dim=feature_extractor.feature_dim(), action_dim=6, hidden_dim=args.hidden_dim).to(device)
+    load_checkpoint_if_available(model, args.resume_from, device)
     trainer = MovementTrainer(
         model=model,
         device=device,
@@ -476,7 +489,7 @@ def main() -> int:
     print(f'Total samples: {dataset_len}')
     print(f'Train samples: {len(train_dataset)}')
     print(f'Val samples: {len(val_dataset)}')
-    print(f'DataLoader workers: {train_loader.num_workers}')
+    print(f'DataLoader workers: train={train_loader_kwargs["num_workers"]} val={val_loader_kwargs["num_workers"]}')
     print(f'CUDA tuning: matmul={runtime_info["matmul_precision"]} cudnn_benchmark={runtime_info["cudnn_benchmark"]} tf32={runtime_info["tf32"]}')
     print(f'Split mode: {args.split_mode}')
     print(f'Feature dim: {feature_extractor.feature_dim()}')

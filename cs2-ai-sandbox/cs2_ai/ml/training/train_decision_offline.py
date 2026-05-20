@@ -326,6 +326,16 @@ def save_checkpoint(
     torch.save(checkpoint, save_path)
 
 
+def load_checkpoint_if_available(policy_net: torch.nn.Module, target_net: torch.nn.Module, resume_from: Path | None, device: str) -> bool:
+    if resume_from is None or not resume_from.exists():
+        return False
+    checkpoint = torch.load(resume_from, map_location=device)
+    policy_net.load_state_dict(checkpoint['model_state_dict'])
+    target_net.load_state_dict(checkpoint['model_state_dict'])
+    print(f'Resumed model weights from: {resume_from}')
+    return True
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Train an offline DecisionDQN model from transitions')
     parser.add_argument('--dataset-dir', type=Path, default=PROJECT_ROOT / 'dataset')
@@ -345,6 +355,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--max-samples-per-demo', type=int, default=None)
     parser.add_argument('--max-cached-demos', type=int, default=2)
     parser.add_argument('--save-path', type=Path, default=PROJECT_ROOT / 'checkpoints' / 'decision_dqn.pt')
+    parser.add_argument('--resume-from', type=Path, default=None)
     parser.add_argument('--log-interval', type=int, default=100)
     parser.add_argument('--runs-dir', type=Path, default=PROJECT_ROOT / 'runs')
     parser.add_argument('--tensorboard-run-name', type=str, default=None)
@@ -392,11 +403,13 @@ def main() -> int:
     val_dataset = DecisionRLTransitionDataset(val_subset)
     
     print(f"Train size: {len(train_dataset)}, Val size: {len(val_dataset)}")
-    print(f"DataLoader workers: {build_dataloader_kwargs(device, args.num_workers, is_training=True)['num_workers']}")
+    train_loader_kwargs = build_dataloader_kwargs(device, args.num_workers, is_training=True)
+    val_loader_kwargs = build_dataloader_kwargs(device, args.num_workers, is_training=False)
+    print(f'DataLoader workers: train={train_loader_kwargs["num_workers"]} val={val_loader_kwargs["num_workers"]}')
     print(f'CUDA tuning: matmul={runtime_info["matmul_precision"]} cudnn_benchmark={runtime_info["cudnn_benchmark"]} tf32={runtime_info["tf32"]}')
     
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False, **build_dataloader_kwargs(device, args.num_workers, is_training=True))
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, drop_last=False, **build_dataloader_kwargs(device, args.num_workers, is_training=False))
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=False, **train_loader_kwargs)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, drop_last=False, **val_loader_kwargs)
     
     # Expected sample counts per demo
     train_expected_counts = {}
@@ -418,6 +431,7 @@ def main() -> int:
     
     policy_net = DecisionDQN(input_dim=input_dim, action_dim=action_dim, hidden_dim=args.hidden_dim).to(device)
     target_net = DecisionDQN(input_dim=input_dim, action_dim=action_dim, hidden_dim=args.hidden_dim).to(device)
+    load_checkpoint_if_available(policy_net, target_net, args.resume_from, device)
     
     trainer = DecisionRLTrainer(
         policy_net=policy_net,

@@ -424,6 +424,15 @@ def save_checkpoint(save_path: Path, model: 'torch.nn.Module', args: argparse.Na
     torch.save(checkpoint, save_path)
 
 
+def load_checkpoint_if_available(model: 'torch.nn.Module', resume_from: Path | None, device: str) -> bool:
+    if resume_from is None or not resume_from.exists():
+        return False
+    checkpoint = torch.load(resume_from, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    print(f'Resumed model weights from: {resume_from}')
+    return True
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Train a supervised aim model from clean_play_ticks')
     parser.add_argument('--dataset-dir', type=Path, default=PROJECT_ROOT / 'dataset')
@@ -447,6 +456,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--tensorboard-run-name', type=str, default=None)
     parser.add_argument('--disable-tensorboard', action='store_true')
     parser.add_argument('--save-path', type=Path, default=PROJECT_ROOT / 'checkpoints' / 'aim_bc.pt')
+    parser.add_argument('--resume-from', type=Path, default=None)
     return parser.parse_args()
 
 
@@ -495,13 +505,16 @@ def main() -> int:
     train_expected_counts = collect_expected_demo_counts(train_dataset)
     val_expected_counts = collect_expected_demo_counts(val_dataset)
     print('Preparing dataloaders...')
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_aim_batch, **build_dataloader_kwargs(device, args.num_workers, is_training=True))
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_aim_batch, **build_dataloader_kwargs(device, args.num_workers, is_training=False))
+    train_loader_kwargs = build_dataloader_kwargs(device, args.num_workers, is_training=True)
+    val_loader_kwargs = build_dataloader_kwargs(device, args.num_workers, is_training=False)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_aim_batch, **train_loader_kwargs)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_aim_batch, **val_loader_kwargs)
 
     print('Initializing model and trainer...')
     feature_extractor = AimFeatureExtractor(seq_len=args.seq_len)
     feature_schema = feature_extractor.schema()
     model = AimAttentionModel(input_dim=feature_extractor.feature_dim()).to(device)
+    load_checkpoint_if_available(model, args.resume_from, device)
     trainer = AimTrainer(model=model, device=device, learning_rate=args.lr, log_interval=args.log_interval)
     demo_names = dataset.base_dataset.get_demo_names()
     dataset_label = str(args.dataset_dir / 'clean_play_ticks')
@@ -537,7 +550,7 @@ def main() -> int:
     print(f'Train samples: {len(train_dataset)}')
     print(f'Val samples: {len(val_dataset)}')
     print(f'Split mode: {args.split_mode}')
-    print(f'DataLoader workers: {train_loader.num_workers}')
+    print(f'DataLoader workers: train={train_loader_kwargs["num_workers"]} val={val_loader_kwargs["num_workers"]}')
     print(f'CUDA tuning: matmul={runtime_info["matmul_precision"]} cudnn_benchmark={runtime_info["cudnn_benchmark"]} tf32={runtime_info["tf32"]}')
     print(f'Feature dim: {feature_extractor.feature_dim()}')
     print(f'Save path: {args.save_path}')

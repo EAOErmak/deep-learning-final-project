@@ -10,6 +10,7 @@ param (
     [int]$MaxSamples = 0,
     [int]$MaxSamplesPerDemo = 20000,
     [switch]$ShowIndexProgress,
+    [string]$ResumeFrom = '',
     [string]$SavePath = ''
 )
 
@@ -37,6 +38,12 @@ $args = @(
 if ($MaxSamples -gt 0) { $args += @("--max-samples", $MaxSamples) }
 if ($MaxSamplesPerDemo -gt 0) { $args += @("--max-samples-per-demo", $MaxSamplesPerDemo) }
 if ($ShowIndexProgress) { $args += "--show-index-progress" }
+if (-not [string]::IsNullOrWhiteSpace($ResumeFrom)) { $args += @("--resume-from", $ResumeFrom) }
 
-python @args
-exit $LASTEXITCODE
+Push-Location $PSScriptRoot
+try {
+    python @args
+    exit $LASTEXITCODE
+} finally {
+    Pop-Location
+}

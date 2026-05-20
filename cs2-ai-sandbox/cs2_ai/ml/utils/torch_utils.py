@@ -71,6 +71,10 @@ def build_dataloader_kwargs(
     is_training: bool,
 ) -> dict[str, object]:
     resolved_workers = resolve_num_workers(num_workers)
+    if os.name == "nt" and not is_training:
+        # On Windows, spawning a second multiprocessing DataLoader for validation
+        # after a training loader is active is brittle and can fail with worker exits.
+        resolved_workers = 0
     kwargs: dict[str, object] = {
         "num_workers": resolved_workers,
         "pin_memory": device == "cuda",
