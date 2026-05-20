@@ -40,13 +40,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--disable-window-guard', action='store_true')
     parser.add_argument('--window-keyword', action='append', default=None)
     parser.add_argument('--min-live-readiness', choices=['basic', 'spatial', 'observer'], default='basic')
+    parser.add_argument(
+        '--allow-basic-neural',
+        action='store_true',
+        help='Allow trained neural agents to run on basic GSI without spatial fields. Use only for debugging.',
+    )
     return parser.parse_args()
 
 
-def build_agent(state_source: str, agent_mode: str, seed: int, args: argparse.Namespace) -> Any:
-    resolved_mode = agent_mode
+def resolve_agent_mode(state_source: str, agent_mode: str) -> str:
     if agent_mode == 'auto':
-        resolved_mode = 'pipeline' if state_source == 'gsi' else 'dummy'
+        return 'pipeline' if state_source == 'gsi' else 'dummy'
+    return agent_mode
+
+
+def resolve_min_live_readiness(args: argparse.Namespace, resolved_agent_mode: str) -> str:
+    if (
+        args.state_source == 'gsi'
+        and resolved_agent_mode in {'neural-checkpoint', 'neural-pipeline'}
+        and args.min_live_readiness == 'basic'
+        and not args.allow_basic_neural
+    ):
+        logging.warning(
+            'Promoting min_live_readiness from basic to spatial for trained neural mode. '
+            'Use --allow-basic-neural only for debugging with incomplete GSI payloads.'
+        )
+        return 'spatial'
+    return args.min_live_readiness
+
+
+def build_agent(state_source: str, agent_mode: str, seed: int, args: argparse.Namespace) -> Any:
+    resolved_mode = resolve_agent_mode(state_source, agent_mode)
 
     if resolved_mode == 'dummy':
         logging.info('Using DummyAgent fallback.')
@@ -99,6 +123,8 @@ def is_live_runtime_ready(game_state: GameState, min_readiness: str) -> tuple[bo
 def main() -> int:
     configure_logging()
     args = parse_args()
+    resolved_agent_mode = resolve_agent_mode(args.state_source, args.agent_mode)
+    min_live_readiness = resolve_min_live_readiness(args, resolved_agent_mode)
     loop_sleep_seconds = 1.0 / max(args.hz, 0.1)
     running = True
     gsi_server: GSIServer | None = None
@@ -117,7 +143,7 @@ def main() -> int:
         gsi_server.start()
 
     state_reader = StateReader(mode=args.state_source, gsi_server=gsi_server)
-    agent = build_agent(args.state_source, args.agent_mode, args.seed, args)
+    agent = build_agent(args.state_source, resolved_agent_mode, args.seed, args)
     window_keywords = tuple(args.window_keyword) if args.window_keyword else ('counter-strike', 'cs2')
     input_controller = InputController(
         window_guard_enabled=not args.disable_window_guard,
@@ -127,11 +153,11 @@ def main() -> int:
     logging.info(
         'CS2 AI sandbox started | state_source=%s | agent_mode=%s | hz=%.2f | window_guard=%s | window_keywords=%s | min_live_readiness=%s',
         args.state_source,
-        args.agent_mode,
+        resolved_agent_mode,
         args.hz,
         not args.disable_window_guard,
         window_keywords,
-        args.min_live_readiness,
+        min_live_readiness,
     )
 
     try:
@@ -144,7 +170,7 @@ def main() -> int:
                 continue
 
             if isinstance(raw_state, GameState) and args.state_source == 'gsi':
-                ready, reason = is_live_runtime_ready(raw_state, args.min_live_readiness)
+                ready, reason = is_live_runtime_ready(raw_state, min_live_readiness)
                 if not ready:
                     input_controller.stop_all()
                     now = time.monotonic()
@@ -176,3 +202,4 @@ def main() -> int:
 
 if __name__ == '__main__':
     raise SystemExit(main())
+

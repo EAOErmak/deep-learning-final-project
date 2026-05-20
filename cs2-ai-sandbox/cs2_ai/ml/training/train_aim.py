@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 from dataclasses import dataclass
@@ -21,17 +22,17 @@ from cs2_ai.ml.utils.torch_utils import get_device, set_seed, torch_available
 if torch_available():
     import torch
     import torch.nn.functional as F
-    from torch.utils.tensorboard import SummaryWriter
 else:
     torch = None
     F = None
-    SummaryWriter = None
 
 
 @dataclass(slots=True)
 class AimTrainingBatch:
     features: 'torch.Tensor'
     targets: 'torch.Tensor'
+    sample_ids: list[str]
+    demo_names: list[str]
 
 
 class AimSequenceTorchDataset(Dataset):
@@ -45,49 +46,50 @@ class AimSequenceTorchDataset(Dataset):
     def get_sample_metadata(self, idx: int) -> dict[str, object]:
         return self.base_dataset.get_sample_metadata(idx)
 
-    def __getitem__(self, idx: int) -> tuple[np.ndarray, np.ndarray]:
+    def __getitem__(self, idx: int) -> tuple[np.ndarray, np.ndarray, dict[str, str]]:
         sequence_sample = self.base_dataset[idx]
         features = self.feature_extractor.extract(sequence_sample.sequence)
         sample_metadata = self.base_dataset.get_sample_metadata(idx)
         target_tick = int(sample_metadata['target_tick'])
         target_state = self.base_dataset.build_state_for_sample_tick(sample_metadata, target_tick)
-
-        tick_indices = list(sample_metadata['tick_indices'])
-        next_tick = target_tick
-        if tick_indices:
-            next_tick = target_tick
         try:
             next_state = self.base_dataset.build_state_for_sample_tick(sample_metadata, target_tick + 1)
         except Exception:
             next_state = target_state
 
         target = build_aim_target(target_state, next_state)
-        return features.astype(np.float32), target.astype(np.float32)
+        meta = {
+            'sample_id': str(sample_metadata['sample_id']),
+            'demo_name': str(sample_metadata['demo_name']),
+        }
+        return features.astype(np.float32), target.astype(np.float32), meta
 
 
 class AimTrainer:
-    def __init__(self, model: 'torch.nn.Module', device: str, learning_rate: float, log_interval: int = 100, writer: 'SummaryWriter' | None = None):
+    def __init__(self, model: 'torch.nn.Module', device: str, learning_rate: float, log_interval: int = 100):
         self.model = model
         self.device = device
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
         self.log_interval = log_interval
-        self.writer = writer
-        self.global_step = 0
 
-    def train_epoch(self, loader: DataLoader, epoch: int) -> dict[str, float]:
+    def train_epoch(self, loader: DataLoader, epoch: int) -> dict[str, object]:
         self.model.train()
         return self._run_epoch(loader, training=True, epoch=epoch)
 
-    def eval_epoch(self, loader: DataLoader, epoch: int) -> dict[str, float]:
+    def eval_epoch(self, loader: DataLoader, epoch: int) -> dict[str, object]:
         self.model.eval()
         with torch.no_grad():
             return self._run_epoch(loader, training=False, epoch=epoch)
 
-    def _run_epoch(self, loader: DataLoader, training: bool, epoch: int) -> dict[str, float]:
+    def _run_epoch(self, loader: DataLoader, training: bool, epoch: int) -> dict[str, object]:
         total_loss = 0.0
         total_aim_loss = 0.0
         total_fire_loss = 0.0
         total_samples = 0
+        per_demo_sum: dict[str, float] = {}
+        per_demo_count: dict[str, int] = {}
+        seen_sample_ids: set[str] = set()
+        seen_demo_sample_ids: dict[str, set[str]] = {}
 
         for batch_idx, batch in enumerate(loader):
             batch = self._to_training_batch(batch)
@@ -96,65 +98,119 @@ class AimTrainer:
             fire_targets = batch.targets[:, 2].unsqueeze(1)
             rightclick_targets = batch.targets[:, 3].unsqueeze(1)
 
-            aim_loss = F.mse_loss(torch.tanh(aim_delta), mouse_targets)
-            shoot_loss = F.binary_cross_entropy_with_logits(shoot_logits, fire_targets)
-            rightclick_loss = F.binary_cross_entropy_with_logits(rightclick_logits, rightclick_targets)
-            fire_loss = shoot_loss + rightclick_loss
-            loss = aim_loss + fire_loss
+            aim_loss_raw = F.mse_loss(torch.tanh(aim_delta), mouse_targets, reduction='none')
+            shoot_loss_raw = F.binary_cross_entropy_with_logits(shoot_logits, fire_targets, reduction='none')
+            rightclick_loss_raw = F.binary_cross_entropy_with_logits(rightclick_logits, rightclick_targets, reduction='none')
+            aim_loss_per_sample = aim_loss_raw.mean(dim=1)
+            fire_loss_per_sample = shoot_loss_raw.squeeze(1) + rightclick_loss_raw.squeeze(1)
+            loss_per_sample = aim_loss_per_sample + fire_loss_per_sample
+            loss = loss_per_sample.mean()
 
             if training:
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
-                self.global_step += 1
 
             batch_size = batch.features.size(0)
             total_samples += batch_size
-            total_loss += float(loss.item()) * batch_size
-            total_aim_loss += float(aim_loss.item()) * batch_size
-            total_fire_loss += float(fire_loss.item()) * batch_size
+            total_loss += float(loss_per_sample.sum().item())
+            total_aim_loss += float(aim_loss_per_sample.sum().item())
+            total_fire_loss += float(fire_loss_per_sample.sum().item())
+
+            for sample_id, demo_name, sample_loss in zip(batch.sample_ids, batch.demo_names, loss_per_sample.detach().cpu().tolist()):
+                seen_sample_ids.add(sample_id)
+                seen_demo_sample_ids.setdefault(demo_name, set()).add(sample_id)
+                per_demo_sum[demo_name] = per_demo_sum.get(demo_name, 0.0) + float(sample_loss)
+                per_demo_count[demo_name] = per_demo_count.get(demo_name, 0) + 1
 
             if training and batch_idx % self.log_interval == 0:
-                print(f'Epoch {epoch} | Batch {batch_idx}/{len(loader)} | Loss: {loss.item():.4f}')
-                if self.writer:
-                    self.writer.add_scalar('Train/Loss_Total', loss.item(), self.global_step)
-                    self.writer.add_scalar('Train/Loss_Aim', aim_loss.item(), self.global_step)
-                    self.writer.add_scalar('Train/Loss_Fire', fire_loss.item(), self.global_step)
+                print(f'Epoch {epoch} | Batch {batch_idx}/{len(loader)} | Loss: {loss.item():.4f} | Seen: {len(seen_sample_ids)}')
 
         if total_samples == 0:
-            return {'loss': 0.0, 'aim_loss': 0.0, 'fire_loss': 0.0}
+            return {'loss': 0.0, 'aim_loss': 0.0, 'fire_loss': 0.0, 'seen_sample_ids': set(), 'per_demo_loss': {}, 'per_demo_seen_counts': {}}
 
         return {
             'loss': total_loss / total_samples,
             'aim_loss': total_aim_loss / total_samples,
             'fire_loss': total_fire_loss / total_samples,
+            'seen_sample_ids': seen_sample_ids,
+            'per_demo_loss': {demo: per_demo_sum[demo] / per_demo_count[demo] for demo in sorted(per_demo_sum)},
+            'per_demo_seen_counts': {demo: len(ids) for demo, ids in sorted(seen_demo_sample_ids.items())},
         }
 
-    def _to_training_batch(self, batch: tuple['torch.Tensor', 'torch.Tensor']) -> AimTrainingBatch:
-        features, targets = batch
+    def _to_training_batch(self, batch: tuple['torch.Tensor', 'torch.Tensor', list[dict[str, str]]]) -> AimTrainingBatch:
+        features, targets, metas = batch
         return AimTrainingBatch(
             features=features.to(self.device, non_blocking=True),
             targets=targets.to(self.device, non_blocking=True),
+            sample_ids=[str(meta['sample_id']) for meta in metas],
+            demo_names=[str(meta['demo_name']) for meta in metas],
         )
 
 
-def collate_aim_batch(batch: list[tuple[np.ndarray, np.ndarray]]) -> tuple['torch.Tensor', 'torch.Tensor']:
+def collate_aim_batch(batch: list[tuple[np.ndarray, np.ndarray, dict[str, str]]]) -> tuple['torch.Tensor', 'torch.Tensor', list[dict[str, str]]]:
     features = torch.tensor(np.stack([item[0] for item in batch]), dtype=torch.float32)
     targets = torch.tensor(np.stack([item[1] for item in batch]), dtype=torch.float32)
-    return features, targets
+    metas = [item[2] for item in batch]
+    return features, targets, metas
 
 
-def save_checkpoint(
-    save_path: Path,
-    model: 'torch.nn.Module',
-    args: argparse.Namespace,
-    train_metrics: dict[str, float],
-    val_metrics: dict[str, float],
-    dataset_label: str,
-    input_dim: int,
-    demo_names: list[str],
-) -> None:
+def collect_expected_demo_counts(dataset) -> dict[str, int]:
+    if hasattr(dataset, 'indices') and hasattr(dataset, 'dataset'):
+        indices = list(dataset.indices)
+        source_dataset = dataset.dataset
+    else:
+        indices = list(range(len(dataset)))
+        source_dataset = dataset
+    counts: dict[str, int] = {}
+    for idx in indices:
+        metadata = source_dataset.get_sample_metadata(int(idx))
+        demo_name = str(metadata['demo_name'])
+        counts[demo_name] = counts.get(demo_name, 0) + 1
+    return counts
+
+
+def build_coverage_summary(metrics: dict[str, object], expected_demo_counts: dict[str, int]) -> dict[str, object]:
+    seen_counts = dict(metrics.get('per_demo_seen_counts', {}))
+    per_demo = {}
+    covered_demos = 0
+    for demo_name, expected_count in sorted(expected_demo_counts.items()):
+        seen_count = int(seen_counts.get(demo_name, 0))
+        coverage = float(seen_count / expected_count) if expected_count else 0.0
+        if seen_count >= expected_count:
+            covered_demos += 1
+        per_demo[demo_name] = {
+            'seen': seen_count,
+            'expected': int(expected_count),
+            'coverage': coverage,
+            'avg_loss': float(metrics.get('per_demo_loss', {}).get(demo_name, 0.0)),
+        }
+    total_expected = int(sum(expected_demo_counts.values()))
+    total_seen = int(sum(seen_counts.values()))
+    return {
+        'total_seen': total_seen,
+        'total_expected': total_expected,
+        'coverage': float(total_seen / total_expected) if total_expected else 0.0,
+        'covered_demos': covered_demos,
+        'demo_count': len(expected_demo_counts),
+        'per_demo': per_demo,
+    }
+
+
+def print_coverage_summary(phase: str, coverage_summary: dict[str, object]) -> None:
+    print(f"{phase} coverage: {coverage_summary['total_seen']}/{coverage_summary['total_expected']} samples ({coverage_summary['coverage']:.2%}) | demos {coverage_summary['covered_demos']}/{coverage_summary['demo_count']}")
+    for demo_name, demo_summary in list(coverage_summary['per_demo'].items())[:10]:
+        print(f"  {phase} demo {demo_name}: {demo_summary['seen']}/{demo_summary['expected']} ({demo_summary['coverage']:.2%}) | avg_loss={demo_summary['avg_loss']:.4f}")
+
+
+def append_epoch_summary(log_path: Path, epoch_summary: dict[str, object]) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open('a', encoding='utf-8') as handle:
+        handle.write(json.dumps(epoch_summary, ensure_ascii=True) + '\n')
+
+
+def save_checkpoint(save_path: Path, model: 'torch.nn.Module', args: argparse.Namespace, train_metrics: dict[str, object], val_metrics: dict[str, object], dataset_label: str, input_dim: int, demo_names: list[str]) -> None:
     save_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
         'model_state_dict': model.state_dict(),
@@ -166,8 +222,8 @@ def save_checkpoint(
         'demo_names': demo_names,
         'demo_count': len(demo_names),
         'split_mode': args.split_mode,
-        'train_metrics': train_metrics,
-        'val_metrics': val_metrics,
+        'train_metrics': {k: v for k, v in train_metrics.items() if k not in {'seen_sample_ids', 'per_demo_loss', 'per_demo_seen_counts'}},
+        'val_metrics': {k: v for k, v in val_metrics.items() if k not in {'seen_sample_ids', 'per_demo_loss', 'per_demo_seen_counts'}},
     }
     torch.save(checkpoint, save_path)
 
@@ -233,34 +289,17 @@ def main() -> int:
         return 1
 
     train_dataset, val_dataset = split_dataset_by_group(dataset, args.val_split, args.seed, mode=args.split_mode)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=collate_aim_batch,
-        pin_memory=(device == 'cuda'),
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=collate_aim_batch,
-        pin_memory=(device == 'cuda'),
-    )
+    train_expected_counts = collect_expected_demo_counts(train_dataset)
+    val_expected_counts = collect_expected_demo_counts(val_dataset)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=collate_aim_batch, pin_memory=(device == 'cuda'))
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=collate_aim_batch, pin_memory=(device == 'cuda'))
 
     feature_extractor = AimFeatureExtractor()
     model = AimAttentionModel(input_dim=feature_extractor.feature_dim()).to(device)
-    
-    from datetime import datetime
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_dir = PROJECT_ROOT / 'runs' / f'aim_{timestamp}'
-    writer = SummaryWriter(log_dir=str(log_dir)) if SummaryWriter else None
-    
-    trainer = AimTrainer(model=model, device=device, learning_rate=args.lr, log_interval=args.log_interval, writer=writer)
+    trainer = AimTrainer(model=model, device=device, learning_rate=args.lr, log_interval=args.log_interval)
     demo_names = dataset.base_dataset.get_demo_names()
     dataset_label = str(args.dataset_dir / 'clean_play_ticks')
+    epoch_log_path = args.save_path.with_name(f'{args.save_path.stem}_epoch_metrics.jsonl')
 
     print('train_aim.py')
     print(f'Device: {device}')
@@ -272,27 +311,25 @@ def main() -> int:
     print(f'Split mode: {args.split_mode}')
     print(f'Feature dim: {feature_extractor.feature_dim()}')
     print(f'Save path: {args.save_path}')
+    print(f'Epoch log: {epoch_log_path}')
 
     best_val_loss = math.inf
     for epoch in range(1, args.epochs + 1):
         train_metrics = trainer.train_epoch(train_loader, epoch=epoch)
-        val_metrics = trainer.eval_epoch(val_loader, epoch=epoch) if len(val_dataset) > 0 else {'loss': train_metrics['loss'], 'aim_loss': train_metrics['aim_loss'], 'fire_loss': train_metrics['fire_loss']}
-        print(
-            f'Epoch {epoch}/{args.epochs} | '
-            f'train_loss={train_metrics["loss"]:.4f} '
-            f'(aim={train_metrics["aim_loss"]:.4f}, fire={train_metrics["fire_loss"]:.4f}) | '
-            f'val_loss={val_metrics["loss"]:.4f} '
-            f'(aim={val_metrics["aim_loss"]:.4f}, fire={val_metrics["fire_loss"]:.4f})'
-        )
+        val_metrics = trainer.eval_epoch(val_loader, epoch=epoch) if len(val_dataset) > 0 else {'loss': train_metrics['loss'], 'aim_loss': train_metrics['aim_loss'], 'fire_loss': train_metrics['fire_loss'], 'seen_sample_ids': set(), 'per_demo_loss': {}, 'per_demo_seen_counts': {}}
+        print(f'Epoch {epoch}/{args.epochs} | train_loss={train_metrics["loss"]:.4f} (aim={train_metrics["aim_loss"]:.4f}, fire={train_metrics["fire_loss"]:.4f}) | val_loss={val_metrics["loss"]:.4f} (aim={val_metrics["aim_loss"]:.4f}, fire={val_metrics["fire_loss"]:.4f})')
+
+        train_coverage = build_coverage_summary(train_metrics, train_expected_counts)
+        val_coverage = build_coverage_summary(val_metrics, val_expected_counts)
+        print_coverage_summary('train', train_coverage)
+        if val_expected_counts:
+            print_coverage_summary('val', val_coverage)
+        append_epoch_summary(epoch_log_path, {'epoch': epoch, 'train': {'loss': train_metrics['loss'], 'aim_loss': train_metrics['aim_loss'], 'fire_loss': train_metrics['fire_loss'], 'coverage': train_coverage}, 'val': {'loss': val_metrics['loss'], 'aim_loss': val_metrics['aim_loss'], 'fire_loss': val_metrics['fire_loss'], 'coverage': val_coverage}})
+
         if val_metrics['loss'] < best_val_loss:
             best_val_loss = val_metrics['loss']
             save_checkpoint(args.save_path, model, args, train_metrics, val_metrics, dataset_label, feature_extractor.feature_dim(), demo_names)
             print(f'  saved checkpoint -> {args.save_path}')
-            
-        if writer:
-            writer.add_scalar('Val/Loss_Total', val_metrics['loss'], epoch)
-            writer.add_scalar('Val/Loss_Aim', val_metrics['aim_loss'], epoch)
-            writer.add_scalar('Val/Loss_Fire', val_metrics['fire_loss'], epoch)
 
     print('Training finished.')
     print(f'Best val loss: {best_val_loss:.4f}')
@@ -301,5 +338,3 @@ def main() -> int:
 
 if __name__ == '__main__':
     raise SystemExit(main())
-
-

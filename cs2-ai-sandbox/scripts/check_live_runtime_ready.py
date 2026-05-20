@@ -30,6 +30,22 @@ class _StaticServer:
         return self._payload
 
 
+def print_next_steps(state: GameState) -> None:
+    caps = state.capabilities
+    if caps.has_spatial_state and caps.has_allplayers:
+        print('next_steps: observer-grade GSI is available. You can use --min-live-readiness observer.')
+        return
+    if caps.has_spatial_state:
+        print('next_steps: spatial GSI is available, but allplayers is missing. Use --min-live-readiness spatial for self-only live models.')
+        print('next_steps: for enemy-aware runtime, join as observer/GOTV/spectator and check allplayers again.')
+        return
+
+    print('next_steps: spatial fields are missing. Python already requests player_position/allplayers_position in config.')
+    print('next_steps: make sure the cfg is installed in the CS2 CLIENT cfg directory, not only the dedicated server cfg directory.')
+    print('next_steps: fully restart the CS2 client after changing the cfg, then join the local server again.')
+    print('next_steps: if regular player mode still omits position/forward, test observer/spectator/GOTV mode.')
+    print('next_steps: trained neural checkpoints should be run with --min-live-readiness spatial or observer.')
+
 def main() -> int:
     payload_path = PROJECT_ROOT / 'latest_gsi_payload.json'
     if not payload_path.exists():
@@ -53,8 +69,10 @@ def main() -> int:
         print(f'player_position: {player.position}')
         print(f'player_forward: {player.forward}')
     print(f'players_count: {len(state.players)}')
+    print_next_steps(state)
     return 0
 
 
 if __name__ == '__main__':
     raise SystemExit(main())
+
