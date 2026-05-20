@@ -4,7 +4,9 @@ param (
     [int]$SeqLen = 16,
     [int]$Stride = 4,
     [string]$SplitMode = "demo",
-    [int]$NumWorkers = 4,
+    [int]$NumWorkers = 0,
+    [int]$MaxSamples = 0,
+    [int]$MaxSamplesPerDemo = 0,
     [switch]$ShowIndexProgress,
     [string]$SavePath = "checkpoints\enemy_tracker_bc_v1.pt"
 )
@@ -21,6 +23,16 @@ $args = @(
     "--num-workers", $NumWorkers,
     "--save-path", $SavePath
 )
+
+if ($MaxSamples -gt 0) {
+    $args += "--max-samples"
+    $args += $MaxSamples
+}
+
+if ($MaxSamplesPerDemo -gt 0) {
+    $args += "--max-samples-per-demo"
+    $args += $MaxSamplesPerDemo
+}
 
 if ($ShowIndexProgress) {
     $args += "--show-index-progress"

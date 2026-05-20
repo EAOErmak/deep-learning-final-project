@@ -2,7 +2,9 @@ param (
     [int]$Epochs = 10,
     [int]$BatchSize = 64,
     [string]$SplitMode = "demo",
-    [int]$NumWorkers = 4,
+    [int]$NumWorkers = 0,
+    [int]$MaxSamples = 0,
+    [int]$MaxSamplesPerDemo = 0,
     [switch]$ShowIndexProgress,
     [switch]$ShowBuildProgress
 )
@@ -19,6 +21,14 @@ $trackerArgs = @(
     "-SplitMode", $SplitMode,
     "-NumWorkers", $NumWorkers
 )
+if ($MaxSamples -gt 0) {
+    $trackerArgs += "-MaxSamples"
+    $trackerArgs += $MaxSamples
+}
+if ($MaxSamplesPerDemo -gt 0) {
+    $trackerArgs += "-MaxSamplesPerDemo"
+    $trackerArgs += $MaxSamplesPerDemo
+}
 if ($ShowIndexProgress) {
     $trackerArgs += "-ShowIndexProgress"
 }
@@ -36,6 +46,14 @@ $movementArgs = @(
     "-SplitMode", $SplitMode,
     "-NumWorkers", $NumWorkers
 )
+if ($MaxSamples -gt 0) {
+    $movementArgs += "-MaxSamples"
+    $movementArgs += $MaxSamples
+}
+if ($MaxSamplesPerDemo -gt 0) {
+    $movementArgs += "-MaxSamplesPerDemo"
+    $movementArgs += $MaxSamplesPerDemo
+}
 if ($ShowIndexProgress) {
     $movementArgs += "-ShowIndexProgress"
 }
@@ -53,6 +71,14 @@ $aimArgs = @(
     "-SplitMode", $SplitMode,
     "-NumWorkers", $NumWorkers
 )
+if ($MaxSamples -gt 0) {
+    $aimArgs += "-MaxSamples"
+    $aimArgs += $MaxSamples
+}
+if ($MaxSamplesPerDemo -gt 0) {
+    $aimArgs += "-MaxSamplesPerDemo"
+    $aimArgs += $MaxSamplesPerDemo
+}
 if ($ShowIndexProgress) {
     $aimArgs += "-ShowIndexProgress"
 }
@@ -70,7 +96,6 @@ $buyArgs = @(
 if ($ShowBuildProgress) {
     $buyArgs += "-ShowBuildProgress"
 }
-
 & $buyArgs[0] @buyArgs[1..($buyArgs.Length - 1)]
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Buy training failed!" -ForegroundColor Red
