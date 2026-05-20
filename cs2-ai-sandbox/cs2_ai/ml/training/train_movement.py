@@ -27,6 +27,11 @@ else:
     torch = None
     F = None
 
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
+
 
 @dataclass(slots=True)
 class TrainingBatch:
@@ -69,27 +74,54 @@ class MovementSequenceTorchDataset(Dataset):
 
 
 class MovementTrainer:
-    def __init__(self, model: 'torch.nn.Module', device: str, learning_rate: float):
+    def __init__(
+        self,
+        model: 'torch.nn.Module',
+        device: str,
+        learning_rate: float,
+        show_batch_progress: bool = True,
+        log_every: int = 25,
+    ):
         self.model = model
         self.device = device
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
+        self.show_batch_progress = show_batch_progress
+        self.log_every = max(1, log_every)
 
-    def train_epoch(self, loader: DataLoader) -> dict[str, float]:
+    def train_epoch(self, loader: DataLoader, epoch_idx: int, total_epochs: int) -> dict[str, float]:
         self.model.train()
-        return self._run_epoch(loader, training=True)
+        return self._run_epoch(loader, training=True, phase='train', epoch_idx=epoch_idx, total_epochs=total_epochs)
 
-    def eval_epoch(self, loader: DataLoader) -> dict[str, float]:
+    def eval_epoch(self, loader: DataLoader, epoch_idx: int, total_epochs: int) -> dict[str, float]:
         self.model.eval()
         with torch.no_grad():
-            return self._run_epoch(loader, training=False)
+            return self._run_epoch(loader, training=False, phase='val', epoch_idx=epoch_idx, total_epochs=total_epochs)
 
-    def _run_epoch(self, loader: DataLoader, training: bool) -> dict[str, float]:
+    def _run_epoch(
+        self,
+        loader: DataLoader,
+        training: bool,
+        phase: str,
+        epoch_idx: int,
+        total_epochs: int,
+    ) -> dict[str, float]:
         total_loss = 0.0
         total_binary_loss = 0.0
         total_move_loss = 0.0
         total_samples = 0
 
-        for batch in loader:
+        iterator = loader
+        progress = None
+        if self.show_batch_progress and tqdm is not None:
+            iterator = tqdm(
+                loader,
+                desc=f'{phase} epoch {epoch_idx}/{total_epochs}',
+                leave=False,
+                unit='batch',
+            )
+            progress = iterator
+
+        for batch_idx, batch in enumerate(iterator, start=1):
             batch = self._to_training_batch(batch)
             logits = self.model(batch.features)
             binary_logits = logits[:, :6]
@@ -112,6 +144,13 @@ class MovementTrainer:
             total_loss += float(loss.item()) * batch_size
             total_binary_loss += float(binary_loss.item()) * batch_size
             total_move_loss += float(move_loss.item()) * batch_size
+
+            if progress is not None and (batch_idx == 1 or batch_idx % self.log_every == 0):
+                progress.set_postfix(
+                    loss=f'{(total_loss / total_samples):.4f}',
+                    bin=f'{(total_binary_loss / total_samples):.4f}',
+                    move=f'{(total_move_loss / total_samples):.4f}',
+                )
 
         if total_samples == 0:
             return {'loss': 0.0, 'binary_loss': 0.0, 'move_loss': 0.0}
@@ -189,6 +228,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--num-workers', type=int, default=0)
     parser.add_argument('--max-samples', type=int, default=None)
     parser.add_argument('--show-index-progress', action='store_true')
+    parser.add_argument('--disable-batch-progress', action='store_true')
+    parser.add_argument('--log-every', type=int, default=25)
     parser.add_argument('--save-path', type=Path, default=PROJECT_ROOT / 'checkpoints' / 'movement_bc.pt')
     return parser.parse_args()
 
@@ -252,7 +293,13 @@ def main() -> int:
 
     feature_extractor = MovementFeatureExtractor()
     model = DecisionDQN(input_dim=feature_extractor.feature_dim(), action_dim=8, hidden_dim=args.hidden_dim).to(device)
-    trainer = MovementTrainer(model=model, device=device, learning_rate=args.lr)
+    trainer = MovementTrainer(
+        model=model,
+        device=device,
+        learning_rate=args.lr,
+        show_batch_progress=not args.disable_batch_progress,
+        log_every=args.log_every,
+    )
 
     print('train_movement.py')
     print(f'Device: {device}')
@@ -268,8 +315,9 @@ def main() -> int:
     best_val_metrics: dict[str, float] = {'loss': math.inf, 'binary_loss': math.inf, 'move_loss': math.inf}
 
     for epoch in range(1, args.epochs + 1):
-        train_metrics = trainer.train_epoch(train_loader)
-        val_metrics = trainer.eval_epoch(val_loader) if len(val_dataset) > 0 else {'loss': train_metrics['loss'], 'binary_loss': train_metrics['binary_loss'], 'move_loss': train_metrics['move_loss']}
+        print(f'Starting epoch {epoch}/{args.epochs}...')
+        train_metrics = trainer.train_epoch(train_loader, epoch_idx=epoch, total_epochs=args.epochs)
+        val_metrics = trainer.eval_epoch(val_loader, epoch_idx=epoch, total_epochs=args.epochs) if len(val_dataset) > 0 else {'loss': train_metrics['loss'], 'binary_loss': train_metrics['binary_loss'], 'move_loss': train_metrics['move_loss']}
         print(
             f'Epoch {epoch}/{args.epochs} | '
             f'train_loss={train_metrics["loss"]:.4f} '

@@ -1,2 +1,5 @@
 dataset/
 demos/
+.cache/
+__pycache__/
+*.py[cod]
