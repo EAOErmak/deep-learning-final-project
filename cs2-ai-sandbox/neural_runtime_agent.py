@@ -124,7 +124,7 @@ class NeuralRuntimeAgent:
         return action
 
 class FullNeuralRuntimeAgent:
-    def __init__(self, seed: int = 42, aim_checkpoint: str | None = None, movement_checkpoint: str | None = None, tracker_checkpoint: str | None = None) -> None:
+    def __init__(self, seed: int = 42, aim_checkpoint: str | None = None, movement_checkpoint: str | None = None, tracker_checkpoint: str | None = None, yolo_weights: str | None = None) -> None:
         if not torch_available():
             raise RuntimeError('PyTorch is not available.')
 
@@ -157,6 +157,14 @@ class FullNeuralRuntimeAgent:
         self.tracker_model.eval()
 
         self.pipeline = NeuralAIPipeline(self.aim_model, self.movement_model, self.tracker_model, device=self.device)
+        
+        if yolo_weights and Path(yolo_weights).exists():
+            from cs2_ai.vision.yolo_pipeline import YoloVisionModule
+            self.vision_module = YoloVisionModule(Path(yolo_weights))
+            self.vision_module.start()
+        else:
+            self.vision_module = None
+            
         self.logger.info('FullNeuralRuntimeAgent initialized.')
 
     def predict_state(self, game_state: GameState, _features: dict[str, float | int | bool] | None = None) -> ActionDict:
@@ -166,7 +174,14 @@ class FullNeuralRuntimeAgent:
         # The easiest way is to borrow PipelineRuntimeAgent's conversion methods
         agent_helper = PipelineRuntimeAgent()
         ai_state = agent_helper._to_ai_game_state(game_state)
-        action_plan = self.pipeline.step(ai_state)
+        
+        vision_target = None
+        if self.vision_module:
+            if ai_state.self_player:
+                self.vision_module.update_context(ai_state.self_player.team)
+            vision_target = self.vision_module.get_latest_target()
+            
+        action_plan = self.pipeline.step(ai_state, vision_target=vision_target)
         action = agent_helper._action_plan_to_action_dict(action_plan)
         
         self.logger.info('FullNeuralRuntimeAgent action dict: %s', action)

@@ -9,6 +9,10 @@ matplotlib==3.10.5
 tqdm==4.67.1
 rich==14.1.0
 tensorboard==2.20.0
+# Vision modules:
+ultralytics==8.2.100
+mss==9.0.1
+opencv-python==4.9.0.80
 # Optional future RL stack:
 # gymnasium==1.2.0
 # stable-baselines3==2.7.0

@@ -42,7 +42,7 @@ class NeuralAIPipeline:
         self.last_buy_output = None
         self.last_action_plan = None
 
-    def step(self, game_state: GameState):
+    def step(self, game_state: GameState, vision_target=None):
         self.memory.push(game_state)
         sequence = GameStateSequence(perspective_steamid=game_state.perspective_steamid, states=self.memory.get_sequence())
         
@@ -106,7 +106,7 @@ class NeuralAIPipeline:
         )
         
         # 5. Aim Shoot
-        aim_features = torch.tensor(self.aim_extractor.extract(sequence, self.last_belief_state), dtype=torch.float32, device=self.device).unsqueeze(0)
+        aim_features = torch.tensor(self.aim_extractor.extract(sequence, self.last_belief_state, vision_target=vision_target), dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
             aim_delta, shoot_logits, rightclick_logits = self.aim_model(aim_features)
             

@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--aim-checkpoint', type=str, default=None)
     parser.add_argument('--movement-checkpoint', type=str, default=None)
     parser.add_argument('--tracker-checkpoint', type=str, default=None)
+    parser.add_argument('--yolo-weights', type=str, default=None, help='Path to YOLO weights for live vision targeting (e.g. weights/yolov10s_cs2.pt)')
     parser.add_argument('--gsi-port', type=int, default=3000)
     parser.add_argument('--hz', type=float, default=10.0)
     parser.add_argument('--seed', type=int, default=42)
@@ -94,7 +95,8 @@ def build_agent(state_source: str, agent_mode: str, seed: int, args: argparse.Na
             seed=seed, 
             aim_checkpoint=args.aim_checkpoint, 
             movement_checkpoint=args.movement_checkpoint, 
-            tracker_checkpoint=args.tracker_checkpoint
+            tracker_checkpoint=args.tracker_checkpoint,
+            yolo_weights=args.yolo_weights
         )
     raise ValueError(f'Unsupported agent mode: {agent_mode}')
 
