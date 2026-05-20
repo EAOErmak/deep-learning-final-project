@@ -21,9 +21,11 @@ from cs2_ai.ml.utils.torch_utils import get_device, set_seed, torch_available
 if torch_available():
     import torch
     import torch.nn.functional as F
+    from torch.utils.tensorboard import SummaryWriter
 else:
     torch = None
     F = None
+    SummaryWriter = None
 
 
 @dataclass(slots=True)
@@ -64,11 +66,13 @@ class AimSequenceTorchDataset(Dataset):
 
 
 class AimTrainer:
-    def __init__(self, model: 'torch.nn.Module', device: str, learning_rate: float, log_interval: int = 100):
+    def __init__(self, model: 'torch.nn.Module', device: str, learning_rate: float, log_interval: int = 100, writer: 'SummaryWriter' | None = None):
         self.model = model
         self.device = device
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
         self.log_interval = log_interval
+        self.writer = writer
+        self.global_step = 0
 
     def train_epoch(self, loader: DataLoader, epoch: int) -> dict[str, float]:
         self.model.train()
@@ -103,6 +107,7 @@ class AimTrainer:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
+                self.global_step += 1
 
             batch_size = batch.features.size(0)
             total_samples += batch_size
@@ -112,6 +117,10 @@ class AimTrainer:
 
             if training and batch_idx % self.log_interval == 0:
                 print(f'Epoch {epoch} | Batch {batch_idx}/{len(loader)} | Loss: {loss.item():.4f}')
+                if self.writer:
+                    self.writer.add_scalar('Train/Loss_Total', loss.item(), self.global_step)
+                    self.writer.add_scalar('Train/Loss_Aim', aim_loss.item(), self.global_step)
+                    self.writer.add_scalar('Train/Loss_Fire', fire_loss.item(), self.global_step)
 
         if total_samples == 0:
             return {'loss': 0.0, 'aim_loss': 0.0, 'fire_loss': 0.0}
@@ -243,7 +252,13 @@ def main() -> int:
 
     feature_extractor = AimFeatureExtractor()
     model = AimAttentionModel(input_dim=feature_extractor.feature_dim()).to(device)
-    trainer = AimTrainer(model=model, device=device, learning_rate=args.lr, log_interval=args.log_interval)
+    
+    from datetime import datetime
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_dir = PROJECT_ROOT / 'runs' / f'aim_{timestamp}'
+    writer = SummaryWriter(log_dir=str(log_dir)) if SummaryWriter else None
+    
+    trainer = AimTrainer(model=model, device=device, learning_rate=args.lr, log_interval=args.log_interval, writer=writer)
     demo_names = dataset.base_dataset.get_demo_names()
     dataset_label = str(args.dataset_dir / 'clean_play_ticks')
 
@@ -273,6 +288,11 @@ def main() -> int:
             best_val_loss = val_metrics['loss']
             save_checkpoint(args.save_path, model, args, train_metrics, val_metrics, dataset_label, feature_extractor.feature_dim(), demo_names)
             print(f'  saved checkpoint -> {args.save_path}')
+            
+        if writer:
+            writer.add_scalar('Val/Loss_Total', val_metrics['loss'], epoch)
+            writer.add_scalar('Val/Loss_Aim', val_metrics['aim_loss'], epoch)
+            writer.add_scalar('Val/Loss_Fire', val_metrics['fire_loss'], epoch)
 
     print('Training finished.')
     print(f'Best val loss: {best_val_loss:.4f}')
