@@ -99,27 +99,35 @@ def build_agent(state_source: str, agent_mode: str, seed: int, args: argparse.Na
     raise ValueError(f'Unsupported agent mode: {agent_mode}')
 
 
+
 def is_live_runtime_ready(game_state: GameState, min_readiness: str) -> tuple[bool, str]:
     player = game_state.controlled_player
     if player is None:
         return False, 'controlled_player missing'
-    if (player.activity or '').lower() != 'playing':
-        return False, f'player activity is {(player.activity or "unknown")!r}, not playing'
+
+    activity = (player.activity or '').lower()
     if min_readiness == 'basic':
+        if activity and activity != 'playing':
+            return False, f'player activity is {activity!r}, not playing'
         return True, 'basic live state available'
+
     if min_readiness == 'spatial':
         if not game_state.capabilities.has_spatial_state:
             return False, 'spatial state missing: no player.position/player.forward'
+        if activity and activity not in {'playing', 'spectating'}:
+            return False, f'player activity is {activity!r}, not playing/spectating'
         return True, 'spatial live state available'
+
     if min_readiness == 'observer':
         if not game_state.capabilities.has_spatial_state:
             return False, 'spatial state missing: no player.position/player.forward'
         if not game_state.capabilities.has_allplayers:
             return False, 'observer context missing: no allplayers'
+        if activity and activity not in {'playing', 'spectating'}:
+            return False, f'player activity is {activity!r}, not playing/spectating'
         return True, 'observer-grade live state available'
+
     return False, f'unsupported readiness mode: {min_readiness}'
-
-
 def main() -> int:
     configure_logging()
     args = parse_args()
@@ -202,4 +210,5 @@ def main() -> int:
 
 if __name__ == '__main__':
     raise SystemExit(main())
+
 
