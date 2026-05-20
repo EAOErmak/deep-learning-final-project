@@ -90,6 +90,8 @@ def build_agent(state_source: str, agent_mode: str, seed: int, args: argparse.Na
         return NeuralRuntimeAgent(seed=seed, checkpoint_path=checkpoint)
     if resolved_mode == 'neural-pipeline':
         logging.info('Using FullNeuralRuntimeAgent with modular NeuralAIPipeline.')
+        if not args.yolo_weights:
+            logging.warning('neural-pipeline started without --yolo-weights. Live aim/enemy context will be effectively blind.')
         from neural_runtime_agent import FullNeuralRuntimeAgent
         return FullNeuralRuntimeAgent(
             seed=seed, 
@@ -212,5 +214,6 @@ def main() -> int:
 
 if __name__ == '__main__':
     raise SystemExit(main())
+
 
 

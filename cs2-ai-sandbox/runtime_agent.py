@@ -44,8 +44,9 @@ class PipelineRuntimeAgent:
             ai_player = self._to_ai_player(player)
             if ai_player.team_num == self_team_num:
                 teammates.append(ai_player)
-            else:
-                enemies.append(ai_player)
+
+        # Do not feed observer/GSI enemy truth into the live policy.
+        # Live enemy context must come from screen-space detection and learned belief.
 
         phase = (game_state.round_state.phase or game_state.map_state.phase or '').lower()
         round_state = AIRoundState(
@@ -193,3 +194,4 @@ class PipelineRuntimeAgent:
         if horizontal == 0.0 and z == 0.0:
             return 0.0
         return math.degrees(math.atan2(z, horizontal))
+

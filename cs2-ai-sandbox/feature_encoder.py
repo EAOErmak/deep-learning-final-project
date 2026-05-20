@@ -85,8 +85,6 @@ def _encode_gsi_state(game_state: GameState) -> dict[str, float | int | bool]:
     velocity = controlled.velocity
     phase = (game_state.round_state.phase or game_state.map_state.phase or '').lower()
     bomb_state = (game_state.round_state.bomb_state or '').lower()
-    enemies = [player for player in game_state.players if _is_enemy(controlled, player) and player.position is not None and player.is_alive]
-    nearest_enemy = min(enemies, key=lambda player: _distance(controlled, player), default=None)
 
     features = dict(ZERO_FEATURES)
     features.update(
@@ -110,25 +108,14 @@ def _encode_gsi_state(game_state: GameState) -> dict[str, float | int | bool]:
             'round_freeze': int(phase in {'freezetime', 'freeze'}),
             'round_warmup': int(phase == 'warmup'),
             'bomb_planted': int(bomb_state == 'planted'),
-            'visible_players_count': len(enemies),
+            # Live runtime must not consume observer/GSI enemy truth directly.
+            # Enemy context for inference should come from vision or a learned belief state.
+            'visible_players_count': 0,
             'available_players_count': len(game_state.players),
             'has_spatial_state': int(game_state.capabilities.has_spatial_state),
-            'has_enemy_context': int(game_state.capabilities.has_enemy_players),
+            'has_enemy_context': 0,
         }
     )
-
-    if nearest_enemy is None or nearest_enemy.position is None or position is None:
-        return features
-
-    enemy_rel_x = nearest_enemy.position.x - position.x
-    enemy_rel_y = nearest_enemy.position.y - position.y
-    enemy_rel_z = nearest_enemy.position.z - position.z
-    features['enemy_visible'] = 1
-    features['enemy_rel_x'] = enemy_rel_x
-    features['enemy_rel_y'] = enemy_rel_y
-    features['enemy_rel_z'] = enemy_rel_z
-    features['enemy_hp'] = int(nearest_enemy.health or 0)
-    features['enemy_distance'] = math.sqrt(enemy_rel_x ** 2 + enemy_rel_y ** 2 + enemy_rel_z ** 2)
     return features
 
 
@@ -161,3 +148,4 @@ def _pitch_from_forward(forward: Vector3 | None) -> float:
     if horizontal == 0.0 and forward.z == 0.0:
         return 0.0
     return math.degrees(math.atan2(forward.z, horizontal))
+
