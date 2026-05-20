@@ -5,7 +5,7 @@ param (
     [int]$BatchSize = 64,
     [int]$SeqLen = 16,
     [int]$Stride = 16,
-    [int]$NumWorkers = 0,
+    [int]$NumWorkers = -1,
     [int]$LogInterval = 10,
     [int]$MaxSamples = 0,
     [int]$MaxSamplesPerDemo = 20000,

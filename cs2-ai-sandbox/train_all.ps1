@@ -2,7 +2,7 @@ param (
     [int]$Epochs = 10,
     [int]$BatchSize = 64,
     [string]$SplitMode = "demo",
-    [int]$NumWorkers = 0,
+    [int]$NumWorkers = -1,
     [int]$MaxSamples = 0,
     [int]$MaxSamplesPerDemo = 0,
     [switch]$ShowIndexProgress,

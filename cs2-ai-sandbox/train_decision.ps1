@@ -2,6 +2,7 @@ param (
     [int]$Epochs = 3,
     [int]$BatchSize = 32,
     [string]$SplitMode = "demo",
+    [int]$NumWorkers = -1,
     [int]$MaxSamples = 0,
     [int]$MaxSamplesPerDemo = 0,
     [string]$SavePath = "checkpoints\decision_dqn.pt",
@@ -15,6 +16,7 @@ $args = @(
     "--epochs", $Epochs,
     "--batch-size", $BatchSize,
     "--split-mode", $SplitMode,
+    "--num-workers", $NumWorkers,
     "--save-path", $SavePath
 )
 

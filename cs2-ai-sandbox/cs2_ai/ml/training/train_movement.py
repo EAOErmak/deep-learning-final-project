@@ -28,7 +28,7 @@ from cs2_ai.features.feature_contract import FeatureSchema
 from cs2_ai.features.movement_features import MovementFeatureExtractor, build_movement_target
 from cs2_ai.ml.models.decision_dqn import DecisionDQN
 from cs2_ai.ml.utils.tensorboard_utils import close_summary_writer, create_summary_writer, log_scalar_dict, tensorboard_available
-from cs2_ai.ml.utils.torch_utils import get_device, set_seed, torch_available
+from cs2_ai.ml.utils.torch_utils import build_dataloader_kwargs, configure_torch_runtime, get_device, set_seed, torch_available
 
 if torch_available():
     import torch
@@ -246,8 +246,8 @@ class MovementTrainer:
 
 
 def collate_movement_batch(batch: list[tuple[np.ndarray, np.ndarray, dict[str, str]]]) -> tuple['torch.Tensor', 'torch.Tensor', list[dict[str, str]]]:
-    features = torch.tensor(np.stack([item[0] for item in batch]), dtype=torch.float32)
-    targets = torch.tensor(np.stack([item[1] for item in batch]), dtype=torch.float32)
+    features = torch.from_numpy(np.stack([item[0] for item in batch]).astype(np.float32, copy=False))
+    targets = torch.from_numpy(np.stack([item[1] for item in batch]).astype(np.float32, copy=False))
     metas = [item[2] for item in batch]
     return features, targets, metas
 
@@ -356,7 +356,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--split-mode', choices=['demo', 'round', 'random'], default='demo')
     parser.add_argument('--alive-only', action='store_true', default=True)
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--num-workers', type=int, default=0)
+    parser.add_argument('--num-workers', type=int, default=-1)
     parser.add_argument('--max-samples', type=int, default=None)
     parser.add_argument('--max-samples-per-demo', type=int, default=None)
     parser.add_argument('--max-cached-demos', type=int, default=2)
@@ -396,6 +396,7 @@ def main() -> int:
     args = parse_args()
     set_seed(args.seed)
     device = get_device()
+    runtime_info = configure_torch_runtime(device)
 
     try:
         print('Building dataset...')
@@ -419,17 +420,15 @@ def main() -> int:
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
         collate_fn=collate_movement_batch,
-        pin_memory=(device == 'cuda'),
+        **build_dataloader_kwargs(device, args.num_workers, is_training=True),
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
         collate_fn=collate_movement_batch,
-        pin_memory=(device == 'cuda'),
+        **build_dataloader_kwargs(device, args.num_workers, is_training=False),
     )
 
     print('Initializing model and trainer...')
@@ -477,6 +476,8 @@ def main() -> int:
     print(f'Total samples: {dataset_len}')
     print(f'Train samples: {len(train_dataset)}')
     print(f'Val samples: {len(val_dataset)}')
+    print(f'DataLoader workers: {train_loader.num_workers}')
+    print(f'CUDA tuning: matmul={runtime_info["matmul_precision"]} cudnn_benchmark={runtime_info["cudnn_benchmark"]} tf32={runtime_info["tf32"]}')
     print(f'Split mode: {args.split_mode}')
     print(f'Feature dim: {feature_extractor.feature_dim()}')
     print(f'Save path: {args.save_path}')

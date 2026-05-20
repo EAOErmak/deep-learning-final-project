@@ -6,7 +6,7 @@ param (
     [int]$SeqLen = 16,
     [int]$Stride = 4,
     [string]$SplitMode = "demo",
-    [int]$NumWorkers = 0,
+    [int]$NumWorkers = -1,
     [int]$LogInterval = 10,
     [int]$LogEvery = 10,
     [int]$MaxSamples = 0,
