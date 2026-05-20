@@ -29,8 +29,11 @@ def configure_logging() -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='CS2 AI sandbox runtime')
     parser.add_argument('--state-source', choices=['mock', 'gsi'], default='mock')
-    parser.add_argument('--agent-mode', choices=['auto', 'dummy', 'pipeline', 'neural-random', 'neural-checkpoint'], default='auto')
+    parser.add_argument('--agent-mode', choices=['auto', 'dummy', 'pipeline', 'neural-random', 'neural-checkpoint', 'neural-pipeline'], default='auto')
     parser.add_argument('--checkpoint', type=str, default=None)
+    parser.add_argument('--aim-checkpoint', type=str, default=None)
+    parser.add_argument('--movement-checkpoint', type=str, default=None)
+    parser.add_argument('--tracker-checkpoint', type=str, default=None)
     parser.add_argument('--gsi-port', type=int, default=3000)
     parser.add_argument('--hz', type=float, default=10.0)
     parser.add_argument('--seed', type=int, default=42)
@@ -40,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_agent(state_source: str, agent_mode: str, seed: int, checkpoint: str | None) -> Any:
+def build_agent(state_source: str, agent_mode: str, seed: int, args: argparse.Namespace) -> Any:
     resolved_mode = agent_mode
     if agent_mode == 'auto':
         resolved_mode = 'pipeline' if state_source == 'gsi' else 'dummy'
@@ -55,10 +58,20 @@ def build_agent(state_source: str, agent_mode: str, seed: int, checkpoint: str |
         logging.info('Using NeuralRuntimeAgent with random untrained PyTorch weights.')
         return NeuralRuntimeAgent(seed=seed)
     if resolved_mode == 'neural-checkpoint':
+        checkpoint = args.checkpoint
         if not checkpoint:
             raise ValueError('--checkpoint is required for --agent-mode neural-checkpoint')
         logging.info('Using NeuralRuntimeAgent with trained checkpoint.')
         return NeuralRuntimeAgent(seed=seed, checkpoint_path=checkpoint)
+    if resolved_mode == 'neural-pipeline':
+        logging.info('Using FullNeuralRuntimeAgent with modular NeuralAIPipeline.')
+        from neural_runtime_agent import FullNeuralRuntimeAgent
+        return FullNeuralRuntimeAgent(
+            seed=seed, 
+            aim_checkpoint=args.aim_checkpoint, 
+            movement_checkpoint=args.movement_checkpoint, 
+            tracker_checkpoint=args.tracker_checkpoint
+        )
     raise ValueError(f'Unsupported agent mode: {agent_mode}')
 
 
@@ -104,7 +117,7 @@ def main() -> int:
         gsi_server.start()
 
     state_reader = StateReader(mode=args.state_source, gsi_server=gsi_server)
-    agent = build_agent(args.state_source, args.agent_mode, args.seed, args.checkpoint)
+    agent = build_agent(args.state_source, args.agent_mode, args.seed, args)
     window_keywords = tuple(args.window_keyword) if args.window_keyword else ('counter-strike', 'cs2')
     input_controller = InputController(
         window_guard_enabled=not args.disable_window_guard,

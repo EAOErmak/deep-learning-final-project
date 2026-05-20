@@ -12,7 +12,7 @@ class EnemyTrackerFeatureExtractor:
         return np.asarray([self._state_to_vector(state) for state in sequence.states], dtype=np.float32)
 
     def feature_dim(self) -> int:
-        return 52
+        return 54
 
     def _state_to_vector(self, state) -> list[float]:
         self_player = state.self_player

@@ -12,7 +12,7 @@ class AimFeatureExtractor:
         return np.asarray([self._state_to_vector(state, belief_state) for state in sequence.states], dtype=np.float32)
 
     def feature_dim(self) -> int:
-        return 22
+        return 20
 
     def _state_to_vector(self, state, belief_state: BeliefStateData | None) -> list[float]:
         self_player = state.self_player
