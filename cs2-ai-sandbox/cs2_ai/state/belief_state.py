@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 from cs2_ai.features.encoding import relative_position
-from cs2_ai.schemas.game_state import GameState
+from cs2_ai.schemas.game_state import GameState, VisibilityStatus
 from cs2_ai.schemas.module_outputs import BeliefStateData, EnemyTrackerOutput
 
 
 class BeliefState:
     def update(self, game_state: GameState, enemy_tracker_output: EnemyTrackerOutput) -> BeliefStateData:
         danger_zones: dict[str, float] = {}
-        enemy_places = {enemy.steamid: enemy.last_place_name or "unknown" for enemy in game_state.enemies}
+        enemy_places = {
+            enemy.steamid: (enemy.last_place_name or "unknown")
+            for enemy in game_state.enemies
+            if enemy.visibility == VisibilityStatus.VISIBLE.value
+        }
         best_prediction = None
         coarse_enemy_counts = {"A": 0.0, "B": 0.0, "mid": 0.0}
         for prediction in enemy_tracker_output.predictions:

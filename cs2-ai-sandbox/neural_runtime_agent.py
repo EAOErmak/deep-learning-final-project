@@ -6,6 +6,7 @@ from typing import Any
 
 from cs2_ai.ml.models.decision_dqn import DecisionDQN
 from cs2_ai.ml.utils.torch_utils import get_device, set_seed, torch_available
+from cs2_ai.features.feature_contract import validate_checkpoint_schema
 from game_state import GameState
 
 ActionDict = dict[str, Any]
@@ -156,23 +157,36 @@ class FullNeuralRuntimeAgent:
         set_seed(seed)
         self.device = get_device()
         self.logger = logging.getLogger(__name__)
+        if not aim_checkpoint or not movement_checkpoint or not tracker_checkpoint:
+            raise ValueError('neural-pipeline requires --aim-checkpoint, --movement-checkpoint, and --tracker-checkpoint.')
+        checkpoints = {
+            'aim': self._load_checkpoint(Path(aim_checkpoint), expected_model_type='aim_attention'),
+            'movement': self._load_checkpoint(Path(movement_checkpoint), expected_model_type='decision_dqn_movement'),
+            'tracker': self._load_checkpoint(Path(tracker_checkpoint), expected_model_type='enemy_tracker_lstm'),
+        }
+        seq_lens = {name: int(checkpoint['feature_schema']['seq_len']) for name, checkpoint in checkpoints.items()}
+        if len(set(seq_lens.values())) != 1:
+            raise ValueError(f'Checkpoint seq_len mismatch across neural pipeline modules: {seq_lens}')
+        shared_seq_len = next(iter(seq_lens.values()))
+        self.aim_extractor = AimFeatureExtractor(seq_len=shared_seq_len)
+        self.movement_extractor = MovementFeatureExtractor(seq_len=shared_seq_len)
+        self.tracker_extractor = EnemyTrackerFeatureExtractor(seq_len=shared_seq_len)
+        validate_checkpoint_schema(checkpoints['aim'], self.aim_extractor.schema(), str(aim_checkpoint))
+        validate_checkpoint_schema(checkpoints['movement'], self.movement_extractor.schema(), str(movement_checkpoint))
+        validate_checkpoint_schema(checkpoints['tracker'], self.tracker_extractor.schema(), str(tracker_checkpoint))
 
-        self.aim_model = AimAttentionModel(input_dim=AimFeatureExtractor().feature_dim()).to(self.device)
-        self.movement_model = DecisionDQN(input_dim=MovementFeatureExtractor().feature_dim(), action_dim=6).to(self.device)
-        self.tracker_model = EnemyTrackerLSTM(input_dim=EnemyTrackerFeatureExtractor().feature_dim(), output_enemies=MAX_ENEMIES).to(self.device)
-
-        if aim_checkpoint and Path(aim_checkpoint).exists():
-            self.aim_model.load_state_dict(torch.load(aim_checkpoint, map_location=self.device).get('model_state_dict'))
-        if movement_checkpoint and Path(movement_checkpoint).exists():
-            self.movement_model.load_state_dict(torch.load(movement_checkpoint, map_location=self.device).get('model_state_dict'))
-        if tracker_checkpoint and Path(tracker_checkpoint).exists():
-            self.tracker_model.load_state_dict(torch.load(tracker_checkpoint, map_location=self.device).get('model_state_dict'))
+        self.aim_model = AimAttentionModel(input_dim=self.aim_extractor.feature_dim()).to(self.device)
+        self.movement_model = DecisionDQN(input_dim=self.movement_extractor.feature_dim(), action_dim=6).to(self.device)
+        self.tracker_model = EnemyTrackerLSTM(input_dim=self.tracker_extractor.feature_dim(), output_enemies=MAX_ENEMIES).to(self.device)
+        self.aim_model.load_state_dict(checkpoints['aim']['model_state_dict'])
+        self.movement_model.load_state_dict(checkpoints['movement']['model_state_dict'])
+        self.tracker_model.load_state_dict(checkpoints['tracker']['model_state_dict'])
 
         self.aim_model.eval()
         self.movement_model.eval()
         self.tracker_model.eval()
 
-        self.pipeline = NeuralAIPipeline(self.aim_model, self.movement_model, self.tracker_model, device=self.device)
+        self.pipeline = NeuralAIPipeline(self.aim_model, self.movement_model, self.tracker_model, memory_len=shared_seq_len, device=self.device)
         self.runtime_adapter = None
         
         if yolo_weights and Path(yolo_weights).exists():
@@ -183,6 +197,20 @@ class FullNeuralRuntimeAgent:
             self.vision_module = None
             
         self.logger.info('FullNeuralRuntimeAgent initialized.')
+
+    def _load_checkpoint(self, checkpoint_path: Path, expected_model_type: str) -> dict[str, Any]:
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f'Checkpoint not found: {checkpoint_path}')
+        import torch
+
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        if not isinstance(checkpoint, dict) or 'model_state_dict' not in checkpoint:
+            raise ValueError(f'Unsupported checkpoint format: {checkpoint_path}')
+        if checkpoint.get('model_type') != expected_model_type:
+            raise ValueError(
+                f'Checkpoint {checkpoint_path} has model_type={checkpoint.get("model_type")!r}, expected {expected_model_type!r}.'
+            )
+        return checkpoint
 
     def predict_state(self, game_state: GameState, _features: dict[str, float | int | bool] | None = None) -> ActionDict:
         from runtime_agent import PipelineRuntimeAgent

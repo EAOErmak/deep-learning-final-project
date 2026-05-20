@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from cs2_ai.dataset.multi_demo_sequence_dataset import MultiDemoSequenceDataset, split_dataset_by_group
 from cs2_ai.features.aim_features import AimFeatureExtractor, build_aim_target
+from cs2_ai.features.feature_contract import FeatureSchema
 from cs2_ai.ml.models.aim_attention import AimAttentionModel
 from cs2_ai.ml.utils.tensorboard_utils import close_summary_writer, create_summary_writer, log_scalar_dict, tensorboard_available
 from cs2_ai.ml.utils.torch_utils import get_device, set_seed, torch_available
@@ -58,9 +59,9 @@ def get_base_dataset_and_index(dataset: Any, idx: int) -> tuple[Any, int]:
 
 
 class AimSequenceTorchDataset(Dataset):
-    def __init__(self, base_dataset, require_spotted_enemy: bool = True):
+    def __init__(self, base_dataset, seq_len: int, require_spotted_enemy: bool = True):
         self.base_dataset = base_dataset
-        self.feature_extractor = AimFeatureExtractor()
+        self.feature_extractor = AimFeatureExtractor(seq_len=seq_len)
         self.require_spotted_enemy = require_spotted_enemy
         self.valid_indices = self._build_valid_indices()
 
@@ -398,14 +399,15 @@ def append_epoch_summary(log_path: Path, epoch_summary: dict[str, object]) -> No
         handle.write(json.dumps(epoch_summary, ensure_ascii=True) + '\n')
 
 
-def save_checkpoint(save_path: Path, model: 'torch.nn.Module', args: argparse.Namespace, train_metrics: dict[str, object], val_metrics: dict[str, object], dataset_label: str, input_dim: int, demo_names: list[str]) -> None:
+def save_checkpoint(save_path: Path, model: 'torch.nn.Module', args: argparse.Namespace, train_metrics: dict[str, object], val_metrics: dict[str, object], dataset_label: str, schema: FeatureSchema, demo_names: list[str]) -> None:
     save_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
         'model_state_dict': model.state_dict(),
         'model_type': 'aim_attention',
-        'input_dim': input_dim,
+        'input_dim': schema.feature_dim,
         'seq_len': args.seq_len,
         'stride': args.stride,
+        'feature_schema': schema.to_metadata(),
         'dataset_source': dataset_label,
         'demo_names': demo_names,
         'demo_count': len(demo_names),
@@ -456,7 +458,7 @@ def build_dataset(args: argparse.Namespace) -> AimSequenceTorchDataset:
     )
     print(f'Demo files indexed: {len(base_dataset.demo_paths)}')
     print(f'Sequence samples built: {len(base_dataset)}')
-    return AimSequenceTorchDataset(base_dataset, require_spotted_enemy=not args.allow_no_spotted_enemy)
+    return AimSequenceTorchDataset(base_dataset, seq_len=args.seq_len, require_spotted_enemy=not args.allow_no_spotted_enemy)
 
 
 def main() -> int:
@@ -486,7 +488,8 @@ def main() -> int:
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=collate_aim_batch, pin_memory=(device == 'cuda'))
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=collate_aim_batch, pin_memory=(device == 'cuda'))
 
-    feature_extractor = AimFeatureExtractor()
+    feature_extractor = AimFeatureExtractor(seq_len=args.seq_len)
+    feature_schema = feature_extractor.schema()
     model = AimAttentionModel(input_dim=feature_extractor.feature_dim()).to(device)
     trainer = AimTrainer(model=model, device=device, learning_rate=args.lr, log_interval=args.log_interval)
     demo_names = dataset.base_dataset.get_demo_names()
@@ -577,7 +580,7 @@ def main() -> int:
 
             if val_metrics['loss'] < best_val_loss:
                 best_val_loss = val_metrics['loss']
-                save_checkpoint(args.save_path, model, args, train_metrics, val_metrics, dataset_label, feature_extractor.feature_dim(), demo_names)
+                save_checkpoint(args.save_path, model, args, train_metrics, val_metrics, dataset_label, feature_schema, demo_names)
                 print(f'  saved checkpoint -> {args.save_path}')
     finally:
         close_summary_writer(writer)

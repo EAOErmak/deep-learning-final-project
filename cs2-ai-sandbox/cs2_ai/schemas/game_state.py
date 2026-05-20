@@ -1,6 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
+
+
+class VisibilityStatus(StrEnum):
+    VISIBLE = "visible"
+    LAST_SEEN = "last_seen"
+    HIDDEN_TRUTH_ONLY = "hidden_truth_only"
+    UNAVAILABLE = "unavailable"
 
 
 @dataclass(slots=True)
@@ -33,6 +41,7 @@ class PlayerState:
     in_bomb_zone: bool
     in_buy_zone: bool
     which_bomb_zone: int
+    visibility: str = VisibilityStatus.VISIBLE.value
 
 
 @dataclass(slots=True)
@@ -91,3 +100,20 @@ class GameState:
 class GameStateSequence:
     perspective_steamid: int
     states: list[GameState]
+
+
+@dataclass(slots=True)
+class DemoTruthState:
+    tick: int
+    perspective_steamid: int
+    self_player: PlayerState
+    teammates: list[PlayerState]
+    enemies: list[PlayerState]
+    round: RoundState
+    bomb: BombState
+
+
+@dataclass(slots=True)
+class StateBundle:
+    observed_state: GameState
+    truth_state: DemoTruthState

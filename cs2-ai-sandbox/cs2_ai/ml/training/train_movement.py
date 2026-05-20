@@ -24,6 +24,7 @@ import numpy as np
 from torch.utils.data import DataLoader, Dataset
 
 from cs2_ai.dataset.multi_demo_sequence_dataset import MultiDemoSequenceDataset, split_dataset_by_group
+from cs2_ai.features.feature_contract import FeatureSchema
 from cs2_ai.features.movement_features import MovementFeatureExtractor, build_movement_target
 from cs2_ai.ml.models.decision_dqn import DecisionDQN
 from cs2_ai.ml.utils.tensorboard_utils import close_summary_writer, create_summary_writer, log_scalar_dict, tensorboard_available
@@ -64,7 +65,7 @@ class MovementSequenceTorchDataset(Dataset):
 
     def __init__(self, base_dataset):
         self.base_dataset = base_dataset
-        self.feature_extractor = MovementFeatureExtractor()
+        self.feature_extractor = MovementFeatureExtractor(seq_len=getattr(base_dataset, "seq_len", None))
 
     def __len__(self) -> int:
         return len(self.base_dataset)
@@ -309,24 +310,25 @@ def save_checkpoint(
     train_metrics: dict[str, object],
     val_metrics: dict[str, object],
     dataset_label: str,
-    input_dim: int,
+    schema: FeatureSchema,
     demo_names: list[str],
 ) -> None:
     save_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
         'model_state_dict': model.state_dict(),
         'model_type': 'decision_dqn_movement',
-        'input_dim': input_dim,
+        'input_dim': schema.feature_dim,
         'action_dim': 6,
         'seq_len': args.seq_len,
         'stride': args.stride,
+        'feature_schema': schema.to_metadata(),
         'dataset_source': dataset_label,
         'demo_names': demo_names,
         'demo_count': len(demo_names),
         'split_mode': args.split_mode,
         'train_metrics': {k: v for k, v in train_metrics.items() if k not in {'seen_sample_ids', 'per_demo_loss', 'per_demo_seen_counts'}},
         'val_metrics': {k: v for k, v in val_metrics.items() if k not in {'seen_sample_ids', 'per_demo_loss', 'per_demo_seen_counts'}},
-        'feature_order': 'MovementFeatureExtractor sequence output',
+        'feature_order': list(schema.feature_names),
     }
     torch.save(checkpoint, save_path)
 
@@ -417,7 +419,8 @@ def main() -> int:
         pin_memory=(device == 'cuda'),
     )
 
-    feature_extractor = MovementFeatureExtractor()
+    feature_extractor = MovementFeatureExtractor(seq_len=args.seq_len)
+    feature_schema = feature_extractor.schema()
     model = DecisionDQN(input_dim=feature_extractor.feature_dim(), action_dim=6, hidden_dim=args.hidden_dim).to(device)
     trainer = MovementTrainer(
         model=model,
@@ -522,7 +525,7 @@ def main() -> int:
                 best_val_loss = val_metrics['loss']
                 best_train_metrics = train_metrics
                 best_val_metrics = val_metrics
-                save_checkpoint(args.save_path, model, args, train_metrics, val_metrics, dataset_label, feature_extractor.feature_dim(), demo_names)
+                save_checkpoint(args.save_path, model, args, train_metrics, val_metrics, dataset_label, feature_schema, demo_names)
                 print(f'  saved checkpoint -> {args.save_path}')
     finally:
         close_summary_writer(writer)

@@ -5,11 +5,17 @@ from typing import Any
 import pandas as pd
 
 from cs2_ai.config import weapon_to_id
-from cs2_ai.schemas.game_state import BombState, GameState, PlayerInputState, PlayerState, RoundState
+from cs2_ai.schemas.game_state import BombState, DemoTruthState, GameState, PlayerInputState, PlayerState, RoundState, StateBundle, VisibilityStatus
 
 
 class GameStateBuilder:
     def build_from_tick_rows(self, tick_rows: pd.DataFrame, perspective_steamid: int) -> GameState:
+        return self.build_state_bundle_from_tick_rows(tick_rows, perspective_steamid).observed_state
+
+    def build_truth_from_tick_rows(self, tick_rows: pd.DataFrame, perspective_steamid: int) -> DemoTruthState:
+        return self.build_state_bundle_from_tick_rows(tick_rows, perspective_steamid).truth_state
+
+    def build_state_bundle_from_tick_rows(self, tick_rows: pd.DataFrame, perspective_steamid: int) -> StateBundle:
         if tick_rows.empty:
             raise ValueError("tick_rows is empty")
         steamids = pd.to_numeric(tick_rows["steamid"], errors="coerce") if "steamid" in tick_rows.columns else pd.Series(dtype="float64")
@@ -19,15 +25,19 @@ class GameStateBuilder:
         self_row = self_rows.iloc[0]
         self_team = self._as_int(self._safe_get(self_row, "team_num", 0))
         teammates: list[PlayerState] = []
-        enemies: list[PlayerState] = []
+        observed_enemies: list[PlayerState] = []
+        truth_enemies: list[PlayerState] = []
         for _, row in tick_rows.iterrows():
-            player = self._build_player_state(row)
+            is_visible = self._as_bool(self._safe_get(row, "spotted", False))
+            player = self._build_player_state(row, visibility=VisibilityStatus.VISIBLE if is_visible else VisibilityStatus.HIDDEN_TRUTH_ONLY)
             if player.steamid == int(perspective_steamid):
                 continue
             if player.team_num == self_team:
                 teammates.append(player)
             else:
-                enemies.append(player)
+                truth_enemies.append(player)
+                if is_visible:
+                    observed_enemies.append(self._build_player_state(row, visibility=VisibilityStatus.VISIBLE))
         tick_value = self._as_int(self._safe_get(self_row, "tick", self._safe_get(tick_rows.iloc[0], "tick", 0)))
         round_row = self_row
         round_state = RoundState(
@@ -48,18 +58,28 @@ class GameStateBuilder:
             is_bomb_dropped=self._as_bool(self._safe_get(round_row, "is_bomb_dropped", False)),
             bomb_position=None,
         )
-        return GameState(
+        observed_state = GameState(
             tick=tick_value,
             perspective_steamid=int(perspective_steamid),
-            self_player=self._build_player_state(self_row),
+            self_player=self._build_player_state(self_row, visibility=VisibilityStatus.VISIBLE),
             self_input=self._build_input_state(self_row),
             teammates=teammates,
-            enemies=enemies,
+            enemies=observed_enemies,
             round=round_state,
             bomb=bomb_state,
         )
+        truth_state = DemoTruthState(
+            tick=tick_value,
+            perspective_steamid=int(perspective_steamid),
+            self_player=self._build_player_state(self_row, visibility=VisibilityStatus.VISIBLE),
+            teammates=teammates,
+            enemies=truth_enemies,
+            round=round_state,
+            bomb=bomb_state,
+        )
+        return StateBundle(observed_state=observed_state, truth_state=truth_state)
 
-    def _build_player_state(self, row: pd.Series) -> PlayerState:
+    def _build_player_state(self, row: pd.Series, visibility: VisibilityStatus = VisibilityStatus.VISIBLE) -> PlayerState:
         weapon = str(self._safe_get(row, "active_weapon_name", "none") or "none")
         return PlayerState(
             steamid=self._as_int(self._safe_get(row, "steamid", 0)),
@@ -85,11 +105,12 @@ class GameStateBuilder:
             ducking=self._as_bool(self._safe_get(row, "ducking", False)),
             shots_fired=self._as_int(self._safe_get(row, "shots_fired", 0)),
             flash_duration=self._as_float(self._safe_get(row, "flash_duration", 0.0)),
-            spotted=self._as_bool(self._safe_get(row, "spotted", False)),
+            spotted=(str(visibility) == VisibilityStatus.VISIBLE.value),
             last_place_name=str(self._safe_get(row, "last_place_name", "unknown")),
             in_bomb_zone=self._as_bool(self._safe_get(row, "in_bomb_zone", False)),
             in_buy_zone=self._as_bool(self._safe_get(row, "in_buy_zone", False)),
             which_bomb_zone=self._as_int(self._safe_get(row, "which_bomb_zone", 0)),
+            visibility=str(visibility),
         )
 
     def _build_input_state(self, row: pd.Series) -> PlayerInputState:

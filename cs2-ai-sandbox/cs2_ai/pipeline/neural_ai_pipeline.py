@@ -30,9 +30,9 @@ class NeuralAIPipeline:
         self.coordinator = ActionCoordinator()
         self.input_controller = DryRunInputController()
         
-        self.tracker_extractor = EnemyTrackerFeatureExtractor()
-        self.movement_extractor = MovementFeatureExtractor()
-        self.aim_extractor = AimFeatureExtractor()
+        self.tracker_extractor = EnemyTrackerFeatureExtractor(seq_len=memory_len)
+        self.movement_extractor = MovementFeatureExtractor(seq_len=memory_len)
+        self.aim_extractor = AimFeatureExtractor(seq_len=memory_len)
         
         self.last_enemy_tracker_output = None
         self.last_belief_state = None
@@ -75,7 +75,7 @@ class NeuralAIPipeline:
         self.last_decision_output = self.decision_maker.decide(game_state, self.last_belief_state)
         
         # 4. Movement
-        movement_features = torch.tensor(self.movement_extractor.extract(sequence, self.last_decision_output, self.last_belief_state), dtype=torch.float32, device=self.device).unsqueeze(0)
+        movement_features = torch.tensor(self.movement_extractor.extract(sequence), dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
             movement_logits = self.movement_model(movement_features)
             # movement_logits is [1, SeqLen, 6], we only need the last timestep
@@ -106,7 +106,7 @@ class NeuralAIPipeline:
         )
         
         # 5. Aim Shoot
-        aim_features = torch.tensor(self.aim_extractor.extract(sequence, self.last_belief_state, vision_target=vision_target), dtype=torch.float32, device=self.device).unsqueeze(0)
+        aim_features = torch.tensor(self.aim_extractor.extract(sequence), dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
             aim_delta, shoot_logits, rightclick_logits = self.aim_model(aim_features)
             
@@ -135,7 +135,7 @@ class NeuralAIPipeline:
         return self.last_action_plan
 
     def _resolve_prediction_roster(self, game_state: GameState, roster_size: int) -> list[int]:
-        sorted_enemies = sorted(game_state.enemies, key=lambda item: (not item.spotted, int(item.steamid)))
+        sorted_enemies = sorted(game_state.enemies, key=lambda item: int(item.steamid))
         roster = [int(enemy.steamid) for enemy in sorted_enemies[:roster_size]]
         while len(roster) < roster_size:
             roster.append(-(len(roster) + 1))
