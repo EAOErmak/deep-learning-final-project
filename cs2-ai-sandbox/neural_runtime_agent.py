@@ -12,6 +12,13 @@ ActionDict = dict[str, Any]
 
 
 class NeuralRuntimeAgent:
+    """Legacy feature-vector runtime agent.
+
+    This path is kept for backward compatibility with old single-checkpoint
+    experiments. Current supervised training in this project is modular and
+    should use FullNeuralRuntimeAgent instead.
+    """
+
     FEATURE_ORDER = [
         'self_x',
         'self_y',
@@ -62,12 +69,21 @@ class NeuralRuntimeAgent:
             self.logger.info('NeuralRuntimeAgent initialized | device=%s | checkpoint=%s | input_dim=%s', self.device, checkpoint_path, len(self.FEATURE_ORDER))
         else:
             self.logger.info('NeuralRuntimeAgent initialized | device=%s | seed=%s | input_dim=%s', self.device, seed, len(self.FEATURE_ORDER))
+            self.logger.warning('NeuralRuntimeAgent is a legacy feature-vector path. Use neural-pipeline for current modular checkpoints.')
 
     def load_checkpoint(self, checkpoint_path: str) -> None:
         checkpoint_file = Path(checkpoint_path)
         if not checkpoint_file.exists():
             raise FileNotFoundError(f'Checkpoint not found: {checkpoint_file}')
         checkpoint = self.torch.load(checkpoint_file, map_location=self.device)
+        if isinstance(checkpoint, dict):
+            model_type = checkpoint.get('model_type')
+            input_dim = checkpoint.get('input_dim')
+            if model_type in {'movement_bc', 'decision_dqn_movement', 'aim_attention', 'enemy_tracker_lstm'} or input_dim not in {None, len(self.FEATURE_ORDER)}:
+                raise ValueError(
+                    f'Checkpoint {checkpoint_file} is not compatible with NeuralRuntimeAgent legacy feature-vector mode. '
+                    'Use --agent-mode neural-pipeline with modular checkpoints instead.'
+                )
         state_dict = checkpoint.get('model_state_dict') if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint else checkpoint
         if not isinstance(state_dict, dict):
             raise ValueError(f'Unsupported checkpoint format: {checkpoint_file}')
@@ -142,7 +158,7 @@ class FullNeuralRuntimeAgent:
         self.logger = logging.getLogger(__name__)
 
         self.aim_model = AimAttentionModel(input_dim=AimFeatureExtractor().feature_dim()).to(self.device)
-        self.movement_model = DecisionDQN(input_dim=MovementFeatureExtractor().feature_dim(), action_dim=8).to(self.device)
+        self.movement_model = DecisionDQN(input_dim=MovementFeatureExtractor().feature_dim(), action_dim=6).to(self.device)
         self.tracker_model = EnemyTrackerLSTM(input_dim=EnemyTrackerFeatureExtractor().feature_dim(), output_enemies=MAX_ENEMIES).to(self.device)
 
         if aim_checkpoint and Path(aim_checkpoint).exists():
@@ -157,6 +173,7 @@ class FullNeuralRuntimeAgent:
         self.tracker_model.eval()
 
         self.pipeline = NeuralAIPipeline(self.aim_model, self.movement_model, self.tracker_model, device=self.device)
+        self.runtime_adapter = None
         
         if yolo_weights and Path(yolo_weights).exists():
             from cs2_ai.vision.yolo_pipeline import YoloVisionModule
@@ -169,20 +186,21 @@ class FullNeuralRuntimeAgent:
 
     def predict_state(self, game_state: GameState, _features: dict[str, float | int | bool] | None = None) -> ActionDict:
         from runtime_agent import PipelineRuntimeAgent
-        
-        # We need to convert GameState to AIGameState, then call pipeline.step()
-        # The easiest way is to borrow PipelineRuntimeAgent's conversion methods
-        agent_helper = PipelineRuntimeAgent()
-        ai_state = agent_helper._to_ai_game_state(game_state)
+
+        if self.runtime_adapter is None:
+            self.runtime_adapter = PipelineRuntimeAgent()
+
+        ai_state = self.runtime_adapter.to_ai_game_state(game_state)
         
         vision_target = None
         if self.vision_module:
-            if ai_state.self_player:
-                self.vision_module.update_context(ai_state.self_player.team)
+            controlled = game_state.controlled_player
+            team_name = (controlled.team or '') if controlled is not None else ''
+            self.vision_module.update_context(team_name)
             vision_target = self.vision_module.get_latest_target()
             
         action_plan = self.pipeline.step(ai_state, vision_target=vision_target)
-        action = agent_helper._action_plan_to_action_dict(action_plan)
+        action = self.runtime_adapter.action_plan_to_action_dict(action_plan)
         
         self.logger.info('FullNeuralRuntimeAgent action dict: %s', action)
         return action

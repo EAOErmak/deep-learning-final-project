@@ -33,6 +33,7 @@ else:
 class AimTrainingBatch:
     features: 'torch.Tensor'
     targets: 'torch.Tensor'
+    visible_enemy_mask: 'torch.Tensor'
     sample_ids: list[str]
     demo_names: list[str]
 
@@ -57,22 +58,56 @@ def get_base_dataset_and_index(dataset: Any, idx: int) -> tuple[Any, int]:
 
 
 class AimSequenceTorchDataset(Dataset):
-    def __init__(self, base_dataset):
+    def __init__(self, base_dataset, require_spotted_enemy: bool = True):
         self.base_dataset = base_dataset
         self.feature_extractor = AimFeatureExtractor()
+        self.require_spotted_enemy = require_spotted_enemy
+        self.valid_indices = self._build_valid_indices()
 
     def __len__(self) -> int:
-        return len(self.base_dataset)
+        return len(self.valid_indices)
 
     def get_sample_metadata(self, idx: int) -> dict[str, object]:
+        base_idx = self.valid_indices[idx]
+        ds, real_idx = get_base_dataset_and_index(self.base_dataset, base_idx)
+        return ds.get_sample_metadata(real_idx)
+
+    def _build_valid_indices(self) -> list[int]:
+        if not self.require_spotted_enemy:
+            return list(range(len(self.base_dataset)))
+
+        valid_indices: list[int] = []
+        for idx in range(len(self.base_dataset)):
+            sample_metadata = self.get_base_sample_metadata(idx)
+            if self.sample_has_spotted_enemy(sample_metadata):
+                valid_indices.append(idx)
+        return valid_indices
+
+    def get_base_sample_metadata(self, idx: int) -> dict[str, object]:
         ds, real_idx = get_base_dataset_and_index(self.base_dataset, idx)
         return ds.get_sample_metadata(real_idx)
+
+    def sample_has_spotted_enemy(self, sample_metadata: dict[str, object]) -> bool:
+        ds = self.base_dataset
+        while hasattr(ds, 'dataset'):
+            ds = ds.dataset
+        ticks_to_check = [int(tick) for tick in sample_metadata.get('tick_indices', ())]
+        ticks_to_check.append(int(sample_metadata['target_tick']))
+        for tick in ticks_to_check:
+            try:
+                state = ds.build_state_for_sample_tick(sample_metadata, tick)
+            except Exception:
+                continue
+            if any(enemy.spotted and enemy.is_alive for enemy in state.enemies):
+                return True
+        return False
 
     def build_target(self, idx: int | None = None, sample_metadata: dict[str, object] | None = None) -> np.ndarray:
         if sample_metadata is None:
             if idx is None:
                 raise ValueError('Either idx or sample_metadata must be provided')
-            ds, real_idx = get_base_dataset_and_index(self.base_dataset, idx)
+            base_idx = self.valid_indices[idx]
+            ds, real_idx = get_base_dataset_and_index(self.base_dataset, base_idx)
             sample_metadata = ds.get_sample_metadata(real_idx)
         else:
             ds = self.base_dataset
@@ -87,15 +122,17 @@ class AimSequenceTorchDataset(Dataset):
         return build_aim_target(target_state, next_state).astype(np.float32)
 
     def __getitem__(self, idx: int) -> tuple[np.ndarray, np.ndarray, dict[str, str]]:
-        sequence_sample = self.base_dataset[idx]
+        base_idx = self.valid_indices[idx]
+        sequence_sample = self.base_dataset[base_idx]
         features = self.feature_extractor.extract(sequence_sample.sequence)
         sample_metadata = self.get_sample_metadata(idx)
         target = self.build_target(sample_metadata=sample_metadata)
+        visible_enemy_mask = np.asarray([1.0 if self.sample_has_spotted_enemy(sample_metadata) else 0.0], dtype=np.float32)
         meta = {
             'sample_id': str(sample_metadata['sample_id']),
             'demo_name': str(sample_metadata['demo_name']),
         }
-        return features.astype(np.float32), target.astype(np.float32), meta
+        return features.astype(np.float32), target.astype(np.float32), visible_enemy_mask, meta
 
 
 class AimTrainer:
@@ -117,7 +154,8 @@ class AimTrainer:
     def _run_epoch(self, loader: DataLoader, training: bool, epoch: int, writer: Any | None = None) -> dict[str, object]:
         total_loss = 0.0
         total_aim_loss = 0.0
-        total_fire_loss = 0.0
+        total_shoot_bce = 0.0
+        total_rightclick_bce = 0.0
         total_active_aim_loss = 0.0
         total_active_aim_samples = 0
         total_samples = 0
@@ -139,10 +177,11 @@ class AimTrainer:
             shoot_loss_raw = F.binary_cross_entropy_with_logits(shoot_logits, fire_targets, reduction='none')
             rightclick_loss_raw = F.binary_cross_entropy_with_logits(rightclick_logits, rightclick_targets, reduction='none')
             aim_loss_per_sample = aim_loss_raw.mean(dim=1)
-            fire_loss_per_sample = shoot_loss_raw.squeeze(1) + rightclick_loss_raw.squeeze(1)
-            loss_per_sample = aim_loss_per_sample + fire_loss_per_sample
+            shoot_bce_per_sample = shoot_loss_raw.squeeze(1)
+            rightclick_bce_per_sample = rightclick_loss_raw.squeeze(1)
+            loss_per_sample = aim_loss_per_sample + shoot_bce_per_sample + rightclick_bce_per_sample
             loss = loss_per_sample.mean()
-            active_aim_mask = torch.any(torch.abs(mouse_targets) > AIM_TARGET_EPS, dim=1)
+            active_aim_mask = torch.any(torch.abs(mouse_targets) > AIM_TARGET_EPS, dim=1) & (batch.visible_enemy_mask.squeeze(1) > 0.5)
 
             if training:
                 self.optimizer.zero_grad(set_to_none=True)
@@ -154,7 +193,8 @@ class AimTrainer:
             total_samples += batch_size
             total_loss += float(loss_per_sample.sum().item())
             total_aim_loss += float(aim_loss_per_sample.sum().item())
-            total_fire_loss += float(fire_loss_per_sample.sum().item())
+            total_shoot_bce += float(shoot_bce_per_sample.sum().item())
+            total_rightclick_bce += float(rightclick_bce_per_sample.sum().item())
             if torch.any(active_aim_mask):
                 total_active_aim_loss += float(aim_loss_per_sample[active_aim_mask].sum().item())
                 total_active_aim_samples += int(active_aim_mask.sum().item())
@@ -163,7 +203,8 @@ class AimTrainer:
                 global_step = (epoch - 1) * total_batches + batch_idx
                 writer.add_scalar('train/loss_step', loss.item(), global_step)
                 writer.add_scalar('train/aim_loss_step', aim_loss_per_sample.mean().item(), global_step)
-                writer.add_scalar('train/fire_loss_step', fire_loss_per_sample.mean().item(), global_step)
+                writer.add_scalar('train/shoot_bce_step', shoot_bce_per_sample.mean().item(), global_step)
+                writer.add_scalar('train/rightclick_bce_step', rightclick_bce_per_sample.mean().item(), global_step)
                 writer.add_scalar('train/active_aim_rate_step', active_aim_mask.float().mean().item(), global_step)
                 if torch.any(active_aim_mask):
                     writer.add_scalar('train/active_aim_loss_step', aim_loss_per_sample[active_aim_mask].mean().item(), global_step)
@@ -185,12 +226,13 @@ class AimTrainer:
                 print(f'{phase_name} epoch {epoch} | Batch {batch_idx + 1}/{total_batches} | Loss: {loss.item():.4f} | Seen: {len(seen_sample_ids)}')
 
         if total_samples == 0:
-            return {'loss': 0.0, 'aim_loss': 0.0, 'fire_loss': 0.0, 'active_aim_loss': 0.0, 'active_aim_rate': 0.0, 'seen_sample_ids': set(), 'per_demo_loss': {}, 'per_demo_seen_counts': {}}
+            return {'loss': 0.0, 'aim_loss': 0.0, 'shoot_bce': 0.0, 'rightclick_bce': 0.0, 'active_aim_loss': 0.0, 'active_aim_rate': 0.0, 'seen_sample_ids': set(), 'per_demo_loss': {}, 'per_demo_seen_counts': {}}
 
         return {
             'loss': total_loss / total_samples,
             'aim_loss': total_aim_loss / total_samples,
-            'fire_loss': total_fire_loss / total_samples,
+            'shoot_bce': total_shoot_bce / total_samples,
+            'rightclick_bce': total_rightclick_bce / total_samples,
             'active_aim_loss': (total_active_aim_loss / total_active_aim_samples) if total_active_aim_samples else 0.0,
             'active_aim_rate': float(total_active_aim_samples / total_samples),
             'seen_sample_ids': seen_sample_ids,
@@ -198,21 +240,23 @@ class AimTrainer:
             'per_demo_seen_counts': {demo: len(ids) for demo, ids in sorted(seen_demo_sample_ids.items())},
         }
 
-    def _to_training_batch(self, batch: tuple['torch.Tensor', 'torch.Tensor', list[dict[str, str]]]) -> AimTrainingBatch:
-        features, targets, metas = batch
+    def _to_training_batch(self, batch: tuple['torch.Tensor', 'torch.Tensor', 'torch.Tensor', list[dict[str, str]]]) -> AimTrainingBatch:
+        features, targets, visible_enemy_mask, metas = batch
         return AimTrainingBatch(
             features=features.to(self.device, non_blocking=True),
             targets=targets.to(self.device, non_blocking=True),
+            visible_enemy_mask=visible_enemy_mask.to(self.device, non_blocking=True),
             sample_ids=[str(meta['sample_id']) for meta in metas],
             demo_names=[str(meta['demo_name']) for meta in metas],
         )
 
 
-def collate_aim_batch(batch: list[tuple[np.ndarray, np.ndarray, dict[str, str]]]) -> tuple['torch.Tensor', 'torch.Tensor', list[dict[str, str]]]:
+def collate_aim_batch(batch: list[tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, str]]]) -> tuple['torch.Tensor', 'torch.Tensor', 'torch.Tensor', list[dict[str, str]]]:
     features = torch.tensor(np.stack([item[0] for item in batch]), dtype=torch.float32)
     targets = torch.tensor(np.stack([item[1] for item in batch]), dtype=torch.float32)
-    metas = [item[2] for item in batch]
-    return features, targets, metas
+    visible_enemy_mask = torch.tensor(np.stack([item[2] for item in batch]), dtype=torch.float32)
+    metas = [item[3] for item in batch]
+    return features, targets, visible_enemy_mask, metas
 
 
 def collect_expected_demo_counts(dataset) -> dict[str, int]:
@@ -282,32 +326,34 @@ def evaluate_aim_baseline(dataset, prior: AimBaselinePrior) -> dict[str, float]:
     total_targets = 0
     total_loss = 0.0
     total_aim_loss = 0.0
-    total_fire_loss = 0.0
+    total_shoot_bce = 0.0
+    total_rightclick_bce = 0.0
     total_active_aim_loss = 0.0
     total_active_aim_samples = 0
 
     for target in _iter_aim_targets(dataset):
         mouse_target = target[5:7]
         aim_loss = float(np.mean(np.square(mouse_target - prior.mouse_mean)))
-        fire_loss = _binary_cross_entropy_from_probability(float(target[2]), prior.fire_prob)
-        rightclick_loss = _binary_cross_entropy_from_probability(float(target[3]), prior.rightclick_prob)
-        combined_fire_loss = fire_loss + rightclick_loss
+        shoot_bce = _binary_cross_entropy_from_probability(float(target[2]), prior.fire_prob)
+        rightclick_bce = _binary_cross_entropy_from_probability(float(target[3]), prior.rightclick_prob)
 
         total_targets += 1
-        total_loss += aim_loss + combined_fire_loss
+        total_loss += aim_loss + shoot_bce + rightclick_bce
         total_aim_loss += aim_loss
-        total_fire_loss += combined_fire_loss
+        total_shoot_bce += shoot_bce
+        total_rightclick_bce += rightclick_bce
         if _is_active_mouse_target(mouse_target):
             total_active_aim_samples += 1
             total_active_aim_loss += aim_loss
 
     if total_targets == 0:
-        return {'loss': 0.0, 'aim_loss': 0.0, 'fire_loss': 0.0, 'active_aim_loss': 0.0, 'active_aim_rate': 0.0}
+        return {'loss': 0.0, 'aim_loss': 0.0, 'shoot_bce': 0.0, 'rightclick_bce': 0.0, 'active_aim_loss': 0.0, 'active_aim_rate': 0.0}
 
     return {
         'loss': total_loss / total_targets,
         'aim_loss': total_aim_loss / total_targets,
-        'fire_loss': total_fire_loss / total_targets,
+        'shoot_bce': total_shoot_bce / total_targets,
+        'rightclick_bce': total_rightclick_bce / total_targets,
         'active_aim_loss': (total_active_aim_loss / total_active_aim_samples) if total_active_aim_samples else 0.0,
         'active_aim_rate': float(total_active_aim_samples / total_targets),
     }
@@ -388,6 +434,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--max-cached-demos', type=int, default=2)
     parser.add_argument('--show-index-progress', action='store_true')
     parser.add_argument('--log-interval', type=int, default=10)
+    parser.add_argument('--allow-no-spotted-enemy', action='store_true')
     parser.add_argument('--runs-dir', type=Path, default=PROJECT_ROOT / 'runs')
     parser.add_argument('--tensorboard-run-name', type=str, default=None)
     parser.add_argument('--disable-tensorboard', action='store_true')
@@ -409,7 +456,7 @@ def build_dataset(args: argparse.Namespace) -> AimSequenceTorchDataset:
     )
     print(f'Demo files indexed: {len(base_dataset.demo_paths)}')
     print(f'Sequence samples built: {len(base_dataset)}')
-    return AimSequenceTorchDataset(base_dataset)
+    return AimSequenceTorchDataset(base_dataset, require_spotted_enemy=not args.allow_no_spotted_enemy)
 
 
 def main() -> int:
@@ -486,17 +533,17 @@ def main() -> int:
     print(
         'Baseline | '
         f'train_loss={train_baseline["loss"]:.4f} '
-        f'(aim={train_baseline["aim_loss"]:.4f}, fire={train_baseline["fire_loss"]:.4f}, active_aim={train_baseline["active_aim_loss"]:.4f}, active_rate={train_baseline["active_aim_rate"]:.2%}) | '
+        f'(aim={train_baseline["aim_loss"]:.4f}, shoot_bce={train_baseline["shoot_bce"]:.4f}, active_aim={train_baseline["active_aim_loss"]:.4f}, active_rate={train_baseline["active_aim_rate"]:.2%}) | '
         f'val_loss={val_baseline["loss"]:.4f} '
-        f'(aim={val_baseline["aim_loss"]:.4f}, fire={val_baseline["fire_loss"]:.4f}, active_aim={val_baseline["active_aim_loss"]:.4f}, active_rate={val_baseline["active_aim_rate"]:.2%})'
+        f'(aim={val_baseline["aim_loss"]:.4f}, shoot_bce={val_baseline["shoot_bce"]:.4f}, active_aim={val_baseline["active_aim_loss"]:.4f}, active_rate={val_baseline["active_aim_rate"]:.2%})'
     )
 
     best_val_loss = math.inf
     try:
         for epoch in range(1, args.epochs + 1):
             train_metrics = trainer.train_epoch(train_loader, epoch=epoch, writer=writer)
-            val_metrics = trainer.eval_epoch(val_loader, epoch=epoch, writer=writer) if len(val_dataset) > 0 else {'loss': train_metrics['loss'], 'aim_loss': train_metrics['aim_loss'], 'fire_loss': train_metrics['fire_loss'], 'active_aim_loss': train_metrics['active_aim_loss'], 'active_aim_rate': train_metrics['active_aim_rate'], 'seen_sample_ids': set(), 'per_demo_loss': {}, 'per_demo_seen_counts': {}}
-            print(f'Epoch {epoch}/{args.epochs} | train_loss={train_metrics["loss"]:.4f} (aim={train_metrics["aim_loss"]:.4f}, fire={train_metrics["fire_loss"]:.4f}) | val_loss={val_metrics["loss"]:.4f} (aim={val_metrics["aim_loss"]:.4f}, fire={val_metrics["fire_loss"]:.4f})')
+            val_metrics = trainer.eval_epoch(val_loader, epoch=epoch, writer=writer) if len(val_dataset) > 0 else {'loss': train_metrics['loss'], 'aim_loss': train_metrics['aim_loss'], 'shoot_bce': train_metrics['shoot_bce'], 'rightclick_bce': train_metrics['rightclick_bce'], 'active_aim_loss': train_metrics['active_aim_loss'], 'active_aim_rate': train_metrics['active_aim_rate'], 'seen_sample_ids': set(), 'per_demo_loss': {}, 'per_demo_seen_counts': {}}
+            print(f'Epoch {epoch}/{args.epochs} | train_loss={train_metrics["loss"]:.4f} (aim={train_metrics["aim_loss"]:.4f}, shoot_bce={train_metrics["shoot_bce"]:.4f}, rightclick_bce={train_metrics["rightclick_bce"]:.4f}) | val_loss={val_metrics["loss"]:.4f} (aim={val_metrics["aim_loss"]:.4f}, shoot_bce={val_metrics["shoot_bce"]:.4f}, rightclick_bce={val_metrics["rightclick_bce"]:.4f})')
             print(
                 'Aim active | '
                 f'train_rate={train_metrics["active_aim_rate"]:.2%} '
@@ -507,9 +554,9 @@ def main() -> int:
             print(
                 'Baseline   | '
                 f'train_loss={train_baseline["loss"]:.4f} '
-                f'(aim={train_baseline["aim_loss"]:.4f}, fire={train_baseline["fire_loss"]:.4f}) | '
+                f'(aim={train_baseline["aim_loss"]:.4f}, shoot_bce={train_baseline["shoot_bce"]:.4f}) | '
                 f'val_loss={val_baseline["loss"]:.4f} '
-                f'(aim={val_baseline["aim_loss"]:.4f}, fire={val_baseline["fire_loss"]:.4f})'
+                f'(aim={val_baseline["aim_loss"]:.4f}, shoot_bce={val_baseline["shoot_bce"]:.4f})'
             )
 
             train_coverage = build_coverage_summary(train_metrics, train_expected_counts)
@@ -517,7 +564,7 @@ def main() -> int:
             print_coverage_summary('train', train_coverage)
             if val_expected_counts:
                 print_coverage_summary('val', val_coverage)
-            append_epoch_summary(epoch_log_path, {'epoch': epoch, 'train': {'loss': train_metrics['loss'], 'aim_loss': train_metrics['aim_loss'], 'fire_loss': train_metrics['fire_loss'], 'active_aim_loss': train_metrics['active_aim_loss'], 'active_aim_rate': train_metrics['active_aim_rate'], 'coverage': train_coverage}, 'val': {'loss': val_metrics['loss'], 'aim_loss': val_metrics['aim_loss'], 'fire_loss': val_metrics['fire_loss'], 'active_aim_loss': val_metrics['active_aim_loss'], 'active_aim_rate': val_metrics['active_aim_rate'], 'coverage': val_coverage}, 'baseline': {'train': train_baseline, 'val': val_baseline}})
+            append_epoch_summary(epoch_log_path, {'epoch': epoch, 'train': {'loss': train_metrics['loss'], 'aim_loss': train_metrics['aim_loss'], 'shoot_bce': train_metrics['shoot_bce'], 'rightclick_bce': train_metrics['rightclick_bce'], 'active_aim_loss': train_metrics['active_aim_loss'], 'active_aim_rate': train_metrics['active_aim_rate'], 'coverage': train_coverage}, 'val': {'loss': val_metrics['loss'], 'aim_loss': val_metrics['aim_loss'], 'shoot_bce': val_metrics['shoot_bce'], 'rightclick_bce': val_metrics['rightclick_bce'], 'active_aim_loss': val_metrics['active_aim_loss'], 'active_aim_rate': val_metrics['active_aim_rate'], 'coverage': val_coverage}, 'baseline': {'train': train_baseline, 'val': val_baseline}})
 
             log_scalar_dict(writer, 'train', train_metrics, epoch, ignored_keys={'seen_sample_ids', 'per_demo_loss', 'per_demo_seen_counts'})
             log_scalar_dict(writer, 'val', val_metrics, epoch, ignored_keys={'seen_sample_ids', 'per_demo_loss', 'per_demo_seen_counts'})

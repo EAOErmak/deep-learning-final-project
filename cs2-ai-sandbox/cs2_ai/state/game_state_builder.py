@@ -93,6 +93,9 @@ class GameStateBuilder:
         )
 
     def _build_input_state(self, row: pd.Series) -> PlayerInputState:
+        walk_value = self._safe_get(row, "WALK", None)
+        if walk_value is None:
+            walk_value = self._safe_get(row, "is_walking", False)
         return PlayerInputState(
             forward=self._as_bool(self._safe_get(row, "FORWARD", False)),
             back=self._as_bool(self._safe_get(row, "BACK", False)),
@@ -103,7 +106,7 @@ class GameStateBuilder:
             reload=self._as_bool(self._safe_get(row, "RELOAD", False)),
             use=self._as_bool(self._safe_get(row, "USE", False)),
             zoom=self._as_bool(self._safe_get(row, "ZOOM", False)),
-            walk=self._as_bool(self._safe_get(row, "WALK", False)),
+            walk=self._as_bool(walk_value),
             usercmd_mouse_dx=self._as_float(self._safe_get(row, "usercmd_mouse_dx", 0.0)),
             usercmd_mouse_dy=self._as_float(self._safe_get(row, "usercmd_mouse_dy", 0.0)),
             usercmd_forward_move=self._as_float(self._safe_get(row, "usercmd_forward_move", 0.0)),

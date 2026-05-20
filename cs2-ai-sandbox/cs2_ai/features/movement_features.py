@@ -13,7 +13,7 @@ class MovementFeatureExtractor:
         return np.asarray([self._state_to_vector(state, decision, belief_state) for state in sequence.states], dtype=np.float32)
 
     def feature_dim(self) -> int:
-        return 28
+        return 33
 
     def _state_to_vector(self, state, decision: DecisionOutput | None, belief_state: BeliefStateData | None) -> list[float]:
         self_player = state.self_player
@@ -21,11 +21,39 @@ class MovementFeatureExtractor:
         teammate_features: list[float] = []
         for teammate in state.teammates[:MAX_TEAMMATES]:
             teammate_features.extend(normalize_position(v) for v in relative_position(self_player.position, teammate.position))
-        danger_values = [float((belief_state.danger_zones if belief_state else {}).get(key, 0.0)) for key in ("A", "B", "mid")]
-        return [*map(normalize_position, self_player.position), *map(normalize_velocity, self_player.velocity), normalize_angle(self_player.yaw), bool_to_float(self_player.is_walking), bool_to_float(self_player.is_airborne), bool_to_float(self_player.ducking), *pad_or_trim_vector(teammate_features, MAX_TEAMMATES * 3), *[normalize_position(v) for v in relative_position(self_player.position, target_position)], *danger_values]
+        top_enemy_rel = [0.0, 0.0, 0.0]
+        top_enemy_confidence = 0.0
+        predicted_enemy_count = 0.0
+        coarse_enemy_counts = [0.0, 0.0, 0.0]
+        if belief_state is not None:
+            top_enemy_rel = [normalize_position(v) for v in belief_state.top_enemy_rel_pos]
+            top_enemy_confidence = float(belief_state.top_enemy_confidence)
+            predicted_enemy_count = float(belief_state.predicted_enemy_count) / 5.0
+            coarse_enemy_counts = [float(belief_state.coarse_enemy_counts.get(key, 0.0)) / 5.0 for key in ("A", "B", "mid")]
+        return [
+            *map(normalize_position, self_player.position),
+            *map(normalize_velocity, self_player.velocity),
+            normalize_angle(self_player.yaw),
+            bool_to_float(self_player.is_walking),
+            bool_to_float(self_player.is_airborne),
+            bool_to_float(self_player.ducking),
+            *pad_or_trim_vector(teammate_features, MAX_TEAMMATES * 3),
+            *[normalize_position(v) for v in relative_position(self_player.position, target_position)],
+            *top_enemy_rel,
+            top_enemy_confidence,
+            predicted_enemy_count,
+            *coarse_enemy_counts,
+        ]
 
 
 def build_movement_target(game_state: GameState) -> np.ndarray:
     self_input = game_state.self_input
-    values = [bool_to_float(self_input.forward), bool_to_float(self_input.back), bool_to_float(self_input.left), bool_to_float(self_input.right), bool_to_float(self_input.walk), bool_to_float(game_state.self_player.ducking), float(self_input.usercmd_forward_move) / 450.0, float(self_input.usercmd_left_move) / 450.0]
+    values = [
+        bool_to_float(self_input.forward),
+        bool_to_float(self_input.back),
+        bool_to_float(self_input.left),
+        bool_to_float(self_input.right),
+        bool_to_float(self_input.walk),
+        bool_to_float(game_state.self_player.ducking),
+    ]
     return np.asarray(values, dtype=np.float32)

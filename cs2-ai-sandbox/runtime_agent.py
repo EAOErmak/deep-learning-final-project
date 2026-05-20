@@ -93,6 +93,9 @@ class PipelineRuntimeAgent:
             bomb=bomb_state,
         )
 
+    def to_ai_game_state(self, game_state: GameState) -> AIGameState:
+        return self._to_ai_game_state(game_state)
+
     def _to_ai_player(self, player: PlayerState) -> AIPlayerState:
         team_num = self._team_to_num(player.team)
         position = [player.position.x, player.position.y, player.position.z] if player.position is not None else [0.0, 0.0, 0.0]
@@ -163,6 +166,9 @@ class PipelineRuntimeAgent:
             elif command.command == 'mouse_left':
                 action['fire'] = True
         return action
+
+    def action_plan_to_action_dict(self, action_plan: ActionPlan) -> ActionDict:
+        return self._action_plan_to_action_dict(action_plan)
 
     def _team_to_num(self, team: str | None) -> int:
         if not team:

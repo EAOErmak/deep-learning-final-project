@@ -21,6 +21,10 @@ class EnemyTrackerOutput:
 @dataclass(slots=True)
 class BeliefStateData:
     predicted_enemies: list[EnemyPrediction]
+    top_enemy_rel_pos: list[float]
+    top_enemy_confidence: float
+    predicted_enemy_count: int
+    coarse_enemy_counts: dict[str, float]
     danger_zones: dict[str, float]
     safe_zones: dict[str, float]
     site_control: dict[str, float]

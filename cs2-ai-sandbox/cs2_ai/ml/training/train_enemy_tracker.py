@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from cs2_ai.config import MAX_ENEMIES
 from cs2_ai.dataset.multi_demo_sequence_dataset import MultiDemoSequenceDataset, split_dataset_by_group
-from cs2_ai.features.enemy_tracker_features import EnemyTrackerFeatureExtractor, build_enemy_position_target
+from cs2_ai.features.enemy_tracker_features import EnemyTrackerFeatureExtractor, build_enemy_confidence_target, build_enemy_position_target, build_enemy_roster
 from cs2_ai.ml.models.enemy_tracker_lstm import EnemyTrackerLSTM
 from cs2_ai.ml.utils.tensorboard_utils import close_summary_writer, create_summary_writer, log_scalar_dict, tensorboard_available
 from cs2_ai.ml.utils.torch_utils import get_device, set_seed, torch_available
@@ -67,19 +67,20 @@ class EnemyTrackerSequenceTorchDataset(Dataset):
         tick_indices = list(sample_metadata['tick_indices'])
         target_tick = int(sample_metadata['target_tick'])
         target_ticks = tick_indices[1:] + [target_tick]
+        target_state = ds.build_state_for_sample_tick(sample_metadata, target_tick)
+        roster_steamids = build_enemy_roster(sequence_sample.sequence, target_state=target_state)
 
         target_positions = np.zeros((len(target_ticks), MAX_ENEMIES, 3), dtype=np.float32)
         target_confidences = np.zeros((len(target_ticks), MAX_ENEMIES), dtype=np.float32)
         for t_idx, tick in enumerate(target_ticks):
             target_state = ds.build_state_for_sample_tick(sample_metadata, tick)
-            target_positions[t_idx] = build_enemy_position_target(target_state)
-            for enemy_idx, enemy in enumerate(target_state.enemies[:MAX_ENEMIES]):
-                if enemy.is_alive:
-                    target_confidences[t_idx, enemy_idx] = 1.0
+            target_positions[t_idx] = build_enemy_position_target(target_state, roster_steamids)
+            target_confidences[t_idx] = build_enemy_confidence_target(target_state, roster_steamids)
 
         meta = {
             'sample_id': str(sample_metadata['sample_id']),
             'demo_name': str(sample_metadata['demo_name']),
+            'roster_steamids': [int(steamid) for steamid in roster_steamids],
         }
         return features.astype(np.float32), target_positions, target_confidences, meta
 

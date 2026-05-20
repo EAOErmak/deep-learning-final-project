@@ -12,6 +12,17 @@ except ImportError:
     VisionTarget = None
 
 
+AIM_MOUSE_SCALE = 500.0
+
+
+def normalize_mouse_delta(value: float) -> float:
+    return float(value) / AIM_MOUSE_SCALE
+
+
+def denormalize_mouse_delta(value: float) -> float:
+    return float(value) * AIM_MOUSE_SCALE
+
+
 class AimFeatureExtractor:
     def extract(self, sequence, belief_state: BeliefStateData | None = None, vision_target: 'VisionTarget' | None = None) -> np.ndarray:
         return np.asarray([self._state_to_vector(state, belief_state, vision_target) for state in sequence.states], dtype=np.float32)
@@ -78,7 +89,7 @@ def build_aim_target(current_state: GameState, next_state: GameState) -> np.ndar
         bool_to_float(next_state.self_input.fire),
         bool_to_float(next_state.self_input.rightclick),
         bool_to_float(next_state.self_input.zoom),
-        float(next_state.self_input.usercmd_mouse_dx) / 500.0,
-        float(next_state.self_input.usercmd_mouse_dy) / 500.0,
+        normalize_mouse_delta(next_state.self_input.usercmd_mouse_dx),
+        normalize_mouse_delta(next_state.self_input.usercmd_mouse_dy),
     ]
     return np.asarray(target, dtype=np.float32)

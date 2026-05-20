@@ -338,25 +338,89 @@ def finalize_clean_frame(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def create_clean_play_ticks(raw_df: pd.DataFrame) -> pd.DataFrame:
-    if not {"is_warmup_period", "is_freeze_period", "round_in_progress"}.issubset(raw_df.columns):
+def _event_round_offset(round_lookup: pd.DataFrame, event_df: pd.DataFrame) -> int:
+    if event_df.empty or "round" not in event_df.columns or round_lookup.empty:
+        return 0
+    event_rounds = pd.to_numeric(event_df["round"], errors="coerce").dropna()
+    raw_rounds = pd.to_numeric(round_lookup["round_number"], errors="coerce").dropna()
+    if event_rounds.empty or raw_rounds.empty:
+        return 0
+    return int(raw_rounds.min()) - int(event_rounds.min())
+
+
+def _build_event_tick_windows(raw_df: pd.DataFrame, parsed_events: dict[str, pd.DataFrame]) -> pd.DataFrame | None:
+    round_lookup = build_round_lookup(raw_df)
+    if round_lookup.empty:
+        return None
+
+    round_start_df = parsed_events.get("round_start", pd.DataFrame())
+    round_end_df = parsed_events.get("round_end", pd.DataFrame())
+    if round_start_df.empty or round_end_df.empty:
+        return None
+    if "round" not in round_start_df.columns or "tick" not in round_start_df.columns:
+        return None
+    if "round" not in round_end_df.columns or "tick" not in round_end_df.columns:
+        return None
+
+    round_offset = _event_round_offset(round_lookup, round_end_df)
+    start_enriched = round_start_df.copy()
+    end_enriched = round_end_df.copy()
+    start_enriched["round_number"] = pd.to_numeric(start_enriched["round"], errors="coerce").astype("float64") + float(round_offset)
+    end_enriched["round_number"] = pd.to_numeric(end_enriched["round"], errors="coerce").astype("float64") + float(round_offset)
+    start_enriched["tick"] = pd.to_numeric(start_enriched["tick"], errors="coerce")
+    end_enriched["tick"] = pd.to_numeric(end_enriched["tick"], errors="coerce")
+    start_enriched = start_enriched.dropna(subset=["round_number", "tick"])
+    end_enriched = end_enriched.dropna(subset=["round_number", "tick"])
+    if start_enriched.empty or end_enriched.empty:
+        return None
+
+    # round_start may fire more than once per round; the last one is the closest proxy to live start.
+    start_ticks = start_enriched.groupby("round_number", dropna=False)["tick"].max().reset_index(name="event_live_start_tick")
+    end_ticks = end_enriched.groupby("round_number", dropna=False)["tick"].min().reset_index(name="event_round_end_tick")
+    windows = round_lookup.merge(start_ticks, on="round_number", how="left").merge(end_ticks, on="round_number", how="left")
+    return windows
+
+
+def build_live_play_mask(raw_df: pd.DataFrame, parsed_events: dict[str, pd.DataFrame]) -> pd.Series:
+    if not {"is_warmup_period", "is_freeze_period", "tick", "total_rounds_played"}.issubset(raw_df.columns):
         raise RuntimeError("Raw ticks are missing required play-filter columns.")
 
-    strict_mask = (
+    tick_series = pd.to_numeric(raw_df["tick"], errors="coerce")
+    round_series = pd.to_numeric(raw_df["total_rounds_played"], errors="coerce")
+    base_mask = (
         (raw_df["is_warmup_period"] == False)
         & (raw_df["is_freeze_period"] == False)
-        & (raw_df["round_in_progress"] == True)
+        & tick_series.notna()
+        & round_series.notna()
     )
-    df_play = raw_df[strict_mask].copy()
 
-    if df_play.empty:
-        fallback_mask = (
-            (raw_df["is_warmup_period"] == False)
-            & (raw_df["is_freeze_period"] == False)
-        )
-        df_play = raw_df[fallback_mask].copy()
-        print("[warning] round_in_progress produced 0 rows. Falling back to non-warmup/non-freeze ticks.")
+    event_windows = _build_event_tick_windows(raw_df, parsed_events)
+    if event_windows is None or event_windows.empty:
+        if "round_in_progress" not in raw_df.columns:
+            raise RuntimeError("Unable to derive live play mask: round events unavailable and round_in_progress missing.")
+        return base_mask & (raw_df["round_in_progress"] == True)
 
+    live_mask = pd.Series(False, index=raw_df.index)
+    for row in event_windows.itertuples(index=False):
+        round_mask = round_series == float(row.round_number)
+        if pd.notna(row.event_live_start_tick):
+            round_mask &= tick_series >= float(row.event_live_start_tick)
+        if pd.notna(row.event_round_end_tick):
+            round_mask &= tick_series < float(row.event_round_end_tick)
+        elif pd.notna(row.end_tick):
+            round_mask &= tick_series <= float(row.end_tick)
+        live_mask |= round_mask
+
+    if "round_in_progress" in raw_df.columns:
+        live_confirmed = base_mask & live_mask & (raw_df["round_in_progress"] == True)
+        if bool(live_confirmed.any()):
+            return live_confirmed
+
+    return base_mask & live_mask
+
+
+def create_clean_play_ticks(raw_df: pd.DataFrame, parsed_events: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    df_play = raw_df[build_live_play_mask(raw_df, parsed_events)].copy()
     return finalize_clean_frame(df_play)
 
 
@@ -438,11 +502,51 @@ def summarize_event_counts(event_df: pd.DataFrame, round_lookup: pd.DataFrame, o
     return enriched.groupby("round_number", dropna=False).size().reset_index(name=output_column)
 
 
-def infer_winner_columns(round_events_df: pd.DataFrame) -> pd.DataFrame:
+def infer_winner_columns(round_events_df: pd.DataFrame, parsed_events: dict[str, pd.DataFrame], round_lookup: pd.DataFrame) -> pd.DataFrame:
     df = round_events_df.copy()
     df["winner_team_num"] = pd.NA
     df["loser_team_num"] = pd.NA
     df["winner_team_num_known"] = False
+
+    round_end_df = parsed_events.get("round_end", pd.DataFrame())
+    if round_end_df.empty or "winner" not in round_end_df.columns:
+        return df
+
+    enriched = round_end_df.copy()
+    if "round" in enriched.columns:
+        round_offset = _event_round_offset(round_lookup, enriched)
+        enriched["round_number"] = pd.to_numeric(enriched["round"], errors="coerce").astype("float64") + float(round_offset)
+    else:
+        enriched = add_round_number_from_tick(enriched, round_lookup)
+
+    enriched = enriched.dropna(subset=["round_number"])
+    if enriched.empty:
+        return df
+
+    enriched["winner_normalized"] = enriched["winner"].astype(str).str.strip().str.upper()
+    winner_by_round = (
+        enriched.groupby("round_number", dropna=False)["winner_normalized"]
+        .agg(get_last_non_null)
+        .reset_index()
+    )
+    winner_map = {"CT": 3, "T": 2}
+    winner_by_round["winner_team_num"] = winner_by_round["winner_normalized"].map(winner_map)
+    winner_by_round["loser_team_num"] = winner_by_round["winner_team_num"].map({3: 2, 2: 3})
+    winner_by_round["winner_team_num_known"] = winner_by_round["winner_team_num"].notna()
+
+    df = df.merge(
+        winner_by_round[["round_number", "winner_team_num", "loser_team_num", "winner_team_num_known"]],
+        on="round_number",
+        how="left",
+        suffixes=("", "_event"),
+    )
+    for column in ("winner_team_num", "loser_team_num", "winner_team_num_known"):
+        event_column = f"{column}_event"
+        if event_column in df.columns:
+            df[column] = df[event_column].where(df[event_column].notna(), df[column])
+            df = df.drop(columns=[event_column])
+
+    df["winner_team_num_known"] = df["winner_team_num_known"].fillna(False).astype(bool)
     return df
 
 
@@ -505,9 +609,39 @@ def build_round_events(raw_df: pd.DataFrame, parsed_events: dict[str, pd.DataFra
             round_events_df[column] = 0
         round_events_df[column] = pd.to_numeric(round_events_df[column], errors="coerce").fillna(0).astype(int)
 
-    round_events_df = infer_winner_columns(round_events_df)
+    round_events_df = infer_winner_columns(round_events_df, parsed_events, round_lookup)
     round_events_df = add_basic_round_reward_columns(round_events_df)
     return round_events_df.sort_values("round_number").reset_index(drop=True)
+
+
+def print_dataset_summary(raw_df: pd.DataFrame, clean_play_df: pd.DataFrame, clean_buy_df: pd.DataFrame) -> None:
+    raw_rows = len(raw_df)
+    print("Dataset summary:")
+    print(f"  live rows: {len(clean_play_df)} ({(len(clean_play_df) / raw_rows):.2%} of raw)" if raw_rows else "  live rows: 0")
+    print(f"  buy rows: {len(clean_buy_df)} ({(len(clean_buy_df) / raw_rows):.2%} of raw)" if raw_rows else "  buy rows: 0")
+
+    if clean_play_df.empty:
+        print("  clean_play_ticks is empty.")
+        return
+
+    def _rate(df: pd.DataFrame, column: str) -> float:
+        if column not in df.columns or df.empty:
+            return 0.0
+        series = df[column]
+        if series.dtype == bool:
+            return float(series.mean())
+        numeric = pd.to_numeric(series, errors="coerce").fillna(0.0)
+        return float((numeric != 0).mean())
+
+    mouse_nonzero = 0.0
+    if {"usercmd_mouse_dx", "usercmd_mouse_dy"}.issubset(clean_play_df.columns):
+        mouse_dx = pd.to_numeric(clean_play_df["usercmd_mouse_dx"], errors="coerce").fillna(0.0)
+        mouse_dy = pd.to_numeric(clean_play_df["usercmd_mouse_dy"], errors="coerce").fillna(0.0)
+        mouse_nonzero = float(((mouse_dx != 0.0) | (mouse_dy != 0.0)).mean())
+
+    print(f"  spotted rate: {_rate(clean_play_df, 'spotted'):.2%}")
+    print(f"  fire rate: {_rate(clean_play_df, 'FIRE'):.2%}")
+    print(f"  nonzero mouse rate: {mouse_nonzero:.2%}")
 
 
 def parse_events_and_save(parser: DemoParser, demo_stem: str, paths: Paths) -> tuple[dict[str, pd.DataFrame], list[str]]:
@@ -565,7 +699,10 @@ def process_demo(demo_path: Path, paths: Paths, registry: dict[str, Any]) -> int
     print(f"Raw ticks shape: {raw_df.shape}")
     print(f"Saved raw ticks: {output_paths['raw_ticks']}")
 
-    clean_play_df = create_clean_play_ticks(raw_df)
+    parsed_events, saved_events = parse_events_and_save(parser, demo_stem, paths)
+    print(f"Saved events: {saved_events if saved_events else 'none'}")
+
+    clean_play_df = create_clean_play_ticks(raw_df, parsed_events)
     clean_play_df.to_parquet(output_paths["clean_play_ticks"], index=False)
     print(f"Clean play ticks shape: {clean_play_df.shape}")
     print(f"Saved clean play ticks: {output_paths['clean_play_ticks']}")
@@ -575,13 +712,11 @@ def process_demo(demo_path: Path, paths: Paths, registry: dict[str, Any]) -> int
     print(f"Clean buy ticks shape: {clean_buy_df.shape}")
     print(f"Saved clean buy ticks: {output_paths['clean_buy_ticks']}")
 
-    parsed_events, saved_events = parse_events_and_save(parser, demo_stem, paths)
-    print(f"Saved events: {saved_events if saved_events else 'none'}")
-
     round_events_df = build_round_events(raw_df, parsed_events)
     round_events_df.to_parquet(output_paths["round_events"], index=False)
     print(f"Round events shape: {round_events_df.shape}")
     print(f"Saved round events: {output_paths['round_events']}")
+    print_dataset_summary(raw_df, clean_play_df, clean_buy_df)
 
     for key, path in output_paths.items():
         if not path.exists():

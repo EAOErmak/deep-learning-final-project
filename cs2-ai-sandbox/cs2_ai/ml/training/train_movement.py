@@ -83,7 +83,7 @@ class MovementSequenceTorchDataset(Dataset):
         target_tick = int(sample_metadata['target_tick'])
         target_ticks = tick_indices[1:] + [target_tick]
 
-        target = np.zeros((len(target_ticks), 8), dtype=np.float32)
+        target = np.zeros((len(target_ticks), 6), dtype=np.float32)
         for t_idx, tick in enumerate(target_ticks):
             target_state = ds.build_state_for_sample_tick(sample_metadata, tick)
             target[t_idx] = build_movement_target(target_state)
@@ -130,7 +130,6 @@ class MovementTrainer:
     ) -> dict[str, object]:
         total_loss = 0.0
         total_binary_loss = 0.0
-        total_move_loss = 0.0
         total_samples = 0
         total_batches = len(loader)
         per_demo_sum: dict[str, float] = {}
@@ -152,16 +151,12 @@ class MovementTrainer:
         for batch_idx, batch in enumerate(iterator, start=1):
             batch = self._to_training_batch(batch)
             logits = self.model(batch.features)
-            binary_logits = logits[..., :6]
-            move_logits = logits[..., 6:8]
-            binary_targets = batch.targets[..., :6]
-            move_targets = batch.targets[..., 6:8]
+            binary_logits = logits
+            binary_targets = batch.targets
 
             binary_loss_raw = F.binary_cross_entropy_with_logits(binary_logits, binary_targets, reduction='none')
-            move_loss_raw = F.mse_loss(torch.tanh(move_logits), move_targets, reduction='none')
             binary_loss_per_sample = binary_loss_raw.mean(dim=(1, 2))
-            move_loss_per_sample = move_loss_raw.mean(dim=(1, 2))
-            loss_per_sample = binary_loss_per_sample + move_loss_per_sample
+            loss_per_sample = binary_loss_per_sample
             loss = loss_per_sample.mean()
 
             if training:
@@ -174,13 +169,11 @@ class MovementTrainer:
             total_samples += batch_size
             total_loss += float(loss_per_sample.sum().item())
             total_binary_loss += float(binary_loss_per_sample.sum().item())
-            total_move_loss += float(move_loss_per_sample.sum().item())
 
             if training and writer is not None:
                 global_step = (epoch_idx - 1) * total_batches + batch_idx - 1
                 writer.add_scalar('train/loss_step', loss.item(), global_step)
                 writer.add_scalar('train/binary_loss_step', binary_loss_per_sample.mean().item(), global_step)
-                writer.add_scalar('train/move_loss_step', move_loss_per_sample.mean().item(), global_step)
                 if (batch_idx - 1) % 10 == 0:
                     writer.flush()
 
@@ -195,7 +188,6 @@ class MovementTrainer:
                 progress.set_postfix(
                     loss=f'{(total_loss / total_samples):.4f}',
                     bin=f'{(total_binary_loss / total_samples):.4f}',
-                    move=f'{(total_move_loss / total_samples):.4f}',
                     seen=len(seen_sample_ids),
                 )
 
@@ -219,7 +211,6 @@ class MovementTrainer:
             return {
                 'loss': 0.0,
                 'binary_loss': 0.0,
-                'move_loss': 0.0,
                 'seen_sample_ids': set(),
                 'per_demo_loss': {},
                 'per_demo_seen_counts': {},
@@ -228,7 +219,6 @@ class MovementTrainer:
         return {
             'loss': total_loss / total_samples,
             'binary_loss': total_binary_loss / total_samples,
-            'move_loss': total_move_loss / total_samples,
             'seen_sample_ids': seen_sample_ids,
             'per_demo_loss': {demo: per_demo_sum[demo] / per_demo_count[demo] for demo in sorted(per_demo_sum)},
             'per_demo_seen_counts': {demo: len(ids) for demo, ids in sorted(seen_demo_sample_ids.items())},
@@ -327,7 +317,7 @@ def save_checkpoint(
         'model_state_dict': model.state_dict(),
         'model_type': 'decision_dqn_movement',
         'input_dim': input_dim,
-        'action_dim': 8,
+        'action_dim': 6,
         'seq_len': args.seq_len,
         'stride': args.stride,
         'dataset_source': dataset_label,
@@ -352,7 +342,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--hidden-dim', type=int, default=256)
     parser.add_argument('--val-split', type=float, default=0.1)
     parser.add_argument('--split-mode', choices=['demo', 'round', 'random'], default='demo')
-    parser.add_argument('--alive-only', action='store_true')
+    parser.add_argument('--alive-only', action='store_true', default=True)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--num-workers', type=int, default=0)
     parser.add_argument('--max-samples', type=int, default=None)
@@ -428,7 +418,7 @@ def main() -> int:
     )
 
     feature_extractor = MovementFeatureExtractor()
-    model = DecisionDQN(input_dim=feature_extractor.feature_dim(), action_dim=8, hidden_dim=args.hidden_dim).to(device)
+    model = DecisionDQN(input_dim=feature_extractor.feature_dim(), action_dim=6, hidden_dim=args.hidden_dim).to(device)
     trainer = MovementTrainer(
         model=model,
         device=device,
@@ -476,8 +466,8 @@ def main() -> int:
     print(f'Epoch log: {epoch_log_path}')
 
     best_val_loss = math.inf
-    best_train_metrics: dict[str, object] = {'loss': math.inf, 'binary_loss': math.inf, 'move_loss': math.inf}
-    best_val_metrics: dict[str, object] = {'loss': math.inf, 'binary_loss': math.inf, 'move_loss': math.inf}
+    best_train_metrics: dict[str, object] = {'loss': math.inf, 'binary_loss': math.inf}
+    best_val_metrics: dict[str, object] = {'loss': math.inf, 'binary_loss': math.inf}
 
     try:
         for epoch in range(1, args.epochs + 1):
@@ -486,7 +476,6 @@ def main() -> int:
             val_metrics = trainer.eval_epoch(val_loader, epoch_idx=epoch, total_epochs=args.epochs, writer=writer) if len(val_dataset) > 0 else {
                 'loss': train_metrics['loss'],
                 'binary_loss': train_metrics['binary_loss'],
-                'move_loss': train_metrics['move_loss'],
                 'seen_sample_ids': set(),
                 'per_demo_loss': {},
                 'per_demo_seen_counts': {},
@@ -494,9 +483,9 @@ def main() -> int:
             print(
                 f'Epoch {epoch}/{args.epochs} | '
                 f'train_loss={train_metrics["loss"]:.4f} '
-                f'(bin={train_metrics["binary_loss"]:.4f}, move={train_metrics["move_loss"]:.4f}) | '
+                f'(bin={train_metrics["binary_loss"]:.4f}) | '
                 f'val_loss={val_metrics["loss"]:.4f} '
-                f'(bin={val_metrics["binary_loss"]:.4f}, move={val_metrics["move_loss"]:.4f})'
+                f'(bin={val_metrics["binary_loss"]:.4f})'
             )
 
             train_coverage = build_coverage_summary(train_metrics, train_expected_counts)
@@ -512,13 +501,11 @@ def main() -> int:
                     'train': {
                         'loss': train_metrics['loss'],
                         'binary_loss': train_metrics['binary_loss'],
-                        'move_loss': train_metrics['move_loss'],
                         'coverage': train_coverage,
                     },
                     'val': {
                         'loss': val_metrics['loss'],
                         'binary_loss': val_metrics['binary_loss'],
-                        'move_loss': val_metrics['move_loss'],
                         'coverage': val_coverage,
                     },
                 },
@@ -542,8 +529,8 @@ def main() -> int:
 
     print('Training finished.')
     print(f'Best val loss: {best_val_loss:.4f}')
-    print(f'Best train metrics: {{"loss": {best_train_metrics["loss"]:.4f}, "binary_loss": {best_train_metrics["binary_loss"]:.4f}, "move_loss": {best_train_metrics["move_loss"]:.4f}}}')
-    print(f'Best val metrics: {{"loss": {best_val_metrics["loss"]:.4f}, "binary_loss": {best_val_metrics["binary_loss"]:.4f}, "move_loss": {best_val_metrics["move_loss"]:.4f}}}')
+    print(f'Best train metrics: {{"loss": {best_train_metrics["loss"]:.4f}, "binary_loss": {best_train_metrics["binary_loss"]:.4f}}}')
+    print(f'Best val metrics: {{"loss": {best_val_metrics["loss"]:.4f}, "binary_loss": {best_val_metrics["binary_loss"]:.4f}}}')
     return 0
 
 

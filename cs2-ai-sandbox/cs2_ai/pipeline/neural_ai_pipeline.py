@@ -10,7 +10,7 @@ from cs2_ai.state.belief_state import BeliefState
 from cs2_ai.state.memory import TickMemory
 from cs2_ai.features.enemy_tracker_features import EnemyTrackerFeatureExtractor
 from cs2_ai.features.movement_features import MovementFeatureExtractor
-from cs2_ai.features.aim_features import AimFeatureExtractor
+from cs2_ai.features.aim_features import AimFeatureExtractor, denormalize_mouse_delta
 from cs2_ai.ml.utils.torch_utils import torch_available
 
 if torch_available():
@@ -54,12 +54,13 @@ class NeuralAIPipeline:
             positions = positions[:, -1, :, :].squeeze(0).cpu().numpy()
             confidences = torch.sigmoid(confidences[:, -1, :]).squeeze(0).cpu().numpy()
             
+        roster_steamids = self._resolve_prediction_roster(game_state, len(confidences))
         predictions = []
         for i in range(len(confidences)):
             if confidences[i] > 0.5:
                 predictions.append(EnemyPrediction(
                     enemy_slot=i,
-                    steamid=None,
+                    steamid=roster_steamids[i],
                     predicted_position=list(positions[i] * 10000.0), # Denormalize assuming normalization divided by 10000
                     predicted_velocity=[0.0, 0.0, 0.0],
                     confidence=float(confidences[i]),
@@ -77,11 +78,10 @@ class NeuralAIPipeline:
         movement_features = torch.tensor(self.movement_extractor.extract(sequence, self.last_decision_output, self.last_belief_state), dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
             movement_logits = self.movement_model(movement_features)
-            # movement_logits is [1, SeqLen, 8], we only need the last timestep
+            # movement_logits is [1, SeqLen, 6], we only need the last timestep
             movement_logits = movement_logits[:, -1, :].squeeze(0)
             
-        binary_probs = torch.sigmoid(movement_logits[:6])
-        move_values = torch.tanh(movement_logits[6:8]) * 450.0 # Denormalize 450 max speed
+        binary_probs = torch.sigmoid(movement_logits)
         
         # parse binary logits [FORWARD, BACK, LEFT, RIGHT, WALK, ducking]
         forward = bool(binary_probs[0] > 0.5)
@@ -94,8 +94,8 @@ class NeuralAIPipeline:
         move_dir = [0.0, 0.0]
         if forward: move_dir[0] += 1.0
         if back: move_dir[0] -= 1.0
-        if right: move_dir[1] -= 1.0 # CS2 mapping: right is negative y usually? Or depends on coordinate system.
-        if left: move_dir[1] += 1.0
+        if right: move_dir[1] += 1.0
+        if left: move_dir[1] -= 1.0
         
         self.last_movement_output = MovementOutput(
             move_direction=move_dir,
@@ -110,7 +110,8 @@ class NeuralAIPipeline:
         with torch.no_grad():
             aim_delta, shoot_logits, rightclick_logits = self.aim_model(aim_features)
             
-        aim_delta = aim_delta.squeeze(0).cpu().numpy() * 500.0 # Denormalize
+        aim_delta = torch.tanh(aim_delta).squeeze(0).cpu().numpy()
+        aim_delta = [denormalize_mouse_delta(float(value)) for value in aim_delta]
         shoot = bool(torch.sigmoid(shoot_logits).squeeze(0).item() > 0.5)
         rightclick = bool(torch.sigmoid(rightclick_logits).squeeze(0).item() > 0.5)
         
@@ -132,3 +133,10 @@ class NeuralAIPipeline:
         
         self.input_controller.execute(self.last_action_plan)
         return self.last_action_plan
+
+    def _resolve_prediction_roster(self, game_state: GameState, roster_size: int) -> list[int]:
+        sorted_enemies = sorted(game_state.enemies, key=lambda item: (not item.spotted, int(item.steamid)))
+        roster = [int(enemy.steamid) for enemy in sorted_enemies[:roster_size]]
+        while len(roster) < roster_size:
+            roster.append(-(len(roster) + 1))
+        return roster
