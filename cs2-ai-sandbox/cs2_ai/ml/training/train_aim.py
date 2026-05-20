@@ -6,6 +6,7 @@ import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
@@ -36,6 +37,16 @@ class AimTrainingBatch:
     demo_names: list[str]
 
 
+@dataclass(slots=True)
+class AimBaselinePrior:
+    mouse_mean: np.ndarray
+    fire_prob: float
+    rightclick_prob: float
+
+
+AIM_TARGET_EPS = 1e-6
+
+
 def get_base_dataset_and_index(dataset: Any, idx: int) -> tuple[Any, int]:
     curr_dataset = dataset
     curr_idx = idx
@@ -57,19 +68,29 @@ class AimSequenceTorchDataset(Dataset):
         ds, real_idx = get_base_dataset_and_index(self.base_dataset, idx)
         return ds.get_sample_metadata(real_idx)
 
-    def __getitem__(self, idx: int) -> tuple[np.ndarray, np.ndarray, dict[str, str]]:
-        sequence_sample = self.base_dataset[idx]
-        features = self.feature_extractor.extract(sequence_sample.sequence)
-        ds, real_idx = get_base_dataset_and_index(self.base_dataset, idx)
-        sample_metadata = ds.get_sample_metadata(real_idx)
+    def build_target(self, idx: int | None = None, sample_metadata: dict[str, object] | None = None) -> np.ndarray:
+        if sample_metadata is None:
+            if idx is None:
+                raise ValueError('Either idx or sample_metadata must be provided')
+            ds, real_idx = get_base_dataset_and_index(self.base_dataset, idx)
+            sample_metadata = ds.get_sample_metadata(real_idx)
+        else:
+            ds = self.base_dataset
+            while hasattr(ds, 'dataset'):
+                ds = ds.dataset
         target_tick = int(sample_metadata['target_tick'])
         target_state = ds.build_state_for_sample_tick(sample_metadata, target_tick)
         try:
             next_state = ds.build_state_for_sample_tick(sample_metadata, target_tick + 1)
         except Exception:
             next_state = target_state
+        return build_aim_target(target_state, next_state).astype(np.float32)
 
-        target = build_aim_target(target_state, next_state)
+    def __getitem__(self, idx: int) -> tuple[np.ndarray, np.ndarray, dict[str, str]]:
+        sequence_sample = self.base_dataset[idx]
+        features = self.feature_extractor.extract(sequence_sample.sequence)
+        sample_metadata = self.get_sample_metadata(idx)
+        target = self.build_target(sample_metadata=sample_metadata)
         meta = {
             'sample_id': str(sample_metadata['sample_id']),
             'demo_name': str(sample_metadata['demo_name']),
@@ -97,6 +118,8 @@ class AimTrainer:
         total_loss = 0.0
         total_aim_loss = 0.0
         total_fire_loss = 0.0
+        total_active_aim_loss = 0.0
+        total_active_aim_samples = 0
         total_samples = 0
         total_batches = len(loader)
         phase_name = 'Train' if training else 'Val'
@@ -119,6 +142,7 @@ class AimTrainer:
             fire_loss_per_sample = shoot_loss_raw.squeeze(1) + rightclick_loss_raw.squeeze(1)
             loss_per_sample = aim_loss_per_sample + fire_loss_per_sample
             loss = loss_per_sample.mean()
+            active_aim_mask = torch.any(torch.abs(mouse_targets) > AIM_TARGET_EPS, dim=1)
 
             if training:
                 self.optimizer.zero_grad(set_to_none=True)
@@ -131,12 +155,18 @@ class AimTrainer:
             total_loss += float(loss_per_sample.sum().item())
             total_aim_loss += float(aim_loss_per_sample.sum().item())
             total_fire_loss += float(fire_loss_per_sample.sum().item())
+            if torch.any(active_aim_mask):
+                total_active_aim_loss += float(aim_loss_per_sample[active_aim_mask].sum().item())
+                total_active_aim_samples += int(active_aim_mask.sum().item())
 
             if training and writer is not None:
                 global_step = (epoch - 1) * total_batches + batch_idx
                 writer.add_scalar('train/loss_step', loss.item(), global_step)
                 writer.add_scalar('train/aim_loss_step', aim_loss_per_sample.mean().item(), global_step)
                 writer.add_scalar('train/fire_loss_step', fire_loss_per_sample.mean().item(), global_step)
+                writer.add_scalar('train/active_aim_rate_step', active_aim_mask.float().mean().item(), global_step)
+                if torch.any(active_aim_mask):
+                    writer.add_scalar('train/active_aim_loss_step', aim_loss_per_sample[active_aim_mask].mean().item(), global_step)
                 if batch_idx % 10 == 0:
                     writer.flush()
 
@@ -155,12 +185,14 @@ class AimTrainer:
                 print(f'{phase_name} epoch {epoch} | Batch {batch_idx + 1}/{total_batches} | Loss: {loss.item():.4f} | Seen: {len(seen_sample_ids)}')
 
         if total_samples == 0:
-            return {'loss': 0.0, 'aim_loss': 0.0, 'fire_loss': 0.0, 'seen_sample_ids': set(), 'per_demo_loss': {}, 'per_demo_seen_counts': {}}
+            return {'loss': 0.0, 'aim_loss': 0.0, 'fire_loss': 0.0, 'active_aim_loss': 0.0, 'active_aim_rate': 0.0, 'seen_sample_ids': set(), 'per_demo_loss': {}, 'per_demo_seen_counts': {}}
 
         return {
             'loss': total_loss / total_samples,
             'aim_loss': total_aim_loss / total_samples,
             'fire_loss': total_fire_loss / total_samples,
+            'active_aim_loss': (total_active_aim_loss / total_active_aim_samples) if total_active_aim_samples else 0.0,
+            'active_aim_rate': float(total_active_aim_samples / total_samples),
             'seen_sample_ids': seen_sample_ids,
             'per_demo_loss': {demo: per_demo_sum[demo] / per_demo_count[demo] for demo in sorted(per_demo_sum)},
             'per_demo_seen_counts': {demo: len(ids) for demo, ids in sorted(seen_demo_sample_ids.items())},
@@ -196,6 +228,89 @@ def collect_expected_demo_counts(dataset) -> dict[str, int]:
         demo_name = str(metadata['demo_name'])
         counts[demo_name] = counts.get(demo_name, 0) + 1
     return counts
+
+
+def resolve_indexed_dataset(dataset) -> tuple[AimSequenceTorchDataset, list[int]]:
+    if hasattr(dataset, 'indices') and hasattr(dataset, 'dataset'):
+        return dataset.dataset, [int(idx) for idx in dataset.indices]
+    return dataset, list(range(len(dataset)))
+
+
+def _iter_aim_targets(dataset):
+    source_dataset, indices = resolve_indexed_dataset(dataset)
+    for idx in indices:
+        sample_metadata = source_dataset.get_sample_metadata(idx)
+        yield source_dataset.build_target(sample_metadata=sample_metadata)
+
+
+def _clip_probability(probability: float) -> float:
+    return float(np.clip(probability, 1e-6, 1.0 - 1e-6))
+
+
+def _binary_cross_entropy_from_probability(target: float, probability: float) -> float:
+    clipped_probability = _clip_probability(probability)
+    return float(-(target * np.log(clipped_probability) + (1.0 - target) * np.log(1.0 - clipped_probability)))
+
+
+def _is_active_mouse_target(mouse_target: np.ndarray) -> bool:
+    return bool(np.any(np.abs(mouse_target) > AIM_TARGET_EPS))
+
+
+def build_aim_baseline_prior(dataset) -> AimBaselinePrior:
+    total_targets = 0
+    mouse_sum = np.zeros(2, dtype=np.float64)
+    fire_sum = 0.0
+    rightclick_sum = 0.0
+
+    for target in _iter_aim_targets(dataset):
+        total_targets += 1
+        mouse_sum += target[5:7]
+        fire_sum += float(target[2])
+        rightclick_sum += float(target[3])
+
+    if total_targets == 0:
+        return AimBaselinePrior(mouse_mean=np.zeros(2, dtype=np.float32), fire_prob=0.5, rightclick_prob=0.5)
+
+    return AimBaselinePrior(
+        mouse_mean=(mouse_sum / total_targets).astype(np.float32),
+        fire_prob=float(fire_sum / total_targets),
+        rightclick_prob=float(rightclick_sum / total_targets),
+    )
+
+
+def evaluate_aim_baseline(dataset, prior: AimBaselinePrior) -> dict[str, float]:
+    total_targets = 0
+    total_loss = 0.0
+    total_aim_loss = 0.0
+    total_fire_loss = 0.0
+    total_active_aim_loss = 0.0
+    total_active_aim_samples = 0
+
+    for target in _iter_aim_targets(dataset):
+        mouse_target = target[5:7]
+        aim_loss = float(np.mean(np.square(mouse_target - prior.mouse_mean)))
+        fire_loss = _binary_cross_entropy_from_probability(float(target[2]), prior.fire_prob)
+        rightclick_loss = _binary_cross_entropy_from_probability(float(target[3]), prior.rightclick_prob)
+        combined_fire_loss = fire_loss + rightclick_loss
+
+        total_targets += 1
+        total_loss += aim_loss + combined_fire_loss
+        total_aim_loss += aim_loss
+        total_fire_loss += combined_fire_loss
+        if _is_active_mouse_target(mouse_target):
+            total_active_aim_samples += 1
+            total_active_aim_loss += aim_loss
+
+    if total_targets == 0:
+        return {'loss': 0.0, 'aim_loss': 0.0, 'fire_loss': 0.0, 'active_aim_loss': 0.0, 'active_aim_rate': 0.0}
+
+    return {
+        'loss': total_loss / total_targets,
+        'aim_loss': total_aim_loss / total_targets,
+        'fire_loss': total_fire_loss / total_targets,
+        'active_aim_loss': (total_active_aim_loss / total_active_aim_samples) if total_active_aim_samples else 0.0,
+        'active_aim_rate': float(total_active_aim_samples / total_targets),
+    }
 
 
 def build_coverage_summary(metrics: dict[str, object], expected_demo_counts: dict[str, int]) -> dict[str, object]:
@@ -364,23 +479,50 @@ def main() -> int:
     print(f'Feature dim: {feature_extractor.feature_dim()}')
     print(f'Save path: {args.save_path}')
     print(f'Epoch log: {epoch_log_path}')
+    print('Computing train-prior baseline metrics...')
+    baseline_prior = build_aim_baseline_prior(train_dataset)
+    train_baseline = evaluate_aim_baseline(train_dataset, baseline_prior)
+    val_baseline = evaluate_aim_baseline(val_dataset, baseline_prior) if len(val_dataset) > 0 else dict(train_baseline)
+    print(
+        'Baseline | '
+        f'train_loss={train_baseline["loss"]:.4f} '
+        f'(aim={train_baseline["aim_loss"]:.4f}, fire={train_baseline["fire_loss"]:.4f}, active_aim={train_baseline["active_aim_loss"]:.4f}, active_rate={train_baseline["active_aim_rate"]:.2%}) | '
+        f'val_loss={val_baseline["loss"]:.4f} '
+        f'(aim={val_baseline["aim_loss"]:.4f}, fire={val_baseline["fire_loss"]:.4f}, active_aim={val_baseline["active_aim_loss"]:.4f}, active_rate={val_baseline["active_aim_rate"]:.2%})'
+    )
 
     best_val_loss = math.inf
     try:
         for epoch in range(1, args.epochs + 1):
             train_metrics = trainer.train_epoch(train_loader, epoch=epoch, writer=writer)
-            val_metrics = trainer.eval_epoch(val_loader, epoch=epoch, writer=writer) if len(val_dataset) > 0 else {'loss': train_metrics['loss'], 'aim_loss': train_metrics['aim_loss'], 'fire_loss': train_metrics['fire_loss'], 'seen_sample_ids': set(), 'per_demo_loss': {}, 'per_demo_seen_counts': {}}
+            val_metrics = trainer.eval_epoch(val_loader, epoch=epoch, writer=writer) if len(val_dataset) > 0 else {'loss': train_metrics['loss'], 'aim_loss': train_metrics['aim_loss'], 'fire_loss': train_metrics['fire_loss'], 'active_aim_loss': train_metrics['active_aim_loss'], 'active_aim_rate': train_metrics['active_aim_rate'], 'seen_sample_ids': set(), 'per_demo_loss': {}, 'per_demo_seen_counts': {}}
             print(f'Epoch {epoch}/{args.epochs} | train_loss={train_metrics["loss"]:.4f} (aim={train_metrics["aim_loss"]:.4f}, fire={train_metrics["fire_loss"]:.4f}) | val_loss={val_metrics["loss"]:.4f} (aim={val_metrics["aim_loss"]:.4f}, fire={val_metrics["fire_loss"]:.4f})')
+            print(
+                'Aim active | '
+                f'train_rate={train_metrics["active_aim_rate"]:.2%} '
+                f'(loss={train_metrics["active_aim_loss"]:.4f}) | '
+                f'val_rate={val_metrics["active_aim_rate"]:.2%} '
+                f'(loss={val_metrics["active_aim_loss"]:.4f})'
+            )
+            print(
+                'Baseline   | '
+                f'train_loss={train_baseline["loss"]:.4f} '
+                f'(aim={train_baseline["aim_loss"]:.4f}, fire={train_baseline["fire_loss"]:.4f}) | '
+                f'val_loss={val_baseline["loss"]:.4f} '
+                f'(aim={val_baseline["aim_loss"]:.4f}, fire={val_baseline["fire_loss"]:.4f})'
+            )
 
             train_coverage = build_coverage_summary(train_metrics, train_expected_counts)
             val_coverage = build_coverage_summary(val_metrics, val_expected_counts)
             print_coverage_summary('train', train_coverage)
             if val_expected_counts:
                 print_coverage_summary('val', val_coverage)
-            append_epoch_summary(epoch_log_path, {'epoch': epoch, 'train': {'loss': train_metrics['loss'], 'aim_loss': train_metrics['aim_loss'], 'fire_loss': train_metrics['fire_loss'], 'coverage': train_coverage}, 'val': {'loss': val_metrics['loss'], 'aim_loss': val_metrics['aim_loss'], 'fire_loss': val_metrics['fire_loss'], 'coverage': val_coverage}})
+            append_epoch_summary(epoch_log_path, {'epoch': epoch, 'train': {'loss': train_metrics['loss'], 'aim_loss': train_metrics['aim_loss'], 'fire_loss': train_metrics['fire_loss'], 'active_aim_loss': train_metrics['active_aim_loss'], 'active_aim_rate': train_metrics['active_aim_rate'], 'coverage': train_coverage}, 'val': {'loss': val_metrics['loss'], 'aim_loss': val_metrics['aim_loss'], 'fire_loss': val_metrics['fire_loss'], 'active_aim_loss': val_metrics['active_aim_loss'], 'active_aim_rate': val_metrics['active_aim_rate'], 'coverage': val_coverage}, 'baseline': {'train': train_baseline, 'val': val_baseline}})
 
             log_scalar_dict(writer, 'train', train_metrics, epoch, ignored_keys={'seen_sample_ids', 'per_demo_loss', 'per_demo_seen_counts'})
             log_scalar_dict(writer, 'val', val_metrics, epoch, ignored_keys={'seen_sample_ids', 'per_demo_loss', 'per_demo_seen_counts'})
+            log_scalar_dict(writer, 'baseline/train', train_baseline, epoch)
+            log_scalar_dict(writer, 'baseline/val', val_baseline, epoch)
             log_scalar_dict(writer, 'train_coverage', train_coverage, epoch, ignored_keys={'per_demo'})
             log_scalar_dict(writer, 'val_coverage', val_coverage, epoch, ignored_keys={'per_demo'})
             if writer is not None:
