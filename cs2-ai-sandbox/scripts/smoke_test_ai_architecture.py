@@ -45,8 +45,8 @@ def run_torch_smoke_test() -> None:
 
     enemy_model = EnemyTrackerLSTM(input_dim=input_dim).to(device)
     positions, confidence = enemy_model(dummy)
-    assert tuple(positions.shape) == (2, 5, 3)
-    assert tuple(confidence.shape) == (2, 5)
+    assert tuple(positions.shape) == (2, seq_len, 5, 3)
+    assert tuple(confidence.shape) == (2, seq_len, 5)
     print("EnemyTrackerLSTM dummy forward OK")
 
     aim_model = AimAttentionModel(input_dim=input_dim).to(device)
@@ -58,7 +58,7 @@ def run_torch_smoke_test() -> None:
 
     decision_model = DecisionDQN(input_dim=input_dim, action_dim=action_dim).to(device)
     q_values = decision_model(dummy)
-    assert tuple(q_values.shape) == (2, action_dim)
+    assert tuple(q_values.shape) == (2, seq_len, action_dim)
     print("DecisionDQN dummy forward OK")
 
 

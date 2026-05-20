@@ -5,6 +5,7 @@ param (
     [int]$Stride = 4,
     [string]$SplitMode = "demo",
     [int]$NumWorkers = 0,
+    [int]$LogInterval = 10,
     [int]$MaxSamples = 0,
     [int]$MaxSamplesPerDemo = 0,
     [switch]$ShowIndexProgress,
@@ -21,6 +22,7 @@ $args = @(
     "--stride", $Stride,
     "--split-mode", $SplitMode,
     "--num-workers", $NumWorkers,
+    "--log-interval", $LogInterval,
     "--save-path", $SavePath
 )
 

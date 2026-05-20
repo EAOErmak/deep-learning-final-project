@@ -6,6 +6,7 @@ param (
     [int]$SeqLen = 16,
     [int]$Stride = 16,
     [int]$NumWorkers = 0,
+    [int]$LogInterval = 10,
     [int]$MaxSamples = 0,
     [int]$MaxSamplesPerDemo = 20000,
     [switch]$ShowIndexProgress,
@@ -30,6 +31,7 @@ $args = @(
     "--stride", $Stride,
     "--split-mode", "round",
     "--num-workers", $NumWorkers,
+    "--log-interval", $LogInterval,
     "--save-path", $SavePath
 )
 if ($MaxSamples -gt 0) { $args += @("--max-samples", $MaxSamples) }

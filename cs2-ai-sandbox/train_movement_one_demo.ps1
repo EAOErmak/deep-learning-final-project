@@ -9,6 +9,7 @@ param (
     [int]$MaxSamples = 0,
     [int]$MaxSamplesPerDemo = 20000,
     [switch]$ShowIndexProgress,
+    [switch]$DisableBatchProgress,
     [int]$LogEvery = 10,
     [string]$SavePath = ''
 )
@@ -37,6 +38,7 @@ $args = @(
 if ($MaxSamples -gt 0) { $args += @("--max-samples", $MaxSamples) }
 if ($MaxSamplesPerDemo -gt 0) { $args += @("--max-samples-per-demo", $MaxSamplesPerDemo) }
 if ($ShowIndexProgress) { $args += "--show-index-progress" }
+if ($DisableBatchProgress) { $args += "--disable-batch-progress" }
 
 python @args
 exit $LASTEXITCODE

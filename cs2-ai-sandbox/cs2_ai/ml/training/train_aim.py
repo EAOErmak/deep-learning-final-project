@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader, Dataset
 from cs2_ai.dataset.multi_demo_sequence_dataset import MultiDemoSequenceDataset, split_dataset_by_group
 from cs2_ai.features.aim_features import AimFeatureExtractor, build_aim_target
 from cs2_ai.ml.models.aim_attention import AimAttentionModel
+from cs2_ai.ml.utils.tensorboard_utils import close_summary_writer, create_summary_writer, log_scalar_dict, tensorboard_available
 from cs2_ai.ml.utils.torch_utils import get_device, set_seed, torch_available
 
 if torch_available():
@@ -72,20 +73,22 @@ class AimTrainer:
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
         self.log_interval = log_interval
 
-    def train_epoch(self, loader: DataLoader, epoch: int) -> dict[str, object]:
+    def train_epoch(self, loader: DataLoader, epoch: int, writer: Any | None = None) -> dict[str, object]:
         self.model.train()
-        return self._run_epoch(loader, training=True, epoch=epoch)
+        return self._run_epoch(loader, training=True, epoch=epoch, writer=writer)
 
-    def eval_epoch(self, loader: DataLoader, epoch: int) -> dict[str, object]:
+    def eval_epoch(self, loader: DataLoader, epoch: int, writer: Any | None = None) -> dict[str, object]:
         self.model.eval()
         with torch.no_grad():
-            return self._run_epoch(loader, training=False, epoch=epoch)
+            return self._run_epoch(loader, training=False, epoch=epoch, writer=writer)
 
-    def _run_epoch(self, loader: DataLoader, training: bool, epoch: int) -> dict[str, object]:
+    def _run_epoch(self, loader: DataLoader, training: bool, epoch: int, writer: Any | None = None) -> dict[str, object]:
         total_loss = 0.0
         total_aim_loss = 0.0
         total_fire_loss = 0.0
         total_samples = 0
+        total_batches = len(loader)
+        phase_name = 'Train' if training else 'Val'
         per_demo_sum: dict[str, float] = {}
         per_demo_count: dict[str, int] = {}
         seen_sample_ids: set[str] = set()
@@ -118,14 +121,27 @@ class AimTrainer:
             total_aim_loss += float(aim_loss_per_sample.sum().item())
             total_fire_loss += float(fire_loss_per_sample.sum().item())
 
+            if training and writer is not None:
+                global_step = (epoch - 1) * total_batches + batch_idx
+                writer.add_scalar('train/loss_step', loss.item(), global_step)
+                writer.add_scalar('train/aim_loss_step', aim_loss_per_sample.mean().item(), global_step)
+                writer.add_scalar('train/fire_loss_step', fire_loss_per_sample.mean().item(), global_step)
+                if batch_idx % 10 == 0:
+                    writer.flush()
+
             for sample_id, demo_name, sample_loss in zip(batch.sample_ids, batch.demo_names, loss_per_sample.detach().cpu().tolist()):
                 seen_sample_ids.add(sample_id)
                 seen_demo_sample_ids.setdefault(demo_name, set()).add(sample_id)
                 per_demo_sum[demo_name] = per_demo_sum.get(demo_name, 0.0) + float(sample_loss)
                 per_demo_count[demo_name] = per_demo_count.get(demo_name, 0) + 1
 
-            if training and batch_idx % self.log_interval == 0:
-                print(f'Epoch {epoch} | Batch {batch_idx}/{len(loader)} | Loss: {loss.item():.4f} | Seen: {len(seen_sample_ids)}')
+            should_log_batch = (
+                batch_idx == 0
+                or (batch_idx + 1) % self.log_interval == 0
+                or batch_idx == total_batches - 1
+            )
+            if should_log_batch:
+                print(f'{phase_name} epoch {epoch} | Batch {batch_idx + 1}/{total_batches} | Loss: {loss.item():.4f} | Seen: {len(seen_sample_ids)}')
 
         if total_samples == 0:
             return {'loss': 0.0, 'aim_loss': 0.0, 'fire_loss': 0.0, 'seen_sample_ids': set(), 'per_demo_loss': {}, 'per_demo_seen_counts': {}}
@@ -245,7 +261,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--max-samples-per-demo', type=int, default=None)
     parser.add_argument('--max-cached-demos', type=int, default=2)
     parser.add_argument('--show-index-progress', action='store_true')
-    parser.add_argument('--log-interval', type=int, default=100)
+    parser.add_argument('--log-interval', type=int, default=10)
+    parser.add_argument('--runs-dir', type=Path, default=PROJECT_ROOT / 'runs')
+    parser.add_argument('--tensorboard-run-name', type=str, default=None)
+    parser.add_argument('--disable-tensorboard', action='store_true')
     parser.add_argument('--save-path', type=Path, default=PROJECT_ROOT / 'checkpoints' / 'aim_bc.pt')
     return parser.parse_args()
 
@@ -300,6 +319,28 @@ def main() -> int:
     demo_names = dataset.base_dataset.get_demo_names()
     dataset_label = str(args.dataset_dir / 'clean_play_ticks')
     epoch_log_path = args.save_path.with_name(f'{args.save_path.stem}_epoch_metrics.jsonl')
+    writer = None
+    run_dir = None
+
+    if args.disable_tensorboard:
+        print('TensorBoard: disabled')
+    elif tensorboard_available():
+        writer, run_dir = create_summary_writer(
+            runs_dir=args.runs_dir,
+            run_name=args.tensorboard_run_name,
+            default_prefix='aim',
+            save_path=args.save_path,
+            config={
+                'args': vars(args),
+                'device': device,
+                'dataset_source': dataset_label,
+                'demo_names': demo_names,
+            },
+        )
+        if run_dir is not None:
+            print(f'TensorBoard run: {run_dir}')
+    else:
+        print('TensorBoard: unavailable (install tensorboard to enable event logging)')
 
     print('train_aim.py')
     print(f'Device: {device}')
@@ -314,22 +355,32 @@ def main() -> int:
     print(f'Epoch log: {epoch_log_path}')
 
     best_val_loss = math.inf
-    for epoch in range(1, args.epochs + 1):
-        train_metrics = trainer.train_epoch(train_loader, epoch=epoch)
-        val_metrics = trainer.eval_epoch(val_loader, epoch=epoch) if len(val_dataset) > 0 else {'loss': train_metrics['loss'], 'aim_loss': train_metrics['aim_loss'], 'fire_loss': train_metrics['fire_loss'], 'seen_sample_ids': set(), 'per_demo_loss': {}, 'per_demo_seen_counts': {}}
-        print(f'Epoch {epoch}/{args.epochs} | train_loss={train_metrics["loss"]:.4f} (aim={train_metrics["aim_loss"]:.4f}, fire={train_metrics["fire_loss"]:.4f}) | val_loss={val_metrics["loss"]:.4f} (aim={val_metrics["aim_loss"]:.4f}, fire={val_metrics["fire_loss"]:.4f})')
+    try:
+        for epoch in range(1, args.epochs + 1):
+            train_metrics = trainer.train_epoch(train_loader, epoch=epoch, writer=writer)
+            val_metrics = trainer.eval_epoch(val_loader, epoch=epoch, writer=writer) if len(val_dataset) > 0 else {'loss': train_metrics['loss'], 'aim_loss': train_metrics['aim_loss'], 'fire_loss': train_metrics['fire_loss'], 'seen_sample_ids': set(), 'per_demo_loss': {}, 'per_demo_seen_counts': {}}
+            print(f'Epoch {epoch}/{args.epochs} | train_loss={train_metrics["loss"]:.4f} (aim={train_metrics["aim_loss"]:.4f}, fire={train_metrics["fire_loss"]:.4f}) | val_loss={val_metrics["loss"]:.4f} (aim={val_metrics["aim_loss"]:.4f}, fire={val_metrics["fire_loss"]:.4f})')
 
-        train_coverage = build_coverage_summary(train_metrics, train_expected_counts)
-        val_coverage = build_coverage_summary(val_metrics, val_expected_counts)
-        print_coverage_summary('train', train_coverage)
-        if val_expected_counts:
-            print_coverage_summary('val', val_coverage)
-        append_epoch_summary(epoch_log_path, {'epoch': epoch, 'train': {'loss': train_metrics['loss'], 'aim_loss': train_metrics['aim_loss'], 'fire_loss': train_metrics['fire_loss'], 'coverage': train_coverage}, 'val': {'loss': val_metrics['loss'], 'aim_loss': val_metrics['aim_loss'], 'fire_loss': val_metrics['fire_loss'], 'coverage': val_coverage}})
+            train_coverage = build_coverage_summary(train_metrics, train_expected_counts)
+            val_coverage = build_coverage_summary(val_metrics, val_expected_counts)
+            print_coverage_summary('train', train_coverage)
+            if val_expected_counts:
+                print_coverage_summary('val', val_coverage)
+            append_epoch_summary(epoch_log_path, {'epoch': epoch, 'train': {'loss': train_metrics['loss'], 'aim_loss': train_metrics['aim_loss'], 'fire_loss': train_metrics['fire_loss'], 'coverage': train_coverage}, 'val': {'loss': val_metrics['loss'], 'aim_loss': val_metrics['aim_loss'], 'fire_loss': val_metrics['fire_loss'], 'coverage': val_coverage}})
 
-        if val_metrics['loss'] < best_val_loss:
-            best_val_loss = val_metrics['loss']
-            save_checkpoint(args.save_path, model, args, train_metrics, val_metrics, dataset_label, feature_extractor.feature_dim(), demo_names)
-            print(f'  saved checkpoint -> {args.save_path}')
+            log_scalar_dict(writer, 'train', train_metrics, epoch, ignored_keys={'seen_sample_ids', 'per_demo_loss', 'per_demo_seen_counts'})
+            log_scalar_dict(writer, 'val', val_metrics, epoch, ignored_keys={'seen_sample_ids', 'per_demo_loss', 'per_demo_seen_counts'})
+            log_scalar_dict(writer, 'train_coverage', train_coverage, epoch, ignored_keys={'per_demo'})
+            log_scalar_dict(writer, 'val_coverage', val_coverage, epoch, ignored_keys={'per_demo'})
+            if writer is not None:
+                writer.flush()
+
+            if val_metrics['loss'] < best_val_loss:
+                best_val_loss = val_metrics['loss']
+                save_checkpoint(args.save_path, model, args, train_metrics, val_metrics, dataset_label, feature_extractor.feature_dim(), demo_names)
+                print(f'  saved checkpoint -> {args.save_path}')
+    finally:
+        close_summary_writer(writer)
 
     print('Training finished.')
     print(f'Best val loss: {best_val_loss:.4f}')

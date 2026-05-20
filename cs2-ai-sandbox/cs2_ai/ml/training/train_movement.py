@@ -26,6 +26,7 @@ from torch.utils.data import DataLoader, Dataset
 from cs2_ai.dataset.multi_demo_sequence_dataset import MultiDemoSequenceDataset, split_dataset_by_group
 from cs2_ai.features.movement_features import MovementFeatureExtractor, build_movement_target
 from cs2_ai.ml.models.decision_dqn import DecisionDQN
+from cs2_ai.ml.utils.tensorboard_utils import close_summary_writer, create_summary_writer, log_scalar_dict, tensorboard_available
 from cs2_ai.ml.utils.torch_utils import get_device, set_seed, torch_available
 
 if torch_available():
@@ -98,14 +99,14 @@ class MovementTrainer:
         self.show_batch_progress = show_batch_progress
         self.log_every = max(1, log_every)
 
-    def train_epoch(self, loader: DataLoader, epoch_idx: int, total_epochs: int) -> dict[str, object]:
+    def train_epoch(self, loader: DataLoader, epoch_idx: int, total_epochs: int, writer: Any | None = None) -> dict[str, object]:
         self.model.train()
-        return self._run_epoch(loader, training=True, phase='train', epoch_idx=epoch_idx, total_epochs=total_epochs)
+        return self._run_epoch(loader, training=True, phase='train', epoch_idx=epoch_idx, total_epochs=total_epochs, writer=writer)
 
-    def eval_epoch(self, loader: DataLoader, epoch_idx: int, total_epochs: int) -> dict[str, object]:
+    def eval_epoch(self, loader: DataLoader, epoch_idx: int, total_epochs: int, writer: Any | None = None) -> dict[str, object]:
         self.model.eval()
         with torch.no_grad():
-            return self._run_epoch(loader, training=False, phase='val', epoch_idx=epoch_idx, total_epochs=total_epochs)
+            return self._run_epoch(loader, training=False, phase='val', epoch_idx=epoch_idx, total_epochs=total_epochs, writer=writer)
 
     def _run_epoch(
         self,
@@ -114,11 +115,13 @@ class MovementTrainer:
         phase: str,
         epoch_idx: int,
         total_epochs: int,
+        writer: Any | None = None,
     ) -> dict[str, object]:
         total_loss = 0.0
         total_binary_loss = 0.0
         total_move_loss = 0.0
         total_samples = 0
+        total_batches = len(loader)
         per_demo_sum: dict[str, float] = {}
         per_demo_count: dict[str, int] = {}
         seen_sample_ids: set[str] = set()
@@ -162,6 +165,14 @@ class MovementTrainer:
             total_binary_loss += float(binary_loss_per_sample.sum().item())
             total_move_loss += float(move_loss_per_sample.sum().item())
 
+            if training and writer is not None:
+                global_step = (epoch_idx - 1) * total_batches + batch_idx - 1
+                writer.add_scalar('train/loss_step', loss.item(), global_step)
+                writer.add_scalar('train/binary_loss_step', binary_loss_per_sample.mean().item(), global_step)
+                writer.add_scalar('train/move_loss_step', move_loss_per_sample.mean().item(), global_step)
+                if (batch_idx - 1) % 10 == 0:
+                    writer.flush()
+
             per_sample_losses = loss_per_sample.detach().cpu().tolist()
             for sample_id, demo_name, sample_loss in zip(batch.sample_ids, batch.demo_names, per_sample_losses):
                 seen_sample_ids.add(sample_id)
@@ -176,6 +187,22 @@ class MovementTrainer:
                     move=f'{(total_move_loss / total_samples):.4f}',
                     seen=len(seen_sample_ids),
                 )
+
+            should_log_batch = (
+                batch_idx == 1
+                or batch_idx % self.log_every == 0
+                or batch_idx == total_batches
+            )
+            if should_log_batch:
+                message = (
+                    f'{phase} epoch {epoch_idx}/{total_epochs} | '
+                    f'Batch {batch_idx}/{total_batches} | '
+                    f'Loss: {loss.item():.4f} | Seen: {len(seen_sample_ids)}'
+                )
+                if progress is not None:
+                    progress.write(message)
+                elif self.show_batch_progress:
+                    print(message)
 
         if total_samples == 0:
             return {
@@ -323,6 +350,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--show-index-progress', action='store_true')
     parser.add_argument('--disable-batch-progress', action='store_true')
     parser.add_argument('--log-every', type=int, default=25)
+    parser.add_argument('--runs-dir', type=Path, default=PROJECT_ROOT / 'runs')
+    parser.add_argument('--tensorboard-run-name', type=str, default=None)
+    parser.add_argument('--disable-tensorboard', action='store_true')
     parser.add_argument('--save-path', type=Path, default=PROJECT_ROOT / 'checkpoints' / 'movement_bc.pt')
     return parser.parse_args()
 
@@ -399,6 +429,28 @@ def main() -> int:
     demo_names = dataset.base_dataset.get_demo_names()
     dataset_label = str(args.dataset_dir / 'clean_play_ticks')
     epoch_log_path = args.save_path.with_name(f'{args.save_path.stem}_epoch_metrics.jsonl')
+    writer = None
+    run_dir = None
+
+    if args.disable_tensorboard:
+        print('TensorBoard: disabled')
+    elif tensorboard_available():
+        writer, run_dir = create_summary_writer(
+            runs_dir=args.runs_dir,
+            run_name=args.tensorboard_run_name,
+            default_prefix='movement',
+            save_path=args.save_path,
+            config={
+                'args': vars(args),
+                'device': device,
+                'dataset_source': dataset_label,
+                'demo_names': demo_names,
+            },
+        )
+        if run_dir is not None:
+            print(f'TensorBoard run: {run_dir}')
+    else:
+        print('TensorBoard: unavailable (install tensorboard to enable event logging)')
 
     print('train_movement.py')
     print(f'Device: {device}')
@@ -416,56 +468,66 @@ def main() -> int:
     best_train_metrics: dict[str, object] = {'loss': math.inf, 'binary_loss': math.inf, 'move_loss': math.inf}
     best_val_metrics: dict[str, object] = {'loss': math.inf, 'binary_loss': math.inf, 'move_loss': math.inf}
 
-    for epoch in range(1, args.epochs + 1):
-        print(f'Starting epoch {epoch}/{args.epochs}...')
-        train_metrics = trainer.train_epoch(train_loader, epoch_idx=epoch, total_epochs=args.epochs)
-        val_metrics = trainer.eval_epoch(val_loader, epoch_idx=epoch, total_epochs=args.epochs) if len(val_dataset) > 0 else {
-            'loss': train_metrics['loss'],
-            'binary_loss': train_metrics['binary_loss'],
-            'move_loss': train_metrics['move_loss'],
-            'seen_sample_ids': set(),
-            'per_demo_loss': {},
-            'per_demo_seen_counts': {},
-        }
-        print(
-            f'Epoch {epoch}/{args.epochs} | '
-            f'train_loss={train_metrics["loss"]:.4f} '
-            f'(bin={train_metrics["binary_loss"]:.4f}, move={train_metrics["move_loss"]:.4f}) | '
-            f'val_loss={val_metrics["loss"]:.4f} '
-            f'(bin={val_metrics["binary_loss"]:.4f}, move={val_metrics["move_loss"]:.4f})'
-        )
+    try:
+        for epoch in range(1, args.epochs + 1):
+            print(f'Starting epoch {epoch}/{args.epochs}...')
+            train_metrics = trainer.train_epoch(train_loader, epoch_idx=epoch, total_epochs=args.epochs, writer=writer)
+            val_metrics = trainer.eval_epoch(val_loader, epoch_idx=epoch, total_epochs=args.epochs, writer=writer) if len(val_dataset) > 0 else {
+                'loss': train_metrics['loss'],
+                'binary_loss': train_metrics['binary_loss'],
+                'move_loss': train_metrics['move_loss'],
+                'seen_sample_ids': set(),
+                'per_demo_loss': {},
+                'per_demo_seen_counts': {},
+            }
+            print(
+                f'Epoch {epoch}/{args.epochs} | '
+                f'train_loss={train_metrics["loss"]:.4f} '
+                f'(bin={train_metrics["binary_loss"]:.4f}, move={train_metrics["move_loss"]:.4f}) | '
+                f'val_loss={val_metrics["loss"]:.4f} '
+                f'(bin={val_metrics["binary_loss"]:.4f}, move={val_metrics["move_loss"]:.4f})'
+            )
 
-        train_coverage = build_coverage_summary(train_metrics, train_expected_counts)
-        val_coverage = build_coverage_summary(val_metrics, val_expected_counts)
-        print_coverage_summary('train', train_coverage)
-        if val_expected_counts:
-            print_coverage_summary('val', val_coverage)
+            train_coverage = build_coverage_summary(train_metrics, train_expected_counts)
+            val_coverage = build_coverage_summary(val_metrics, val_expected_counts)
+            print_coverage_summary('train', train_coverage)
+            if val_expected_counts:
+                print_coverage_summary('val', val_coverage)
 
-        append_epoch_summary(
-            epoch_log_path,
-            {
-                'epoch': epoch,
-                'train': {
-                    'loss': train_metrics['loss'],
-                    'binary_loss': train_metrics['binary_loss'],
-                    'move_loss': train_metrics['move_loss'],
-                    'coverage': train_coverage,
+            append_epoch_summary(
+                epoch_log_path,
+                {
+                    'epoch': epoch,
+                    'train': {
+                        'loss': train_metrics['loss'],
+                        'binary_loss': train_metrics['binary_loss'],
+                        'move_loss': train_metrics['move_loss'],
+                        'coverage': train_coverage,
+                    },
+                    'val': {
+                        'loss': val_metrics['loss'],
+                        'binary_loss': val_metrics['binary_loss'],
+                        'move_loss': val_metrics['move_loss'],
+                        'coverage': val_coverage,
+                    },
                 },
-                'val': {
-                    'loss': val_metrics['loss'],
-                    'binary_loss': val_metrics['binary_loss'],
-                    'move_loss': val_metrics['move_loss'],
-                    'coverage': val_coverage,
-                },
-            },
-        )
+            )
 
-        if val_metrics['loss'] < best_val_loss:
-            best_val_loss = val_metrics['loss']
-            best_train_metrics = train_metrics
-            best_val_metrics = val_metrics
-            save_checkpoint(args.save_path, model, args, train_metrics, val_metrics, dataset_label, feature_extractor.feature_dim(), demo_names)
-            print(f'  saved checkpoint -> {args.save_path}')
+            log_scalar_dict(writer, 'train', train_metrics, epoch, ignored_keys={'seen_sample_ids', 'per_demo_loss', 'per_demo_seen_counts'})
+            log_scalar_dict(writer, 'val', val_metrics, epoch, ignored_keys={'seen_sample_ids', 'per_demo_loss', 'per_demo_seen_counts'})
+            log_scalar_dict(writer, 'train_coverage', train_coverage, epoch, ignored_keys={'per_demo'})
+            log_scalar_dict(writer, 'val_coverage', val_coverage, epoch, ignored_keys={'per_demo'})
+            if writer is not None:
+                writer.flush()
+
+            if val_metrics['loss'] < best_val_loss:
+                best_val_loss = val_metrics['loss']
+                best_train_metrics = train_metrics
+                best_val_metrics = val_metrics
+                save_checkpoint(args.save_path, model, args, train_metrics, val_metrics, dataset_label, feature_extractor.feature_dim(), demo_names)
+                print(f'  saved checkpoint -> {args.save_path}')
+    finally:
+        close_summary_writer(writer)
 
     print('Training finished.')
     print(f'Best val loss: {best_val_loss:.4f}')

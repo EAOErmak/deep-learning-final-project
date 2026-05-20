@@ -8,6 +8,7 @@ param (
     [int]$MaxSamples = 0,
     [int]$MaxSamplesPerDemo = 0,
     [switch]$ShowIndexProgress,
+    [switch]$DisableBatchProgress,
     [int]$LogEvery = 10,
     [string]$SavePath = "checkpoints\movement_bc_v1.pt"
 )
@@ -38,6 +39,10 @@ if ($MaxSamplesPerDemo -gt 0) {
 
 if ($ShowIndexProgress) {
     $args += "--show-index-progress"
+}
+
+if ($DisableBatchProgress) {
+    $args += "--disable-batch-progress"
 }
 
 python @args
