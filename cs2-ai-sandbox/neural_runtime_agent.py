@@ -142,7 +142,15 @@ class NeuralRuntimeAgent:
         return action
 
 class FullNeuralRuntimeAgent:
-    def __init__(self, seed: int = 42, aim_checkpoint: str | None = None, movement_checkpoint: str | None = None, tracker_checkpoint: str | None = None, yolo_weights: str | None = None) -> None:
+    def __init__(
+        self,
+        seed: int = 42,
+        aim_checkpoint: str | None = None,
+        movement_checkpoint: str | None = None,
+        tracker_checkpoint: str | None = None,
+        yolo_weights: str | None = None,
+        window_keywords: tuple[str, ...] = ('counter-strike', 'cs2'),
+    ) -> None:
         if not torch_available():
             raise RuntimeError('PyTorch is not available.')
 
@@ -215,7 +223,7 @@ class FullNeuralRuntimeAgent:
         
         if yolo_weights and Path(yolo_weights).exists():
             from cs2_ai.vision.yolo_pipeline import YoloVisionModule
-            self.vision_module = YoloVisionModule(Path(yolo_weights))
+            self.vision_module = YoloVisionModule(Path(yolo_weights), window_keywords=window_keywords)
             self.vision_module.start()
         else:
             self.vision_module = None

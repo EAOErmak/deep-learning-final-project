@@ -115,7 +115,8 @@ def build_agent(state_source: str, agent_mode: str, seed: int, args: argparse.Na
             aim_checkpoint=args.aim_checkpoint, 
             movement_checkpoint=args.movement_checkpoint, 
             tracker_checkpoint=args.tracker_checkpoint,
-            yolo_weights=args.yolo_weights
+            yolo_weights=args.yolo_weights,
+            window_keywords=tuple(args.window_keyword) if args.window_keyword else ('counter-strike', 'cs2'),
         )
     raise ValueError(f'Unsupported agent mode: {agent_mode}')
 
@@ -201,6 +202,7 @@ def main() -> int:
                 top=args.radar_top,
                 size=args.radar_size,
                 world_scale=args.radar_world_scale,
+                window_keywords=tuple(args.window_keyword) if args.window_keyword else ('counter-strike', 'cs2'),
             )
             radar_vision.start()
 

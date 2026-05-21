@@ -2,6 +2,7 @@ import threading
 import time
 from pathlib import Path
 from dataclasses import dataclass
+import logging
 
 try:
     import mss
@@ -12,6 +13,8 @@ except ImportError:
     np = None
     YOLO = None
 
+from cs2_ai.vision.window_capture import CaptureRegion, WindowCaptureLocator
+
 @dataclass
 class VisionTarget:
     screen_dx: float  # [-1.0, 1.0] relative to screen center
@@ -20,11 +23,18 @@ class VisionTarget:
     label: str
 
 class YoloVisionModule:
-    def __init__(self, model_path: Path, capture_fps: int = 60):
+    def __init__(
+        self,
+        model_path: Path,
+        capture_fps: int = 60,
+        window_keywords: tuple[str, ...] = ('counter-strike', 'cs2'),
+    ):
         self.model_path = model_path
         self.capture_fps = capture_fps
         self.model = None
         self.sct = None
+        self.logger = logging.getLogger(__name__)
+        self.window_locator = WindowCaptureLocator(window_keywords=window_keywords)
         
         self._thread = None
         self._stop_event = threading.Event()
@@ -68,23 +78,20 @@ class YoloVisionModule:
             return self.latest_target
 
     def _capture_loop(self):
-        monitor = self.sct.monitors[1]  # Primary monitor
-        width = monitor["width"]
-        height = monitor["height"]
-        center_x = width / 2.0
-        center_y = height / 2.0
-        
-        # Capture 640x640 crop in the center to save performance
-        crop_size = 640
-        left = int(center_x - crop_size / 2)
-        top = int(center_y - crop_size / 2)
-        bbox = {"top": top, "left": left, "width": crop_size, "height": crop_size}
-
         frame_time = 1.0 / self.capture_fps
 
         while not self._stop_event.is_set():
             start_t = time.perf_counter()
-            
+
+            capture_region = self._resolve_capture_region()
+            left = capture_region.left
+            top = capture_region.top
+            width = capture_region.width
+            height = capture_region.height
+            center_x = left + width / 2.0
+            center_y = top + height / 2.0
+            bbox = capture_region.as_mss_bbox()
+
             sct_img = self.sct.grab(bbox)
             img = np.array(sct_img)[:, :, :3]  # Drop alpha channel
 
@@ -130,8 +137,9 @@ class YoloVisionModule:
                     if dist < min_dist:
                         min_dist = dist
                         # Normalize identically to world_to_screen_delta
-                        screen_dx = (full_x - center_x) / center_x
-                        screen_dy = (full_y - center_y) / center_x  # Use center_x to preserve aspect ratio aspect
+                        norm_base = max(width / 2.0, 1.0)
+                        screen_dx = (full_x - center_x) / norm_base
+                        screen_dy = (full_y - center_y) / norm_base  # Use width to preserve aspect ratio handling
                         
                         best_target = VisionTarget(
                             screen_dx=screen_dx,
@@ -147,3 +155,19 @@ class YoloVisionModule:
             sleep_time = frame_time - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
+
+    def _resolve_capture_region(self) -> CaptureRegion:
+        window_region = self.window_locator.find_client_region()
+        if window_region is not None:
+            crop_size = min(640, window_region.width, window_region.height)
+            crop_left = window_region.left + max(0, (window_region.width - crop_size) // 2)
+            crop_top = window_region.top + max(0, (window_region.height - crop_size) // 2)
+            return CaptureRegion(left=crop_left, top=crop_top, width=crop_size, height=crop_size)
+
+        monitor = self.sct.monitors[1]  # Primary monitor
+        width = int(monitor['width'])
+        height = int(monitor['height'])
+        crop_size = min(640, width, height)
+        left = int(width / 2.0 - crop_size / 2)
+        top = int(height / 2.0 - crop_size / 2)
+        return CaptureRegion(left=left, top=top, width=crop_size, height=crop_size)

@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from typing import Iterable
 
 from game_state import GameState, LiveCapabilities, PlayerState, Vector3
+from cs2_ai.vision.window_capture import CaptureRegion, WindowCaptureLocator
 
 try:
     import cv2
@@ -42,6 +43,7 @@ class RadarVisionModule:
         world_scale: float = 2000.0,
         min_blob_area: int = 6,
         max_blob_area: int = 200,
+        window_keywords: tuple[str, ...] = ('counter-strike', 'cs2'),
     ) -> None:
         self.logger = logging.getLogger(__name__)
         self.left = left
@@ -52,6 +54,7 @@ class RadarVisionModule:
         self.max_blob_area = max_blob_area
         self.sct = None
         self.is_running = False
+        self.window_locator = WindowCaptureLocator(window_keywords=window_keywords)
 
     def start(self) -> None:
         if mss is None or cv2 is None or np is None:
@@ -75,7 +78,7 @@ class RadarVisionModule:
         if not self.is_running or self.sct is None or np is None or cv2 is None:
             return None
 
-        bbox = {"top": self.top, "left": self.left, "width": self.size, "height": self.size}
+        bbox = self._resolve_capture_region().as_mss_bbox()
         frame = np.array(self.sct.grab(bbox))[:, :, :3]
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         teammate_mask = self._build_teammate_mask(hsv)
@@ -128,6 +131,17 @@ class RadarVisionModule:
             )
         teammates.sort(key=lambda item: abs(item.rel_x) + abs(item.rel_y))
         return teammates[:4]
+
+    def _resolve_capture_region(self) -> CaptureRegion:
+        window_region = self.window_locator.find_client_region()
+        if window_region is not None:
+            max_left = max(window_region.width - self.size, 0)
+            max_top = max(window_region.height - self.size, 0)
+            left = window_region.left + min(max(self.left, 0), max_left)
+            top = window_region.top + min(max(self.top, 0), max_top)
+            return CaptureRegion(left=left, top=top, width=self.size, height=self.size)
+
+        return CaptureRegion(left=self.left, top=self.top, width=self.size, height=self.size)
 
 
 def augment_live_state_with_radar(
