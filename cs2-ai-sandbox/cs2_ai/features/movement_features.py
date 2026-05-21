@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 
 from cs2_ai.config import MAX_TEAMMATES
 from cs2_ai.features.encoding import bool_to_float, normalize_angle, normalize_position, normalize_velocity, pad_or_trim_vector, relative_position
@@ -8,6 +9,9 @@ from cs2_ai.features.feature_contract import FeatureSchema, NORMALIZATION_CONSTA
 from cs2_ai.schemas.game_state import GameState
 from cs2_ai.schemas.module_outputs import BeliefStateData, DecisionOutput
 
+
+MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE = "next_tick_sequence"
+MOVEMENT_TARGET_MODE_ACTION_CHUNK = "action_chunk"
 
 MOVEMENT_FEATURE_NAMES = (
     "self_pos_x",
@@ -47,6 +51,26 @@ MOVEMENT_FEATURE_NAMES = (
     "belief_a_count",
     "belief_b_count",
     "belief_mid_count",
+)
+
+MOVEMENT_ACTION_NAMES = (
+    "forward",
+    "back",
+    "left",
+    "right",
+    "walk",
+    "crouch",
+)
+
+MOVEMENT_ACTION_CHUNK_NAMES = MOVEMENT_ACTION_NAMES + ("jump",)
+
+JUMP_COLUMNS = (
+    "JUMP",
+    "jump",
+    "IN_JUMP",
+    "in_jump",
+    "usercmd_jump",
+    "jump_pressed",
 )
 
 
@@ -110,6 +134,14 @@ class MovementFeatureExtractor:
         ]
 
 
+def movement_action_names_for_target_mode(target_mode: str) -> tuple[str, ...]:
+    if target_mode == MOVEMENT_TARGET_MODE_ACTION_CHUNK:
+        return MOVEMENT_ACTION_CHUNK_NAMES
+    if target_mode == MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE:
+        return MOVEMENT_ACTION_NAMES
+    raise ValueError(f"Unsupported movement target mode: {target_mode}")
+
+
 def build_movement_target(game_state: GameState) -> np.ndarray:
     self_input = game_state.self_input
     values = [
@@ -121,3 +153,56 @@ def build_movement_target(game_state: GameState) -> np.ndarray:
         bool_to_float(game_state.self_player.ducking),
     ]
     return np.asarray(values, dtype=np.float32)
+
+
+def build_movement_target_from_tick_rows(tick_rows: pd.DataFrame, perspective_steamid: int) -> np.ndarray:
+    if tick_rows.empty or "steamid" not in tick_rows.columns:
+        raise ValueError('tick_rows is empty or missing steamid.')
+    steamids = pd.to_numeric(tick_rows["steamid"], errors="coerce")
+    self_rows = tick_rows.loc[steamids == int(perspective_steamid)]
+    if self_rows.empty:
+        raise ValueError(f'Perspective player {perspective_steamid} not found on tick rows.')
+    self_row = self_rows.iloc[0]
+    values = [
+        bool_to_float(bool(self_row.get("FORWARD", False))),
+        bool_to_float(bool(self_row.get("BACK", False))),
+        bool_to_float(bool(self_row.get("LEFT", False))),
+        bool_to_float(bool(self_row.get("RIGHT", False))),
+        bool_to_float(bool(self_row.get("WALK", self_row.get("is_walking", False)))),
+        bool_to_float(bool(self_row.get("ducking", False))),
+    ]
+    return np.asarray(values, dtype=np.float32)
+
+
+def extract_jump_target_from_tick_rows(tick_rows: pd.DataFrame, perspective_steamid: int) -> float:
+    if tick_rows.empty or "steamid" not in tick_rows.columns:
+        return 0.0
+    steamids = pd.to_numeric(tick_rows["steamid"], errors="coerce")
+    self_rows = tick_rows.loc[steamids == int(perspective_steamid)]
+    if self_rows.empty:
+        return 0.0
+    self_row = self_rows.iloc[0]
+    for column in JUMP_COLUMNS:
+        if column not in self_row.index or pd.isna(self_row[column]):
+            continue
+        return bool_to_float(bool(self_row[column]))
+    buttons_value = self_row.get("buttons")
+    if isinstance(buttons_value, str) and "jump" in buttons_value.lower():
+        return 1.0
+    return 0.0
+
+
+def build_movement_action_chunk_target(game_state: GameState, jump_value: float) -> np.ndarray:
+    return np.asarray(
+        [
+            *build_movement_target(game_state).astype(np.float32).tolist(),
+            float(np.clip(jump_value, 0.0, 1.0)),
+        ],
+        dtype=np.float32,
+    )
+
+
+def build_movement_action_chunk_target_from_tick_rows(tick_rows: pd.DataFrame, perspective_steamid: int) -> np.ndarray:
+    base_target = build_movement_target_from_tick_rows(tick_rows, perspective_steamid)
+    jump_value = extract_jump_target_from_tick_rows(tick_rows, perspective_steamid)
+    return np.asarray([*base_target.tolist(), float(np.clip(jump_value, 0.0, 1.0))], dtype=np.float32)
