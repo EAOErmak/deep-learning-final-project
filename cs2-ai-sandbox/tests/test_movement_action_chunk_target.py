@@ -11,7 +11,13 @@ if str(PROJECT_ROOT) not in sys.path:
 import pandas as pd
 
 from cs2_ai.dataset.sequence_dataset import PerspectiveSequenceDataset
-from cs2_ai.features.movement_features import MOVEMENT_TARGET_MODE_ACTION_CHUNK, MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE
+from cs2_ai.features.movement_features import (
+    GRID_NAVIGATION_FEATURE_NAMES,
+    MOVEMENT_FEATURE_MODE_SOLO_GRID,
+    MOVEMENT_FEATURE_NAMES_SOLO_GRID,
+    MOVEMENT_TARGET_MODE_ACTION_CHUNK,
+    MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE,
+)
 from cs2_ai.ml.training.train_movement import MovementSequenceTorchDataset
 
 
@@ -129,6 +135,66 @@ class MovementActionChunkTargetTests(unittest.TestCase):
         _, targets, _ = dataset[0]
         self.assertTrue(((targets == 0.0) | (targets == 1.0)).all())
         self.assertEqual(float(targets[:, 6].max()), 1.0)
+
+    def test_grid_navigation_features_extend_feature_dim(self):
+        df = build_tick_df().copy()
+        for column, value in {
+            'next_cell_rel_x': 200.0,
+            'next_cell_rel_y': -100.0,
+            'next_cell_rel_z': 32.0,
+            'next_cell_distance': 225.0,
+            'has_next_cell_target': 1.0,
+            'dwell_pass_through': 1.0,
+            'dwell_short_hold': 0.0,
+            'dwell_medium_hold': 0.0,
+            'dwell_long_hold': 0.0,
+        }.items():
+            df[column] = value
+        dataset = MovementSequenceTorchDataset(
+            PerspectiveSequenceDataset(df, seq_len=4, stride=1, alive_only=True),
+            target_mode=MOVEMENT_TARGET_MODE_ACTION_CHUNK,
+            chunk_len=4,
+            use_grid_navigation_features=True,
+        )
+        features, _, _ = dataset[0]
+        self.assertEqual(features.shape[1], len(dataset.feature_extractor.feature_names()))
+        self.assertEqual(features.shape[1], len(GRID_NAVIGATION_FEATURE_NAMES) + 37)
+        self.assertAlmostEqual(float(features[0, -9]), 0.2, places=6)
+        self.assertAlmostEqual(float(features[0, -8]), -0.1, places=6)
+        self.assertAlmostEqual(float(features[0, -7]), 0.125, places=6)
+
+    def test_solo_grid_feature_mode_uses_only_expected_features(self):
+        df = build_tick_df().copy()
+        for column, value in {
+            'next_cell_rel_x': 200.0,
+            'next_cell_rel_y': -100.0,
+            'next_cell_rel_z': 32.0,
+            'next_cell_distance': 225.0,
+            'has_next_cell_target': 1.0,
+            'dwell_pass_through': 1.0,
+            'dwell_short_hold': 0.0,
+            'dwell_medium_hold': 0.0,
+            'dwell_long_hold': 0.0,
+        }.items():
+            df[column] = value
+        dataset = MovementSequenceTorchDataset(
+            PerspectiveSequenceDataset(df, seq_len=4, stride=1, alive_only=True),
+            target_mode=MOVEMENT_TARGET_MODE_ACTION_CHUNK,
+            chunk_len=4,
+            movement_feature_mode=MOVEMENT_FEATURE_MODE_SOLO_GRID,
+        )
+        features, _, _ = dataset[0]
+        feature_names = dataset.feature_extractor.feature_names()
+        self.assertEqual(feature_names, MOVEMENT_FEATURE_NAMES_SOLO_GRID)
+        self.assertEqual(features.shape, (4, 19))
+        self.assertTrue(all(not name.startswith('teammate_') for name in feature_names))
+        self.assertTrue(all(feature in feature_names for feature in GRID_NAVIGATION_FEATURE_NAMES))
+        self.assertAlmostEqual(float(features[0, 0]), float(df.iloc[0]['X']) / 4000.0, places=6)
+        self.assertAlmostEqual(float(features[0, 1]), float(df.iloc[0]['Y']) / 4000.0, places=6)
+        self.assertAlmostEqual(float(features[0, 2]), float(df.iloc[0]['Z']) / 512.0, places=6)
+        self.assertAlmostEqual(float(features[0, 10]), 0.2, places=6)
+        self.assertAlmostEqual(float(features[0, 11]), -0.1, places=6)
+        self.assertAlmostEqual(float(features[0, 12]), 0.125, places=6)
 
 
 if __name__ == "__main__":

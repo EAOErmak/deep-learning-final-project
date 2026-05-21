@@ -15,6 +15,8 @@ from cs2_ai.schemas.module_outputs import BeliefStateData, DecisionOutput
 MOVEMENT_TARGET_MODE_NEXT_TICK = "next_tick"
 MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE = MOVEMENT_TARGET_MODE_NEXT_TICK
 MOVEMENT_TARGET_MODE_ACTION_CHUNK = "action_chunk"
+MOVEMENT_FEATURE_MODE_LEGACY = "legacy"
+MOVEMENT_FEATURE_MODE_SOLO_GRID = "solo_grid"
 
 MOVEMENT_FEATURE_NAMES = (
     "self_pos_x",
@@ -56,6 +58,42 @@ MOVEMENT_FEATURE_NAMES = (
     "belief_mid_count",
 )
 
+MOVEMENT_FEATURE_NAMES_SOLO_GRID = (
+    "self_pos_x",
+    "self_pos_y",
+    "self_pos_z",
+    "self_vel_x",
+    "self_vel_y",
+    "self_vel_z",
+    "self_yaw",
+    "self_is_walking",
+    "self_is_airborne",
+    "self_is_ducking",
+    "next_cell_rel_x",
+    "next_cell_rel_y",
+    "next_cell_rel_z",
+    "next_cell_distance",
+    "has_next_cell_target",
+    "dwell_pass_through",
+    "dwell_short_hold",
+    "dwell_medium_hold",
+    "dwell_long_hold",
+)
+
+GRID_NAVIGATION_FEATURE_NAMES = (
+    "next_cell_rel_x",
+    "next_cell_rel_y",
+    "next_cell_rel_z",
+    "next_cell_distance",
+    "has_next_cell_target",
+    "dwell_pass_through",
+    "dwell_short_hold",
+    "dwell_medium_hold",
+    "dwell_long_hold",
+)
+
+GRID_NAVIGATION_REQUIRED_COLUMNS = GRID_NAVIGATION_FEATURE_NAMES
+
 MOVEMENT_ACTION_NAMES = (
     "forward",
     "back",
@@ -81,8 +119,26 @@ _missing_jump_warning_emitted = False
 
 
 class MovementFeatureExtractor:
-    def __init__(self, seq_len: int | None = None):
+    def __init__(
+        self,
+        seq_len: int | None = None,
+        use_grid_navigation_features: bool = False,
+        movement_feature_mode: str = MOVEMENT_FEATURE_MODE_LEGACY,
+    ):
         self.seq_len = seq_len
+        self.movement_feature_mode = normalize_movement_feature_mode(movement_feature_mode)
+        self.use_grid_navigation_features = bool(use_grid_navigation_features) or self.movement_feature_mode == MOVEMENT_FEATURE_MODE_SOLO_GRID
+
+    @property
+    def requires_grid_navigation_features(self) -> bool:
+        return self.use_grid_navigation_features
+
+    def feature_names(self) -> tuple[str, ...]:
+        if self.movement_feature_mode == MOVEMENT_FEATURE_MODE_SOLO_GRID:
+            return MOVEMENT_FEATURE_NAMES_SOLO_GRID
+        if self.use_grid_navigation_features:
+            return MOVEMENT_FEATURE_NAMES + GRID_NAVIGATION_FEATURE_NAMES
+        return MOVEMENT_FEATURE_NAMES
 
     def schema(self, seq_len: int | None = None) -> FeatureSchema:
         resolved_seq_len = int(seq_len if seq_len is not None else self.seq_len or 0)
@@ -92,21 +148,47 @@ class MovementFeatureExtractor:
             model_key="movement",
             version=SCHEMA_VERSION,
             seq_len=resolved_seq_len,
-            feature_names=MOVEMENT_FEATURE_NAMES,
+            feature_names=self.feature_names(),
             default_value=0.0,
             normalization=dict(NORMALIZATION_CONSTANTS),
         )
 
-    def extract(self, sequence, decision: DecisionOutput | None = None, belief_state: BeliefStateData | None = None) -> np.ndarray:
-        frames = [self._state_to_vector(state, decision=None, belief_state=None) for state in sequence.states]
+    def extract(
+        self,
+        sequence,
+        decision: DecisionOutput | None = None,
+        belief_state: BeliefStateData | None = None,
+        grid_navigation_frames: list[dict[str, float]] | None = None,
+    ) -> np.ndarray:
+        frames = []
+        for idx, state in enumerate(sequence.states):
+            base_vector = self._state_to_vector(state, decision=None, belief_state=None)
+            if self.use_grid_navigation_features:
+                nav_frame = grid_navigation_frames[idx] if grid_navigation_frames is not None and idx < len(grid_navigation_frames) else {}
+                base_vector.extend(self._grid_navigation_vector(nav_frame))
+            frames.append(base_vector)
         if self.seq_len is not None:
             frames = pad_or_trim_sequence(frames, self.seq_len, self.feature_dim(), default_value=0.0)
         return np.asarray(frames, dtype=np.float32)
 
     def feature_dim(self) -> int:
-        return len(MOVEMENT_FEATURE_NAMES)
+        return len(self.feature_names())
 
     def _state_to_vector(self, state: GameState, decision: DecisionOutput | None, belief_state: BeliefStateData | None) -> list[float]:
+        if self.movement_feature_mode == MOVEMENT_FEATURE_MODE_SOLO_GRID:
+            self_player = state.self_player
+            return [
+                float(self_player.position[0]) / 4000.0,
+                float(self_player.position[1]) / 4000.0,
+                float(self_player.position[2]) / 512.0,
+                float(self_player.velocity[0]) / 500.0,
+                float(self_player.velocity[1]) / 500.0,
+                float(self_player.velocity[2]) / 500.0,
+                normalize_angle(self_player.yaw),
+                bool_to_float(self_player.is_walking),
+                bool_to_float(self_player.is_airborne),
+                bool_to_float(self_player.ducking),
+            ]
         self_player = state.self_player
         teammate_features: list[float] = []
         teammate_present: list[float] = []
@@ -138,6 +220,45 @@ class MovementFeatureExtractor:
             predicted_enemy_count,
             *coarse_enemy_counts,
         ]
+
+    def _grid_navigation_vector(self, nav_frame: dict[str, float] | None) -> list[float]:
+        nav_frame = nav_frame or {}
+        return [
+            float(nav_frame.get("next_cell_rel_x", 0.0)) / 1000.0,
+            float(nav_frame.get("next_cell_rel_y", 0.0)) / 1000.0,
+            float(nav_frame.get("next_cell_rel_z", 0.0)) / 256.0,
+            float(nav_frame.get("next_cell_distance", 0.0)) / 1000.0,
+            float(nav_frame.get("has_next_cell_target", 0.0)),
+            float(nav_frame.get("dwell_pass_through", 0.0)),
+            float(nav_frame.get("dwell_short_hold", 0.0)),
+            float(nav_frame.get("dwell_medium_hold", 0.0)),
+            float(nav_frame.get("dwell_long_hold", 0.0)),
+        ]
+
+
+def normalize_movement_feature_mode(movement_feature_mode: str | None) -> str:
+    normalized = str(movement_feature_mode or MOVEMENT_FEATURE_MODE_LEGACY).strip().lower()
+    if normalized in {MOVEMENT_FEATURE_MODE_LEGACY, "default"}:
+        return MOVEMENT_FEATURE_MODE_LEGACY
+    if normalized == MOVEMENT_FEATURE_MODE_SOLO_GRID:
+        return MOVEMENT_FEATURE_MODE_SOLO_GRID
+    raise ValueError(f"Unsupported movement feature mode: {movement_feature_mode}")
+
+
+def build_grid_navigation_feature_frame_from_row(row: pd.Series, *, strict: bool = False) -> dict[str, float]:
+    missing = [column for column in GRID_NAVIGATION_REQUIRED_COLUMNS if column not in row.index]
+    if missing:
+        if strict:
+            raise ValueError(
+                'Grid navigation features were requested, but required columns are missing: '
+                f'{missing}. Run label_dust2_grid preprocessing first.'
+            )
+        return {column: 0.0 for column in GRID_NAVIGATION_REQUIRED_COLUMNS}
+    result: dict[str, float] = {}
+    for column in GRID_NAVIGATION_REQUIRED_COLUMNS:
+        value = row.get(column, 0.0)
+        result[column] = 0.0 if pd.isna(value) else float(value)
+    return result
 
 
 def movement_action_names_for_target_mode(target_mode: str) -> tuple[str, ...]:
@@ -180,12 +301,12 @@ def build_movement_target_from_tick_rows(tick_rows: pd.DataFrame, perspective_st
         raise ValueError(f'Perspective player {perspective_steamid} not found on tick rows.')
     self_row = self_rows.iloc[0]
     values = [
-        bool_to_float(bool(self_row.get("FORWARD", False))),
-        bool_to_float(bool(self_row.get("BACK", False))),
-        bool_to_float(bool(self_row.get("LEFT", False))),
-        bool_to_float(bool(self_row.get("RIGHT", False))),
-        bool_to_float(bool(self_row.get("WALK", self_row.get("is_walking", False)))),
-        bool_to_float(bool(self_row.get("ducking", False))),
+        bool_to_float(bool(self_row.get("move_forward", self_row.get("FORWARD", False)))),
+        bool_to_float(bool(self_row.get("move_back", self_row.get("BACK", False)))),
+        bool_to_float(bool(self_row.get("move_left", self_row.get("LEFT", False)))),
+        bool_to_float(bool(self_row.get("move_right", self_row.get("RIGHT", False)))),
+        bool_to_float(bool(self_row.get("move_walk", self_row.get("WALK", self_row.get("is_walking", False))))),
+        bool_to_float(bool(self_row.get("move_crouch", self_row.get("ducking", False)))),
     ]
     return np.asarray(values, dtype=np.float32)
 
@@ -199,6 +320,8 @@ def extract_jump_target_from_tick_rows(tick_rows: pd.DataFrame, perspective_stea
     if self_rows.empty:
         return 0.0
     self_row = self_rows.iloc[0]
+    if "move_jump" in self_row.index and not pd.isna(self_row["move_jump"]):
+        return bool_to_float(bool(self_row["move_jump"]))
     for column in JUMP_COLUMNS:
         if column not in self_row.index or pd.isna(self_row[column]):
             continue

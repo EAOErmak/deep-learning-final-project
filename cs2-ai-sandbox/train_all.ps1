@@ -29,7 +29,7 @@ if ($MaxSamplesPerDemo -gt 0) {
 if ($ShowIndexProgress) {
     $trackerArgs.Add("ShowIndexProgress", $true)
 }
-& "./train_enemy_tracker.ps1" @trackerArgs
+& (Join-Path $PSScriptRoot 'train_enemy_tracker.ps1') @trackerArgs
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Enemy Tracker training failed!" -ForegroundColor Red
     exit $LASTEXITCODE
@@ -51,7 +51,7 @@ if ($MaxSamplesPerDemo -gt 0) {
 if ($ShowIndexProgress) {
     $movementArgs.Add("ShowIndexProgress", $true)
 }
-& "./train_movement.ps1" @movementArgs
+& (Join-Path $PSScriptRoot 'train_movement.ps1') @movementArgs
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Movement training failed!" -ForegroundColor Red
     exit $LASTEXITCODE
@@ -73,7 +73,7 @@ if ($MaxSamplesPerDemo -gt 0) {
 if ($ShowIndexProgress) {
     $aimArgs.Add("ShowIndexProgress", $true)
 }
-& "./train_aim.ps1" @aimArgs
+& (Join-Path $PSScriptRoot 'train_aim.ps1') @aimArgs
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Aim training failed!" -ForegroundColor Red
     exit $LASTEXITCODE
@@ -86,7 +86,7 @@ $buyArgs = @{
 if ($ShowBuildProgress) {
     $buyArgs.Add("ShowBuildProgress", $true)
 }
-& "./train_buy.ps1" @buyArgs
+& (Join-Path $PSScriptRoot 'train_buy.ps1') @buyArgs
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Buy training failed!" -ForegroundColor Red
     exit $LASTEXITCODE
@@ -104,7 +104,7 @@ if ($MaxSamples -gt 0) {
 if ($MaxSamplesPerDemo -gt 0) {
     $decisionArgs.Add("MaxSamplesPerDemo", $MaxSamplesPerDemo)
 }
-& "./train_decision.ps1" @decisionArgs
+& (Join-Path $PSScriptRoot 'train_decision.ps1') @decisionArgs
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Decision DQN training failed!" -ForegroundColor Red
     exit $LASTEXITCODE

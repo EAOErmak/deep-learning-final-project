@@ -22,17 +22,25 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
+import pandas as pd
 from torch.utils.data import DataLoader, Dataset
 
 from cs2_ai.dataset.multi_demo_sequence_dataset import MultiDemoSequenceDataset, split_dataset_by_group
+from cs2_ai.dataset.prebuilt_split_sequence_dataset import PrebuiltSplitSequenceDataset
 from cs2_ai.features.feature_contract import FeatureSchema
 from cs2_ai.features.movement_features import (
+    GRID_NAVIGATION_FEATURE_NAMES,
+    MOVEMENT_FEATURE_MODE_LEGACY,
+    MOVEMENT_FEATURE_MODE_SOLO_GRID,
+    MOVEMENT_FEATURE_NAMES_SOLO_GRID,
     MOVEMENT_TARGET_MODE_ACTION_CHUNK,
     MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE,
     MovementFeatureExtractor,
     build_movement_action_chunk_target_from_tick_rows,
+    build_grid_navigation_feature_frame_from_row,
     build_movement_target_from_tick_rows,
     movement_action_names_for_target_mode,
+    normalize_movement_feature_mode,
     normalize_movement_target_mode,
 )
 from cs2_ai.ml.models.decision_dqn import DecisionDQN
@@ -83,13 +91,21 @@ class MovementSequenceTorchDataset(Dataset):
         self,
         base_dataset,
         *,
-        target_mode: str = MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE,
+        target_mode: str = MOVEMENT_TARGET_MODE_ACTION_CHUNK,
         chunk_len: int = 8,
+        use_grid_navigation_features: bool = False,
+        movement_feature_mode: str = MOVEMENT_FEATURE_MODE_LEGACY,
     ):
         self.base_dataset = base_dataset
-        self.feature_extractor = MovementFeatureExtractor(seq_len=getattr(base_dataset, "seq_len", None))
+        self.feature_extractor = MovementFeatureExtractor(
+            seq_len=getattr(base_dataset, "seq_len", None),
+            use_grid_navigation_features=use_grid_navigation_features,
+            movement_feature_mode=movement_feature_mode,
+        )
         self.target_mode = normalize_movement_target_mode(target_mode)
         self.chunk_len = int(chunk_len)
+        self.movement_feature_mode = normalize_movement_feature_mode(movement_feature_mode)
+        self.use_grid_navigation_features = self.feature_extractor.requires_grid_navigation_features
         if self.chunk_len <= 0:
             raise ValueError('chunk_len must be positive.')
         self.action_names = movement_action_names_for_target_mode(target_mode)
@@ -172,9 +188,9 @@ class MovementSequenceTorchDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[np.ndarray, np.ndarray, dict[str, str]]:
         base_idx = self.valid_indices[idx]
         sequence_sample = self.base_dataset[base_idx]
-        features = self.feature_extractor.extract(sequence_sample.sequence)
-
         sample_metadata = self.get_sample_metadata(idx)
+        grid_navigation_frames = self._build_grid_navigation_frames(sample_metadata) if self.use_grid_navigation_features else None
+        features = self.feature_extractor.extract(sequence_sample.sequence, grid_navigation_frames=grid_navigation_frames)
         target_ticks = self._resolve_target_ticks(sample_metadata)
         if target_ticks is None:
             raise ValueError(f'No valid future target chunk for sample {sample_metadata["sample_id"]}.')
@@ -190,6 +206,19 @@ class MovementSequenceTorchDataset(Dataset):
             'demo_name': str(sample_metadata['demo_name']),
         }
         return features.astype(np.float32), target.astype(np.float32), meta
+
+    def _build_grid_navigation_frames(self, sample_metadata: dict[str, object]) -> list[dict[str, float]]:
+        round_tick_rows = self._resolve_round_tick_rows(sample_metadata)
+        perspective_steamid = int(sample_metadata['perspective_steamid'])
+        frames: list[dict[str, float]] = []
+        for tick in sample_metadata['tick_indices']:
+            tick_rows = round_tick_rows[int(tick)]
+            steamids = pd.to_numeric(tick_rows["steamid"], errors="coerce")
+            self_rows = tick_rows.loc[steamids == perspective_steamid]
+            if self_rows.empty:
+                raise ValueError(f'Perspective player {perspective_steamid} not found for navigation features on tick {tick}.')
+            frames.append(build_grid_navigation_feature_frame_from_row(self_rows.iloc[0], strict=True))
+        return frames
 
 
 class MovementTrainer:
@@ -459,6 +488,29 @@ def collate_movement_batch(batch: list[tuple[np.ndarray, np.ndarray, dict[str, s
     return features, targets, metas
 
 
+def inspect_movement_batch(
+    batch: tuple['torch.Tensor', 'torch.Tensor', list[dict[str, str]]],
+    action_names: tuple[str, ...],
+    feature_dim: int,
+) -> None:
+    features, targets, metas = batch
+    print('Inspecting first movement batch...')
+    print(f'  features shape: {tuple(features.shape)}')
+    print(f'  features dtype: {features.dtype}')
+    print(f'  targets shape: {tuple(targets.shape)}')
+    print(f'  targets dtype: {targets.dtype}')
+    print(f'  feature_dim: {feature_dim}')
+    print(f'  action_names: {list(action_names)}')
+    if metas:
+        first_meta = metas[0]
+        print(f'  first sample_id: {first_meta.get("sample_id", "")}')
+        print(f'  first demo_name: {first_meta.get("demo_name", "")}')
+    positive_ratios = targets.to(dtype=torch.float32).mean(dim=(0, 1)).cpu().tolist()
+    print('  target positive ratios:')
+    for action_name, ratio in zip(action_names, positive_ratios, strict=True):
+        print(f'    {action_name}: {float(ratio):.4f}')
+
+
 def collect_expected_demo_counts(dataset) -> dict[str, int]:
     if hasattr(dataset, 'indices') and hasattr(dataset, 'dataset'):
         indices = list(dataset.indices)
@@ -546,15 +598,17 @@ def save_checkpoint(
     action_names: tuple[str, ...],
 ) -> None:
     save_path.parent.mkdir(parents=True, exist_ok=True)
+    model_type = 'movement_gru_chunk' if args.model == MOVEMENT_MODEL_GRU else 'decision_dqn_movement'
     checkpoint = {
         'model_state_dict': model.state_dict(),
-        'model_type': 'movement_gru_chunk' if args.model == MOVEMENT_MODEL_GRU else 'decision_dqn_movement',
+        'model_type': model_type,
         'input_dim': schema.feature_dim,
         'action_dim': len(action_names),
         'action_names': list(action_names),
         'movement_model_name': args.model,
+        'movement_feature_mode': args.movement_feature_mode,
         'target_mode': args.target_mode,
-        'chunk_len': args.chunk_len,
+        'chunk_len': int(getattr(model, 'chunk_len', args.chunk_len if args.target_mode == MOVEMENT_TARGET_MODE_ACTION_CHUNK else args.seq_len)),
         'seq_len': args.seq_len,
         'stride': args.stride,
         'hidden_dim': args.hidden_dim,
@@ -637,11 +691,17 @@ def compute_pos_weight(dataset: MovementSequenceTorchDataset, mode: str, explici
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Train a supervised movement model from clean_play_ticks')
     parser.add_argument('--dataset-dir', type=Path, default=PROJECT_ROOT / 'dataset')
-    parser.add_argument('--model', choices=[MOVEMENT_MODEL_DECISION_DQN, MOVEMENT_MODEL_GRU], default=MOVEMENT_MODEL_DECISION_DQN)
+    parser.add_argument('--trainset-dir', type=Path, default=None)
+    parser.add_argument('--train-data', type=Path, default=None)
+    parser.add_argument('--val-data', type=Path, default=None)
+    parser.add_argument('--test-data', type=Path, default=None)
+    parser.add_argument('--model', choices=[MOVEMENT_MODEL_DECISION_DQN, MOVEMENT_MODEL_GRU], default=MOVEMENT_MODEL_GRU)
     parser.add_argument('--seq-len', type=int, default=64)
     parser.add_argument('--stride', type=int, default=8)
-    parser.add_argument('--target-mode', choices=[MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE, 'next_tick_sequence', MOVEMENT_TARGET_MODE_ACTION_CHUNK], default=MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE)
+    parser.add_argument('--target-mode', choices=[MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE, 'next_tick_sequence', MOVEMENT_TARGET_MODE_ACTION_CHUNK], default=MOVEMENT_TARGET_MODE_ACTION_CHUNK)
     parser.add_argument('--chunk-len', type=int, default=8)
+    parser.add_argument('--movement-feature-mode', choices=[MOVEMENT_FEATURE_MODE_LEGACY, MOVEMENT_FEATURE_MODE_SOLO_GRID], default=MOVEMENT_FEATURE_MODE_LEGACY)
+    parser.add_argument('--use-grid-navigation-features', action='store_true')
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--epochs', type=int, default=3)
     parser.add_argument('--lr', type=float, default=1e-3)
@@ -691,9 +751,66 @@ def build_dataset(args: argparse.Namespace) -> MovementSequenceTorchDataset:
         base_dataset,
         target_mode=normalize_movement_target_mode(args.target_mode),
         chunk_len=args.chunk_len,
+        use_grid_navigation_features=args.use_grid_navigation_features,
+        movement_feature_mode=args.movement_feature_mode,
     )
     print(f'Filtered movement samples: {len(dataset)}')
     return dataset
+
+
+def build_prebuilt_split_dataset(parquet_path: Path, args: argparse.Namespace) -> MovementSequenceTorchDataset:
+    base_dataset = PrebuiltSplitSequenceDataset(
+        parquet_path=parquet_path,
+        seq_len=args.seq_len,
+        stride=args.stride,
+        alive_only=args.alive_only,
+        max_samples=args.max_samples,
+        show_progress=args.show_index_progress,
+    )
+    return MovementSequenceTorchDataset(
+        base_dataset,
+        target_mode=normalize_movement_target_mode(args.target_mode),
+        chunk_len=args.chunk_len,
+        use_grid_navigation_features=args.use_grid_navigation_features,
+        movement_feature_mode=args.movement_feature_mode,
+    )
+
+
+def resolve_prebuilt_split_paths(args: argparse.Namespace) -> tuple[Path, Path | None, Path | None]:
+    if args.train_data is not None:
+        return args.train_data, args.val_data, args.test_data
+    if args.trainset_dir is None:
+        raise ValueError('trainset_dir or train_data must be provided for prebuilt split loading.')
+    train_path = args.trainset_dir / 'train.parquet'
+    val_path = args.trainset_dir / 'val.parquet'
+    test_path = args.trainset_dir / 'test.parquet'
+    return train_path, val_path if val_path.exists() else None, test_path if test_path.exists() else None
+
+
+def validate_feature_mode(feature_extractor: MovementFeatureExtractor) -> None:
+    feature_names = feature_extractor.feature_names()
+    if feature_extractor.movement_feature_mode != MOVEMENT_FEATURE_MODE_SOLO_GRID:
+        return
+    if feature_extractor.feature_dim() != len(MOVEMENT_FEATURE_NAMES_SOLO_GRID):
+        raise ValueError(
+            f'solo_grid feature_dim mismatch: expected {len(MOVEMENT_FEATURE_NAMES_SOLO_GRID)}, '
+            f'got {feature_extractor.feature_dim()}.'
+        )
+    if any(name.startswith('teammate_') for name in feature_names):
+        raise ValueError(f'solo_grid must not include teammate features: {feature_names}')
+    required = {
+        'next_cell_rel_x',
+        'next_cell_rel_y',
+        'next_cell_rel_z',
+        'next_cell_distance',
+        'dwell_pass_through',
+        'dwell_short_hold',
+        'dwell_medium_hold',
+        'dwell_long_hold',
+    }
+    missing = sorted(required - set(feature_names))
+    if missing:
+        raise ValueError(f'solo_grid is missing required navigation features: {missing}')
 
 
 def main() -> int:
@@ -703,13 +820,25 @@ def main() -> int:
 
     args = parse_args()
     args.target_mode = normalize_movement_target_mode(args.target_mode)
+    args.movement_feature_mode = normalize_movement_feature_mode(args.movement_feature_mode)
+    if args.movement_feature_mode == MOVEMENT_FEATURE_MODE_SOLO_GRID:
+        args.use_grid_navigation_features = True
+    if args.model == MOVEMENT_MODEL_DECISION_DQN:
+        print('WARNING: DecisionDQN movement mode is legacy. Prefer --model movement_gru --target-mode action_chunk.')
+    elif args.model == MOVEMENT_MODEL_GRU and args.target_mode == MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE:
+        print('WARNING: MovementGRU is recommended with action_chunk target mode. Current target_mode=next_tick_sequence.')
     set_seed(args.seed)
     device = get_device()
     runtime_info = configure_torch_runtime(device)
 
     try:
         print('Building dataset...')
-        dataset = build_dataset(args)
+        using_prebuilt_trainset = args.trainset_dir is not None or args.train_data is not None
+        if using_prebuilt_trainset:
+            train_path, val_path, test_path = resolve_prebuilt_split_paths(args)
+            dataset = build_prebuilt_split_dataset(train_path, args)
+        else:
+            dataset = build_dataset(args)
     except FileNotFoundError as exc:
         print(exc)
         print('No clean_play_ticks parquet found. Run parser/cleaner first.')
@@ -721,7 +850,15 @@ def main() -> int:
         return 1
 
     print('Building train/val split...')
-    train_dataset, val_dataset = split_dataset_by_group(dataset, args.val_split, args.seed, mode=args.split_mode)
+    using_prebuilt_trainset = args.trainset_dir is not None or args.train_data is not None
+    test_dataset = None
+    if using_prebuilt_trainset:
+        train_dataset = dataset
+        _, val_path, test_path = resolve_prebuilt_split_paths(args)
+        val_dataset = build_prebuilt_split_dataset(val_path, args) if val_path is not None and val_path.exists() else split_dataset_by_group(dataset, args.val_split, args.seed, mode=args.split_mode)[1]
+        test_dataset = build_prebuilt_split_dataset(test_path, args) if test_path is not None and test_path.exists() else None
+    else:
+        train_dataset, val_dataset = split_dataset_by_group(dataset, args.val_split, args.seed, mode=args.split_mode)
     train_expected_counts = collect_expected_demo_counts(train_dataset)
     val_expected_counts = collect_expected_demo_counts(val_dataset)
     print('Computing movement target statistics...')
@@ -730,6 +867,9 @@ def main() -> int:
     print(f'Target mode: {args.target_mode}')
     print(f'Chunk len: {dataset.target_len}')
     print(f'Target shape: [batch, {dataset.target_len}, {dataset.action_dim}]')
+    print(f'Movement feature mode: {args.movement_feature_mode}')
+    if dataset.feature_extractor.requires_grid_navigation_features:
+        print(f'Grid navigation features enabled: {list(GRID_NAVIGATION_FEATURE_NAMES)}')
     print('Action positive ratios:')
     for name, ratio in zip(dataset.action_names, dataset_stats['positive_ratios'], strict=True):
         print(f'  {name}: {float(ratio):.4f}')
@@ -757,7 +897,27 @@ def main() -> int:
     )
 
     print('Initializing model and trainer...')
-    feature_extractor = MovementFeatureExtractor(seq_len=args.seq_len)
+    feature_extractor = MovementFeatureExtractor(
+        seq_len=args.seq_len,
+        use_grid_navigation_features=args.use_grid_navigation_features,
+        movement_feature_mode=args.movement_feature_mode,
+    )
+    validate_feature_mode(feature_extractor)
+    first_batch = next(iter(train_loader))
+    inspect_movement_batch(first_batch, dataset.action_names, feature_extractor.feature_dim())
+    expected_target_len = args.chunk_len if args.target_mode == MOVEMENT_TARGET_MODE_ACTION_CHUNK else args.seq_len
+    expected_action_dim = 7 if args.target_mode == MOVEMENT_TARGET_MODE_ACTION_CHUNK else 6
+    assert_temporal_features(
+        first_batch[0],
+        seq_len=args.seq_len,
+        feature_dim=feature_extractor.feature_dim(),
+        name='first movement batch features',
+    )
+    assert_shape(
+        first_batch[1],
+        (int(first_batch[1].shape[0]), expected_target_len, expected_action_dim),
+        'first movement batch targets',
+    )
     feature_schema = feature_extractor.schema()
     model = build_model(
         model_name=args.model,
@@ -781,7 +941,7 @@ def main() -> int:
     )
 
     demo_names = dataset.base_dataset.get_demo_names()
-    dataset_label = str(args.dataset_dir / 'clean_play_ticks')
+    dataset_label = str(args.trainset_dir) if using_prebuilt_trainset and args.trainset_dir is not None else str(args.dataset_dir / 'clean_play_ticks')
     epoch_log_path = args.save_path.with_name(f'{args.save_path.stem}_epoch_metrics.jsonl')
     writer = None
     run_dir = None
@@ -813,11 +973,16 @@ def main() -> int:
     print(f'Total samples: {dataset_len}')
     print(f'Train samples: {len(train_dataset)}')
     print(f'Val samples: {len(val_dataset)}')
+    if test_dataset is not None:
+        print(f'Test samples: {len(test_dataset)}')
     print(f'DataLoader workers: train={train_loader_kwargs["num_workers"]} val={val_loader_kwargs["num_workers"]}')
     print(f'CUDA tuning: matmul={runtime_info["matmul_precision"]} cudnn_benchmark={runtime_info["cudnn_benchmark"]} tf32={runtime_info["tf32"]}')
     print(f'Split mode: {args.split_mode}')
     print(f'Model: {args.model}')
-    print(f'Feature dim: {feature_extractor.feature_dim()}')
+    print(f'Movement feature dim: {feature_extractor.feature_dim()}')
+    print('Movement features:')
+    for idx, feature_name in enumerate(feature_extractor.feature_names()):
+        print(f'{idx} {feature_name}')
     print(f'Action dim: {dataset.action_dim}')
     print(f'Save path: {args.save_path}')
     print(f'Epoch log: {epoch_log_path}')

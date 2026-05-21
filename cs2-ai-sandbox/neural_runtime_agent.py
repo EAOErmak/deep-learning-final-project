@@ -150,6 +150,7 @@ class FullNeuralRuntimeAgent:
         tracker_checkpoint: str | None = None,
         yolo_weights: str | None = None,
         window_keywords: tuple[str, ...] = ('counter-strike', 'cs2'),
+        show_yolo_overlay: bool = False,
     ) -> None:
         if not torch_available():
             raise RuntimeError('PyTorch is not available.')
@@ -194,14 +195,7 @@ class FullNeuralRuntimeAgent:
             head_mode=str(checkpoints['aim'].get('aim_head_mode', AIM_HEAD_MODE_LEGACY)),
         ).to(self.device)
         self.movement_model = self._build_movement_model(checkpoints['movement']).to(self.device)
-        self.tracker_model = EnemyTrackerLSTM(
-            input_dim=self.tracker_extractor.feature_dim(),
-            hidden_dim=int(checkpoints['tracker'].get('hidden_dim', 128)),
-            num_layers=int(checkpoints['tracker'].get('num_layers', 2)),
-            output_enemies=int(checkpoints['tracker'].get('output_enemies', MAX_ENEMIES)),
-            dropout=float(checkpoints['tracker'].get('dropout', 0.1)),
-            output_mode=str(checkpoints['tracker'].get('output_mode', 'each_tick')),
-        ).to(self.device)
+        self.tracker_model = self._build_tracker_model(checkpoints['tracker'], EnemyTrackerLSTM, MAX_ENEMIES).to(self.device)
         self.aim_model.load_state_dict(checkpoints['aim']['model_state_dict'])
         self.movement_model.load_state_dict(checkpoints['movement']['model_state_dict'])
         self.tracker_model.load_state_dict(checkpoints['tracker']['model_state_dict'])
@@ -223,7 +217,11 @@ class FullNeuralRuntimeAgent:
         
         if yolo_weights and Path(yolo_weights).exists():
             from cs2_ai.vision.yolo_pipeline import YoloVisionModule
-            self.vision_module = YoloVisionModule(Path(yolo_weights), window_keywords=window_keywords)
+            self.vision_module = YoloVisionModule(
+                Path(yolo_weights),
+                window_keywords=window_keywords,
+                show_overlay=show_yolo_overlay,
+            )
             self.vision_module.start()
         else:
             self.vision_module = None
@@ -266,6 +264,25 @@ class FullNeuralRuntimeAgent:
             action_dim=action_dim,
             hidden_dim=int(checkpoint.get('hidden_dim', 256)),
         )
+
+    def _build_tracker_model(self, checkpoint: dict[str, Any], tracker_cls, max_enemies: int):
+        import torch
+
+        model = tracker_cls(
+            input_dim=self.tracker_extractor.feature_dim(),
+            hidden_dim=int(checkpoint.get('hidden_dim', 128)),
+            num_layers=int(checkpoint.get('num_layers', 2)),
+            output_enemies=int(checkpoint.get('output_enemies', max_enemies)),
+            dropout=float(checkpoint.get('dropout', 0.1)),
+            output_mode=str(checkpoint.get('output_mode', 'each_tick')),
+        )
+        state_dict = checkpoint.get('model_state_dict', {})
+        if isinstance(state_dict, dict) and not any(str(key).startswith('shared_head.') for key in state_dict):
+            self.logger.warning(
+                'Tracker checkpoint appears to be legacy and has no shared_head weights; using Identity shared head for compatibility.'
+            )
+            model.shared_head = torch.nn.Identity()
+        return model
 
     def predict_state(self, game_state: GameState, _features: dict[str, float | int | bool] | None = None) -> ActionDict:
         from runtime_agent import PipelineRuntimeAgent

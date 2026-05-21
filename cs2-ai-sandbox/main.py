@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--movement-checkpoint', type=str, default=None)
     parser.add_argument('--tracker-checkpoint', type=str, default=None)
     parser.add_argument('--yolo-weights', type=str, default=None, help='Path to YOLO weights for live vision targeting (e.g. weights/yolov10s_cs2.pt)')
+    parser.add_argument('--show-yolo-overlay', action='store_true', help='Draw a transparent debug overlay with YOLO boxes above the CS2 window.')
     parser.add_argument('--gsi-host', type=str, default='127.0.0.1', help='Host/interface for the local GSI HTTP listener. Use 0.0.0.0 to accept LAN clients.')
     parser.add_argument('--gsi-port', type=int, default=3000)
     parser.add_argument('--hz', type=float, default=10.0)
@@ -117,6 +118,7 @@ def build_agent(state_source: str, agent_mode: str, seed: int, args: argparse.Na
             tracker_checkpoint=args.tracker_checkpoint,
             yolo_weights=args.yolo_weights,
             window_keywords=tuple(args.window_keyword) if args.window_keyword else ('counter-strike', 'cs2'),
+            show_yolo_overlay=args.show_yolo_overlay,
         )
     raise ValueError(f'Unsupported agent mode: {agent_mode}')
 

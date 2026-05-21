@@ -277,6 +277,7 @@ class NeuralAIPipeline:
         input_seq_len = int(movement_features.shape[1])
         if int(movement_output.shape[1]) == input_seq_len:
             return movement_output[:, -1, :]
+        # For action_chunk outputs, the first predicted future step is the immediate action to execute now.
         return movement_output[:, 0, :]
 
     def _resolve_prediction_roster(self, game_state: GameState, roster_size: int) -> list[int]:

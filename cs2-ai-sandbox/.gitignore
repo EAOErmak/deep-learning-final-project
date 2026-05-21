@@ -3,3 +3,15 @@ demos/
 .cache/
 __pycache__/
 *.py[cod]
+checkpoints/*
+!checkpoints/.gitkeep
+artifacts/*
+!artifacts/.gitkeep
+data/*
+!data/.gitkeep
+!data/processed/
+!data/trainsets/
+data/processed/*
+!data/processed/.gitkeep
+data/trainsets/*
+!data/trainsets/.gitkeep

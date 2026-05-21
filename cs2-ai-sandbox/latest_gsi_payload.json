@@ -2,99 +2,119 @@
   "provider": {
     "name": "Counter-Strike: Global Offensive",
     "appid": 730,
-    "version": 14162,
+    "version": 14163,
     "steamid": "76561198864890105",
-    "timestamp": 1779245546
+    "timestamp": 1779388335
   },
   "map": {
     "mode": "competitive",
     "name": "de_dust2",
     "phase": "live",
-    "round": 2,
+    "round": 6,
     "team_ct": {
-      "score": 1,
-      "consecutive_round_losses": 1,
+      "score": 6,
+      "consecutive_round_losses": 0,
       "timeouts_remaining": 1,
       "matches_won_this_series": 0
     },
     "team_t": {
-      "score": 1,
-      "consecutive_round_losses": 0,
+      "score": 0,
+      "consecutive_round_losses": 7,
       "timeouts_remaining": 1,
       "matches_won_this_series": 0
     },
     "num_matches_to_win_series": 0
   },
   "round": {
-    "phase": "live"
+    "phase": "over",
+    "win_team": "CT"
   },
   "phase_countdowns": {
-    "phase": "live",
-    "phase_ends_in": "114.6"
+    "phase": "over",
+    "phase_ends_in": "2.9"
   },
   "bomb": {
-    "state": "carried",
-    "position": "-760.66, -836.17, 157.07",
-    "player": "304"
+    "state": "dropped",
+    "position": "-328.72, -757.62, 74.25"
   },
   "player": {
-    "spectarget": "375",
-    "position": "258.16, 2480.55, -121.08",
-    "forward": "0.30, -0.95, 0.07"
+    "steamid": "76561198769761559",
+    "name": "Consistency",
+    "observer_slot": 0,
+    "team": "CT",
+    "activity": "playing",
+    "state": {
+      "health": 100,
+      "armor": 0,
+      "helmet": false,
+      "flashed": 0,
+      "smoked": 0,
+      "burning": 0,
+      "money": 16000,
+      "round_kills": 1,
+      "round_killhs": 1,
+      "round_totaldmg": 100,
+      "equip_value": 200
+    },
+    "match_stats": {
+      "kills": 4,
+      "assists": 0,
+      "deaths": 0,
+      "mvps": 4,
+      "score": 8
+    },
+    "weapons": {
+      "weapon_0": {
+        "name": "weapon_knife",
+        "paintkit": "default",
+        "type": "Knife",
+        "state": "active"
+      },
+      "weapon_1": {
+        "name": "weapon_usp_silencer",
+        "paintkit": "cu_usp_cut",
+        "type": "Pistol",
+        "ammo_clip": 8,
+        "ammo_clip_max": 12,
+        "ammo_reserve": 1,
+        "state": "holstered"
+      }
+    },
+    "spectarget": "76561198769761559",
+    "position": "-51.75, -769.14, 8.37",
+    "forward": "0.64, -0.01, -0.77"
   },
   "allplayers": {
-    "304": {
-      "name": "Бару",
+    "303": {
+      "name": "Здоровяк",
       "observer_slot": 1,
       "team": "T",
       "state": {
-        "health": 100,
+        "health": 0,
         "armor": 0,
         "helmet": false,
         "flashed": 0,
         "smoked": 0,
         "burning": 0,
-        "money": 4350,
+        "money": 13900,
         "round_kills": 0,
         "round_killhs": 0,
         "round_totaldmg": 0,
-        "equip_value": 200
+        "equip_value": 0
       },
       "match_stats": {
         "kills": 0,
         "assists": 0,
-        "deaths": 0,
+        "deaths": 4,
         "mvps": 0,
         "score": 0
       },
-      "weapons": {
-        "weapon_0": {
-          "name": "weapon_knife_t",
-          "paintkit": "default",
-          "type": "Knife",
-          "state": "holstered"
-        },
-        "weapon_1": {
-          "name": "weapon_glock",
-          "paintkit": "default",
-          "type": "Pistol",
-          "ammo_clip": 20,
-          "ammo_clip_max": 20,
-          "ammo_reserve": 3,
-          "state": "holstered"
-        },
-        "weapon_2": {
-          "name": "weapon_c4",
-          "paintkit": "default",
-          "type": "C4",
-          "state": "active"
-        }
-      },
-      "position": "-760.66, -836.17, 117.07",
-      "forward": "-0.63, 0.78, -0.02"
+      "weapons": {},
+      "position": "530.87, -945.76, 222.42",
+      "forward": "1.00, 0.00, -0.00"
     },
-    "507": {
-      "name": "Мокрые носки",
+    "76561198769761559": {
+      "name": "Consistency",
       "observer_slot": 0,
       "team": "CT",
       "state": {
@@ -104,43 +124,43 @@
         "flashed": 0,
         "smoked": 0,
         "burning": 0,
-        "money": 800,
-        "round_kills": 0,
-        "round_killhs": 0,
-        "round_totaldmg": 0,
+        "money": 16000,
+        "round_kills": 1,
+        "round_killhs": 1,
+        "round_totaldmg": 100,
         "equip_value": 200
       },
       "match_stats": {
-        "kills": 0,
+        "kills": 4,
         "assists": 0,
         "deaths": 0,
-        "mvps": 0,
-        "score": 0
+        "mvps": 4,
+        "score": 8
       },
       "weapons": {
         "weapon_0": {
           "name": "weapon_knife",
           "paintkit": "default",
           "type": "Knife",
-          "state": "holstered"
+          "state": "active"
         },
         "weapon_1": {
-          "name": "weapon_hkp2000",
-          "paintkit": "default",
+          "name": "weapon_usp_silencer",
+          "paintkit": "cu_usp_cut",
           "type": "Pistol",
-          "ammo_clip": 13,
-          "ammo_clip_max": 13,
-          "ammo_reserve": 4,
-          "state": "active"
+          "ammo_clip": 8,
+          "ammo_clip_max": 12,
+          "ammo_reserve": 1,
+          "state": "holstered"
         }
       },
-      "position": "258.16, 2480.55, -121.08",
-      "forward": "0.39, -0.92, -0.02"
+      "position": "-51.75, -769.14, 8.37",
+      "forward": "0.64, -0.01, -0.77"
     }
   },
   "previously": {
     "phase_countdowns": {
-      "phase_ends_in": "114.8"
+      "phase_ends_in": "3.1"
     }
   }
 }
