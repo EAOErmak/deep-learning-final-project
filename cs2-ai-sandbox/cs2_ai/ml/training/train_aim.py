@@ -563,7 +563,9 @@ def load_checkpoint_if_available(model: 'torch.nn.Module', resume_from: Path | N
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Train a supervised aim model from clean_play_ticks')
-    parser.add_argument('--dataset-dir', type=Path, default=PROJECT_ROOT / 'dataset')
+    parser.add_argument('--data-dir', type=Path, default=PROJECT_ROOT / 'data')
+    parser.add_argument('--dataset-subdir', type=str, default='clean_play_ticks')
+    parser.add_argument('--dataset-dir', type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument('--seq-len', type=int, default=16)
     parser.add_argument('--stride', type=int, default=4)
     parser.add_argument('--batch-size', type=int, default=32)
@@ -597,10 +599,22 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_dataset_root(args: argparse.Namespace) -> Path:
+    if args.dataset_dir is not None:
+        return args.dataset_dir
+    candidate = Path(args.data_dir)
+    legacy = PROJECT_ROOT / 'dataset'
+    if candidate.exists():
+        return candidate
+    if legacy.exists():
+        return legacy
+    return candidate
+
+
 def build_dataset(args: argparse.Namespace) -> AimSequenceTorchDataset:
     base_dataset = MultiDemoSequenceDataset(
-        dataset_dir=args.dataset_dir,
-        subdir='clean_play_ticks',
+        dataset_dir=resolve_dataset_root(args),
+        subdir=args.dataset_subdir,
         seq_len=args.seq_len,
         stride=args.stride,
         alive_only=args.alive_only,
@@ -637,7 +651,7 @@ def main() -> int:
         dataset = build_dataset(args)
     except FileNotFoundError as exc:
         print(exc)
-        print('No clean_play_ticks parquet found. Run parser/cleaner first.')
+        print(f'No parquet files found under {resolve_dataset_root(args) / args.dataset_subdir}. Run parser/cleaner first.')
         return 1
 
     dataset_len = len(dataset)
@@ -677,7 +691,7 @@ def main() -> int:
         binary_pos_weight=torch.tensor(train_pos_weight_np, dtype=torch.float32) if train_pos_weight_np is not None else None,
     )
     demo_names = dataset.base_dataset.get_demo_names()
-    dataset_label = str(args.dataset_dir / 'clean_play_ticks')
+    dataset_label = str(resolve_dataset_root(args) / args.dataset_subdir)
     epoch_log_path = args.save_path.with_name(f'{args.save_path.stem}_epoch_metrics.jsonl')
     writer = None
 

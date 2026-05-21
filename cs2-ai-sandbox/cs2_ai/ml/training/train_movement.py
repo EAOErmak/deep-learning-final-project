@@ -690,7 +690,9 @@ def compute_pos_weight(dataset: MovementSequenceTorchDataset, mode: str, explici
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Train a supervised movement model from clean_play_ticks')
-    parser.add_argument('--dataset-dir', type=Path, default=PROJECT_ROOT / 'dataset')
+    parser.add_argument('--data-dir', type=Path, default=PROJECT_ROOT / 'data')
+    parser.add_argument('--dataset-subdir', type=str, default='clean_play_ticks')
+    parser.add_argument('--dataset-dir', type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument('--trainset-dir', type=Path, default=None)
     parser.add_argument('--train-data', type=Path, default=None)
     parser.add_argument('--val-data', type=Path, default=None)
@@ -732,11 +734,24 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def resolve_dataset_root(args: argparse.Namespace) -> Path:
+    if args.dataset_dir is not None:
+        return args.dataset_dir
+    candidate = Path(args.data_dir)
+    legacy = PROJECT_ROOT / 'dataset'
+    if candidate.exists():
+        return candidate
+    if legacy.exists():
+        return legacy
+    return candidate
+
+
 def build_dataset(args: argparse.Namespace) -> MovementSequenceTorchDataset:
-    print('Scanning clean_play_ticks parquet files...')
+    dataset_root = resolve_dataset_root(args)
+    print(f'Scanning parquet files in {dataset_root / args.dataset_subdir}...')
     base_dataset = MultiDemoSequenceDataset(
-        dataset_dir=args.dataset_dir,
-        subdir='clean_play_ticks',
+        dataset_dir=dataset_root,
+        subdir=args.dataset_subdir,
         seq_len=args.seq_len,
         stride=args.stride,
         alive_only=args.alive_only,
@@ -841,7 +856,7 @@ def main() -> int:
             dataset = build_dataset(args)
     except FileNotFoundError as exc:
         print(exc)
-        print('No clean_play_ticks parquet found. Run parser/cleaner first.')
+        print(f'No parquet files found under {resolve_dataset_root(args) / args.dataset_subdir}. Run parser/cleaner first.')
         return 1
 
     dataset_len = len(dataset)
@@ -941,7 +956,7 @@ def main() -> int:
     )
 
     demo_names = dataset.base_dataset.get_demo_names()
-    dataset_label = str(args.trainset_dir) if using_prebuilt_trainset and args.trainset_dir is not None else str(args.dataset_dir / 'clean_play_ticks')
+    dataset_label = str(args.trainset_dir) if using_prebuilt_trainset and args.trainset_dir is not None else str(resolve_dataset_root(args) / args.dataset_subdir)
     epoch_log_path = args.save_path.with_name(f'{args.save_path.stem}_epoch_metrics.jsonl')
     writer = None
     run_dir = None

@@ -97,6 +97,59 @@ python scripts/parse_one_demo.py
 
 Повторный запуск не парсит ту же demo второй раз, если она уже добавлена в registry.
 
+## Round-based dataset
+
+Round-based parquet layout теперь поддерживается отдельно под `data/rounds-dataset` без изменения существующих `clean_play_ticks`, `clean_buy_ticks`, `events` и `round_events`.
+
+```text
+data/
+  clean_play_ticks/
+  clean_buy_ticks/
+  events/
+  round_events/
+  rounds-dataset/
+    <demo_file_name>/
+      rounds/
+        round_<n>.parquet
+      manifest.json
+      rounds_summary.csv
+    manifest.json
+    rounds_summary.csv
+```
+
+Dry-run:
+
+```powershell
+python scripts/build_rounds_dataset.py --dry-run
+```
+
+Build:
+
+```powershell
+python scripts/build_rounds_dataset.py --overwrite
+```
+
+Inspect:
+
+```powershell
+python scripts/inspect_rounds_dataset.py --dataset-subdir rounds-dataset
+```
+
+Movement training example on round files:
+
+```powershell
+python -m cs2_ai.ml.training.train_movement `
+  --data-dir data `
+  --dataset-subdir rounds-dataset `
+  --model movement_gru `
+  --target-mode action_chunk `
+  --chunk-len 8 `
+  --seq-len 32 `
+  --split-mode round `
+  --epochs 1 `
+  --save-path checkpoints/movement_gru_round_dataset_test.pt
+```
+
 ## Как тестировать локально в CS2
 
 Рекомендуемый безопасный сценарий:
