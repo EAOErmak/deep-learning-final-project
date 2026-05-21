@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
+import shutil
 import sys
 import unittest
 from pathlib import Path
-import shutil
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -25,6 +26,7 @@ def make_builder_df() -> pd.DataFrame:
                     'demo_name': f'demo_{group_idx // 2}',
                     'total_rounds_played': group_idx,
                     'round_id': group_idx,
+                    'round_number': group_idx,
                     'steamid': steamid,
                     'team_num': 3,
                     'tick': tick,
@@ -87,6 +89,41 @@ def make_builder_df() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def make_round_df(demo_name: str, round_number: int, steamids: tuple[int, ...]) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for tick in range(1, 41):
+        for steamid in steamids:
+            rows.append(
+                {
+                    'map_name': 'de_dust2',
+                    'demo_name': demo_name,
+                    'round_number': round_number,
+                    'total_rounds_played': round_number,
+                    'steamid': steamid,
+                    'team_num': 3 if steamid % 2 else 2,
+                    'tick': tick,
+                    'X': float(-2200 + tick * 10 + round_number),
+                    'Y': float(-1200 + steamid),
+                    'Z': 0.0,
+                    'velocity_X': 15.0,
+                    'velocity_Y': 0.0,
+                    'velocity_Z': 0.0,
+                    'yaw': 0.0,
+                    'is_alive': True,
+                    'is_airborne': False,
+                    'ducking': False,
+                    'is_walking': tick % 2 == 0,
+                    'FORWARD': tick % 2 == 0,
+                    'BACK': False,
+                    'LEFT': tick % 3 == 0,
+                    'RIGHT': tick % 5 == 0,
+                    'WALK': tick % 2 == 0,
+                    'JUMP': tick % 11 == 0,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 class MovementTrainsetBuilderTests(unittest.TestCase):
     def test_build_and_load_prebuilt_trainset(self):
         df = make_builder_df()
@@ -141,6 +178,123 @@ class MovementTrainsetBuilderTests(unittest.TestCase):
         finally:
             if tmp_path.exists():
                 shutil.rmtree(tmp_path, ignore_errors=True)
+
+    def test_build_from_rounds_dataset_with_round_split_and_auto_grid(self):
+        tmp_path = PROJECT_ROOT / '.tmp_test_rounds_trainset'
+        shutil.rmtree(tmp_path, ignore_errors=True)
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        try:
+            rounds_root = tmp_path / 'data' / 'rounds-dataset'
+            output_dir = tmp_path / 'data' / 'trainset'
+            for demo_name, round_numbers in {'demo_abc': (1, 2), 'demo_xyz': (5, 6)}.items():
+                rounds_dir = rounds_root / demo_name / 'rounds'
+                rounds_dir.mkdir(parents=True, exist_ok=True)
+                (rounds_root / demo_name / 'manifest.json').write_text(
+                    json.dumps({'source_file_name': f'{demo_name}.parquet'}, ensure_ascii=True),
+                    encoding='utf-8',
+                )
+                for round_number in round_numbers:
+                    make_round_df(demo_name, round_number, (101, 202)).to_parquet(
+                        rounds_dir / f'round_{round_number}.parquet',
+                        index=False,
+                    )
+
+            argv_backup = sys.argv[:]
+            try:
+                sys.argv = [
+                    'build_movement_trainset',
+                    '--rounds-dataset-dir', str(rounds_root),
+                    '--output-dir', str(output_dir),
+                    '--map', 'de_dust2',
+                    '--feature-mode', 'solo_grid',
+                    '--split-unit', 'round',
+                    '--auto-label-grid', 'true',
+                    '--require-grid-labels', 'true',
+                    '--seed', '42',
+                    '--min-group-rows', '32',
+                ]
+                result = build_movement_trainset.main()
+            finally:
+                sys.argv = argv_backup
+
+            self.assertEqual(result, 0)
+            train_df = pd.read_parquet(output_dir / 'train.parquet')
+            combined = pd.concat(
+                [
+                    train_df,
+                    pd.read_parquet(output_dir / 'val.parquet'),
+                    pd.read_parquet(output_dir / 'test.parquet'),
+                ],
+                ignore_index=True,
+            )
+            self.assertIn('demo_file_name', combined.columns)
+            self.assertIn('round_number', combined.columns)
+            self.assertIn('source_file', combined.columns)
+            self.assertIn('current_cell_id', combined.columns)
+            self.assertIn('next_cell_distance', combined.columns)
+            self.assertEqual(combined['split_round_id'].nunique(), 4)
+            round_to_split = combined.groupby('split_round_id')['split'].nunique()
+            self.assertTrue((round_to_split == 1).all())
+
+            manifest = json.loads((output_dir / 'manifest.json').read_text(encoding='utf-8'))
+            self.assertEqual(manifest['input_mode'], 'rounds-dataset')
+            self.assertEqual(manifest['split_unit'], 'round')
+        finally:
+            shutil.rmtree(tmp_path, ignore_errors=True)
+
+    def test_build_from_rounds_dataset_with_demo_split_keeps_demo_together(self):
+        tmp_path = PROJECT_ROOT / '.tmp_test_rounds_demo_split'
+        shutil.rmtree(tmp_path, ignore_errors=True)
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        try:
+            rounds_root = tmp_path / 'data' / 'rounds-dataset'
+            output_dir = tmp_path / 'data' / 'trainset'
+            for demo_name in ('demo_a', 'demo_b', 'demo_c'):
+                rounds_dir = rounds_root / demo_name / 'rounds'
+                rounds_dir.mkdir(parents=True, exist_ok=True)
+                for round_number in (1, 2):
+                    round_df = make_round_df(demo_name, round_number, (101, 202))
+                    round_df['next_cell_rel_x'] = 100.0
+                    round_df['next_cell_rel_y'] = 0.0
+                    round_df['next_cell_rel_z'] = 0.0
+                    round_df['next_cell_distance'] = 100.0
+                    round_df['has_next_cell_target'] = 1.0
+                    round_df['dwell_pass_through'] = 1.0
+                    round_df['dwell_short_hold'] = 0.0
+                    round_df['dwell_medium_hold'] = 0.0
+                    round_df['dwell_long_hold'] = 0.0
+                    round_df.to_parquet(rounds_dir / f'round_{round_number}.parquet', index=False)
+
+            argv_backup = sys.argv[:]
+            try:
+                sys.argv = [
+                    'build_movement_trainset',
+                    '--rounds-dataset-dir', str(rounds_root),
+                    '--output-dir', str(output_dir),
+                    '--map', 'de_dust2',
+                    '--feature-mode', 'solo_grid',
+                    '--split-unit', 'demo',
+                    '--require-grid-labels', 'true',
+                    '--seed', '42',
+                    '--min-group-rows', '32',
+                ]
+                result = build_movement_trainset.main()
+            finally:
+                sys.argv = argv_backup
+
+            self.assertEqual(result, 0)
+            combined = pd.concat(
+                [
+                    pd.read_parquet(output_dir / 'train.parquet'),
+                    pd.read_parquet(output_dir / 'val.parquet'),
+                    pd.read_parquet(output_dir / 'test.parquet'),
+                ],
+                ignore_index=True,
+            )
+            demo_to_split = combined.groupby('demo_file_name')['split'].nunique()
+            self.assertTrue((demo_to_split == 1).all())
+        finally:
+            shutil.rmtree(tmp_path, ignore_errors=True)
 
 
 if __name__ == '__main__':

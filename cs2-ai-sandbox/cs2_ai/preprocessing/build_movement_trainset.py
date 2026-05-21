@@ -2,13 +2,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
 from cs2_ai.features.movement_features import GRID_NAVIGATION_REQUIRED_COLUMNS, MOVEMENT_FEATURE_MODE_SOLO_GRID
-from cs2_ai.navigation.path_labeler import resolve_position_columns
+from cs2_ai.navigation.cell_indexer import build_grid_map
+from cs2_ai.navigation.path_labeler import (
+    label_navigation_for_group,
+    resolve_group_columns,
+    resolve_position_columns,
+)
 
 
 REQUIRED_MOVE_COLUMNS = ('move_forward', 'move_back', 'move_left', 'move_right')
@@ -21,6 +28,7 @@ GRID_STATS_COLUMNS = (
     'dwell_medium_hold',
     'dwell_long_hold',
 )
+ROUND_FILE_PATTERN = re.compile(r'^round_(?P<round_number>.+)\.parquet$', re.IGNORECASE)
 
 
 def parse_bool(value: str | bool) -> bool:
@@ -100,7 +108,7 @@ def coerce_bool_series(series: pd.Series) -> pd.Series:
 def resolve_movement_target_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, str | None]]:
     candidates = {
         'move_forward': ('move_forward', 'forward', 'FORWARD'),
-        'move_back': ('move_back', 'back', 'BACK', 'move_back', 'backward', 'move_backward'),
+        'move_back': ('move_back', 'back', 'BACK', 'backward', 'move_backward'),
         'move_left': ('move_left', 'left', 'LEFT'),
         'move_right': ('move_right', 'right', 'RIGHT'),
         'move_walk': ('move_walk', 'walk', 'WALK', 'is_walking'),
@@ -142,8 +150,8 @@ def ensure_grid_columns(df: pd.DataFrame, required: bool) -> pd.DataFrame:
     missing = [column for column in GRID_NAVIGATION_REQUIRED_COLUMNS if column not in df.columns]
     if missing and required:
         raise ValueError(
-            f'Missing required grid navigation columns: {missing}. '
-            'Run cs2_ai.preprocessing.label_dust2_grid first.'
+            'Grid labels are missing. Run label_dust2_grid or use --auto-label-grid true. '
+            f'Missing columns: {missing}'
         )
     result = df.copy()
     for column in missing:
@@ -152,33 +160,178 @@ def ensure_grid_columns(df: pd.DataFrame, required: bool) -> pd.DataFrame:
     return result
 
 
-def resolve_group_key_columns(df: pd.DataFrame) -> tuple[str, str, str]:
-    demo_col = next((column for column in ('demo_id', 'demo_name') if column in df.columns), None)
-    round_col = next((column for column in ('round_id', 'total_rounds_played') if column in df.columns), None)
-    player_col = next((column for column in ('player_id', 'steam_id', 'steamid') if column in df.columns), None)
-    if demo_col is None:
-        demo_col = 'source_file'
-    if round_col is None:
-        df['round_id'] = 'unknown_round'
-        round_col = 'round_id'
-    if player_col is None:
-        df['player_id'] = 'unknown_player'
-        player_col = 'player_id'
-    return demo_col, round_col, player_col
+def read_optional_json(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding='utf-8'))
 
 
-def build_split_group_id(df: pd.DataFrame) -> tuple[pd.DataFrame, tuple[str, str, str]]:
+def discover_round_parquet_files(rounds_dataset_dir: Path) -> list[Path]:
+    return sorted(path for path in rounds_dataset_dir.glob('*/rounds/round_*.parquet') if path.is_file())
+
+
+def extract_round_number(round_file: Path) -> int | str:
+    match = ROUND_FILE_PATTERN.match(round_file.name)
+    if match is None:
+        print(f'WARNING: could not extract round number from {round_file.name}; using file name.')
+        return round_file.name
+    raw_value = match.group('round_number')
+    try:
+        return int(raw_value)
+    except ValueError:
+        print(f'WARNING: round number is not numeric in {round_file.name}; using "{raw_value}" as string.')
+        return raw_value
+
+
+def resolve_round_source_file(round_file: Path) -> str:
+    demo_dir = round_file.parents[1]
+    demo_manifest = read_optional_json(demo_dir / 'manifest.json') or {}
+    source_file = demo_manifest.get('source_file_name') or demo_manifest.get('source_file')
+    if source_file:
+        return str(source_file)
+    return demo_dir.name
+
+
+def load_rounds_dataset(rounds_dataset_dir: Path) -> tuple[pd.DataFrame, list[Path], dict[str, Any]]:
+    round_files = discover_round_parquet_files(rounds_dataset_dir)
+    if not round_files:
+        raise FileNotFoundError(f'No round parquet files found for {rounds_dataset_dir} / */rounds/round_*.parquet')
+
+    top_manifest = read_optional_json(rounds_dataset_dir / 'manifest.json')
+    top_summary_exists = (rounds_dataset_dir / 'rounds_summary.csv').exists()
+    if top_manifest is not None:
+        print(f'DEBUG: loaded rounds dataset manifest from {rounds_dataset_dir / "manifest.json"}')
+    if top_summary_exists:
+        print(f'DEBUG: found rounds dataset summary at {rounds_dataset_dir / "rounds_summary.csv"}')
+
+    frames: list[pd.DataFrame] = []
+    for round_file in round_files:
+        frame = pd.read_parquet(round_file)
+        demo_file_name = round_file.parents[1].name
+        round_number = extract_round_number(round_file)
+        source_file = resolve_round_source_file(round_file)
+        frame = frame.copy()
+        frame['demo_file_name'] = demo_file_name
+        frame['round_number'] = round_number
+        frame['source_file'] = source_file
+        frame['round_parquet_path'] = str(round_file)
+        frames.append(frame)
+
+    metadata = {
+        'rounds_dataset_dir': str(rounds_dataset_dir),
+        'top_manifest_exists': top_manifest is not None,
+        'top_summary_exists': top_summary_exists,
+    }
+    return pd.concat(frames, ignore_index=True), round_files, metadata
+
+
+def load_legacy_input_dataset(input_dir: Path, input_glob: str) -> tuple[pd.DataFrame, list[Path], dict[str, Any]]:
+    parquet_files = sorted(input_dir.glob(input_glob))
+    if not parquet_files:
+        raise FileNotFoundError(f'No parquet files found for {input_dir} / {input_glob}')
+
+    frames: list[pd.DataFrame] = []
+    for path in parquet_files:
+        frame = pd.read_parquet(path)
+        frame = frame.copy()
+        frame['source_file'] = str(path)
+        if 'demo_file_name' not in frame.columns:
+            frame['demo_file_name'] = path.stem
+        if 'round_number' not in frame.columns:
+            if 'round_id' in frame.columns:
+                frame['round_number'] = frame['round_id']
+            elif 'total_rounds_played' in frame.columns:
+                frame['round_number'] = frame['total_rounds_played']
+        frames.append(frame)
+
+    metadata = {
+        'input_dir': str(input_dir),
+        'input_glob': input_glob,
+    }
+    return pd.concat(frames, ignore_index=True), parquet_files, metadata
+
+
+def sort_columns_for_output(df: pd.DataFrame) -> list[str]:
+    preferred = ['demo_file_name', 'round_number', 'source_file', 'split', 'split_group_id', 'split_round_id']
+    return [column for column in preferred if column in df.columns] + [column for column in df.columns if column not in preferred]
+
+
+def label_grid_navigation_dataframe(
+    df: pd.DataFrame,
+    *,
+    map_name: str,
+    lookahead_ticks: int,
+    min_target_distance: float,
+) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    grid_map = build_grid_map(map_name)
+    x_col, y_col, z_col = resolve_position_columns(df)
+    tick_column = resolve_tick_column(df)
+    if tick_column is None:
+        raise ValueError('Grid auto-labelling requires a tick column. Expected one of: tick, tick_id, server_tick.')
+    group_columns = resolve_group_columns(df)
+    labeled_groups: list[pd.DataFrame] = []
+    if group_columns:
+        for _, group in df.groupby(group_columns, sort=False, dropna=False):
+            labeled_groups.append(
+                label_navigation_for_group(
+                    group,
+                    grid_map=grid_map,
+                    lookahead_ticks=lookahead_ticks,
+                    min_target_distance=min_target_distance,
+                    x_col=x_col,
+                    y_col=y_col,
+                    z_col=z_col,
+                    tick_column=tick_column,
+                )
+            )
+    else:
+        labeled_groups.append(
+            label_navigation_for_group(
+                df,
+                grid_map=grid_map,
+                lookahead_ticks=lookahead_ticks,
+                min_target_distance=min_target_distance,
+                x_col=x_col,
+                y_col=y_col,
+                z_col=z_col,
+                tick_column=tick_column,
+            )
+        )
+    return pd.concat(labeled_groups, ignore_index=True)
+
+
+def resolve_demo_column(df: pd.DataFrame) -> str:
+    for column in ('demo_file_name', 'demo_id', 'demo_name', 'source_file'):
+        if column in df.columns:
+            return column
+    raise ValueError('Could not resolve demo grouping column.')
+
+
+def resolve_round_column(df: pd.DataFrame) -> str:
+    for column in ('round_number', 'round_id', 'total_rounds_played'):
+        if column in df.columns:
+            return column
+    raise ValueError('Could not resolve round grouping column.')
+
+
+def build_split_group_id(df: pd.DataFrame, split_unit: str) -> tuple[pd.DataFrame, dict[str, str]]:
     result = df.copy()
-    demo_col, round_col, player_col = resolve_group_key_columns(result)
-    result['split_group_id'] = (
-        result[demo_col].astype(str)
-        + '::'
-        + result[round_col].astype(str)
-        + '::'
-        + result[player_col].astype(str)
-    )
+    demo_col = resolve_demo_column(result)
+    round_col = resolve_round_column(result)
     result['split_round_id'] = result[demo_col].astype(str) + '::' + result[round_col].astype(str)
-    return result, (demo_col, round_col, player_col)
+    if split_unit == 'round':
+        result['split_group_id'] = result['split_round_id']
+    elif split_unit == 'demo':
+        result['split_group_id'] = result[demo_col].astype(str)
+    else:
+        raise ValueError(f'Unsupported split unit: {split_unit}')
+    return result, {
+        'demo_column': demo_col,
+        'round_column': round_col,
+        'split_unit': split_unit,
+    }
 
 
 def split_group_ids(group_ids: list[str], train_ratio: float, val_ratio: float, test_ratio: float, seed: int) -> tuple[set[str], set[str], set[str]]:
@@ -242,12 +395,18 @@ def print_grid_stats(df: pd.DataFrame, required_grid: bool) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Build reproducible movement train/val/test parquet splits.')
-    parser.add_argument('--input-dir', type=Path, required=True)
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument('--input-dir', type=Path)
+    input_group.add_argument('--rounds-dataset-dir', type=Path)
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--map', type=str, default='de_dust2')
     parser.add_argument('--feature-mode', choices=['legacy', 'solo_grid'], default='solo_grid')
     parser.add_argument('--input-glob', type=str, default='**/clean_play_ticks*.parquet')
+    parser.add_argument('--split-unit', choices=['round', 'demo'], default='round')
     parser.add_argument('--require-grid-labels', type=parse_bool, default=True)
+    parser.add_argument('--auto-label-grid', type=parse_bool, default=False)
+    parser.add_argument('--lookahead-ticks', type=int, default=10)
+    parser.add_argument('--min-target-distance', type=float, default=75.0)
     parser.add_argument('--train-ratio', type=float, default=0.8)
     parser.add_argument('--val-ratio', type=float, default=0.1)
     parser.add_argument('--test-ratio', type=float, default=0.1)
@@ -259,20 +418,17 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    parquet_files = sorted(args.input_dir.glob(args.input_glob))
-    if not parquet_files:
-        raise FileNotFoundError(f'No parquet files found for {args.input_dir} / {args.input_glob}')
+    if args.rounds_dataset_dir is not None:
+        df, source_files, input_metadata = load_rounds_dataset(args.rounds_dataset_dir)
+        input_mode = 'rounds-dataset'
+    else:
+        df, source_files, input_metadata = load_legacy_input_dataset(args.input_dir, args.input_glob)
+        input_mode = 'legacy-input-dir'
 
-    print(f'Found parquet files: {len(parquet_files)}')
-    frames: list[pd.DataFrame] = []
-    for path in parquet_files:
-        frame = pd.read_parquet(path)
-        frame['source_file'] = str(path)
-        frames.append(frame)
-    df = pd.concat(frames, ignore_index=True)
     if args.max_rows is not None:
         df = df.head(int(args.max_rows)).copy()
     total_rows_before = len(df)
+    print(f'Found parquet files: {len(source_files)}')
     print(f'total rows before filtering: {total_rows_before}')
 
     map_col = resolve_map_column(df)
@@ -284,6 +440,15 @@ def main() -> int:
     df, position_columns, velocity_columns, yaw_column = canonicalize_position_and_state_columns(df)
     df, target_column_map = resolve_movement_target_columns(df)
     require_grid = args.feature_mode == MOVEMENT_FEATURE_MODE_SOLO_GRID and bool(args.require_grid_labels)
+    has_all_grid_columns = all(column in df.columns for column in GRID_NAVIGATION_REQUIRED_COLUMNS)
+    if not has_all_grid_columns and bool(args.auto_label_grid):
+        print('Grid labels are missing; running auto grid labelling.')
+        df = label_grid_navigation_dataframe(
+            df,
+            map_name=args.map,
+            lookahead_ticks=args.lookahead_ticks,
+            min_target_distance=args.min_target_distance,
+        )
     df = ensure_grid_columns(df, required=require_grid)
 
     required_columns = ['X', 'Y', 'Z', 'velocity_X', 'velocity_Y', 'velocity_Z', 'yaw', *REQUIRED_MOVE_COLUMNS]
@@ -296,22 +461,27 @@ def main() -> int:
     if tick_col is None:
         print('WARNING: tick column not found; preserving original row order.')
     else:
-        df = df.sort_values([column for column in ('source_file', 'total_rounds_played', 'tick', 'steamid') if column in df.columns]).reset_index(drop=True)
+        sort_columns = [column for column in ('demo_file_name', 'source_file', 'round_number', 'total_rounds_played', tick_col, 'steamid') if column in df.columns]
+        df = df.sort_values(sort_columns).reset_index(drop=True)
 
-    df, group_columns = build_split_group_id(df)
+    df, group_columns = build_split_group_id(df, split_unit=args.split_unit)
     group_sizes = df.groupby('split_group_id').size()
     valid_group_ids = set(group_sizes[group_sizes >= int(args.min_group_rows)].index.tolist())
+    filtered_out_groups = int(len(group_sizes) - len(valid_group_ids))
     df = df.loc[df['split_group_id'].isin(valid_group_ids)].copy()
 
     total_rows_after = len(df)
     all_group_ids = sorted(pd.unique(df['split_group_id']))
     print(f'total rows after filtering: {total_rows_after}')
     print(f'number of groups: {len(all_group_ids)}')
+    if filtered_out_groups:
+        print(f'filtered groups below min-group-rows={args.min_group_rows}: {filtered_out_groups}')
     train_ids, val_ids, test_ids = split_group_ids(all_group_ids, args.train_ratio, args.val_ratio, args.test_ratio, args.seed)
 
     df['split'] = 'test'
     df.loc[df['split_group_id'].isin(train_ids), 'split'] = 'train'
     df.loc[df['split_group_id'].isin(val_ids), 'split'] = 'val'
+    df = df[sort_columns_for_output(df)].copy()
 
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -327,14 +497,22 @@ def main() -> int:
 
     manifest = {
         'created_at': datetime.now(timezone.utc).isoformat(),
-        'input_dir': str(args.input_dir),
+        'input_mode': input_mode,
+        'input_dir': str(args.input_dir) if args.input_dir is not None else None,
+        'rounds_dataset_dir': str(args.rounds_dataset_dir) if args.rounds_dataset_dir is not None else None,
         'input_glob': args.input_glob,
         'map': args.map,
         'feature_mode': args.feature_mode,
+        'split_unit': args.split_unit,
         'seed': args.seed,
         'train_ratio': args.train_ratio,
         'val_ratio': args.val_ratio,
         'test_ratio': args.test_ratio,
+        'min_group_rows': int(args.min_group_rows),
+        'auto_label_grid': bool(args.auto_label_grid),
+        'require_grid_labels': bool(args.require_grid_labels),
+        'lookahead_ticks': int(args.lookahead_ticks),
+        'min_target_distance': float(args.min_target_distance),
         'total_rows': int(len(df)),
         'train_rows': int(len(train_df)),
         'val_rows': int(len(val_df)),
@@ -343,13 +521,16 @@ def main() -> int:
         'train_groups': int(len(train_ids)),
         'val_groups': int(len(val_ids)),
         'test_groups': int(len(test_ids)),
+        'total_rounds': int(df['split_round_id'].nunique()) if 'split_round_id' in df.columns else 0,
+        'total_demos': int(df['demo_file_name'].nunique()) if 'demo_file_name' in df.columns else 0,
         'required_grid_columns': list(GRID_NAVIGATION_REQUIRED_COLUMNS) if require_grid else [],
         'movement_target_columns': target_column_map,
         'position_columns': list(position_columns),
         'velocity_columns': list(velocity_columns),
         'yaw_column': yaw_column,
-        'group_columns': list(group_columns),
-        'source_files': [str(path) for path in parquet_files],
+        'group_columns': group_columns,
+        'source_files': [str(path) for path in source_files],
+        'input_metadata': input_metadata,
     }
     (output_dir / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=True, indent=2), encoding='utf-8')
 

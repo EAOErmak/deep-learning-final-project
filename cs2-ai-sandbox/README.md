@@ -543,3 +543,68 @@ Dry-run the bridge without sending inputs:
 python scripts/debug_vision_aim_bridge.py --fake-target
 python scripts/debug_vision_aim_bridge.py --yolo-weights weights/yolov10s_cs2.pt
 ```
+
+## Training on rounds-dataset with round ledger
+
+The trainers can now read flat parquet datasets such as `data/clean_play_ticks/*.parquet` and nested round datasets such as `data/rounds-dataset/<demo_dir>/rounds/*.parquet`. When a training run starts, the selected train/val rounds are appended to `artifacts/training_ledger/training_rounds.jsonl`.
+
+Movement:
+
+```powershell
+python -m cs2_ai.ml.training.train_movement `
+  --data-dir data `
+  --dataset-subdir rounds-dataset `
+  --model movement_gru `
+  --target-mode action_chunk `
+  --chunk-len 8 `
+  --seq-len 32 `
+  --split-mode round `
+  --epochs 1 `
+  --save-path checkpoints/movement_gru_rounds.pt
+```
+
+Aim:
+
+```powershell
+python -m cs2_ai.ml.training.train_aim `
+  --data-dir data `
+  --dataset-subdir rounds-dataset `
+  --aim-feature-mode vision_like `
+  --aim-head-mode multi_head `
+  --split-mode round `
+  --epochs 1 `
+  --save-path checkpoints/aim_vision_like_rounds.pt
+```
+
+Enemy tracker:
+
+```powershell
+python -m cs2_ai.ml.training.train_enemy_tracker `
+  --data-dir data `
+  --dataset-subdir rounds-dataset `
+  --output-mode target_tick `
+  --split-mode round `
+  --epochs 1 `
+  --save-path checkpoints/enemy_tracker_rounds.pt
+```
+
+Skip already trained rounds:
+
+```powershell
+python -m cs2_ai.ml.training.train_movement `
+  --data-dir data `
+  --dataset-subdir rounds-dataset `
+  --model movement_gru `
+  --target-mode action_chunk `
+  --split-mode round `
+  --skip-trained-rounds `
+  --ledger-match-mode module `
+  --save-path checkpoints/movement_gru_rounds_2.pt
+```
+
+Inspect ledger:
+
+```powershell
+python scripts/inspect_training_ledger.py `
+  --ledger-path artifacts/training_ledger/training_rounds.jsonl
+```

@@ -46,6 +46,14 @@ from cs2_ai.features.movement_features import (
 from cs2_ai.ml.models.decision_dqn import DecisionDQN
 from cs2_ai.ml.models.movement_gru import MovementGRU
 from cs2_ai.ml.reporting import build_base_training_report, write_training_report
+from cs2_ai.ml.training.training_dataset_utils import (
+    add_common_training_data_args,
+    build_dataset_label,
+    filter_dataset_by_trained_rounds,
+    resolve_dataset_root as resolve_shared_dataset_root,
+    resolve_run_id,
+)
+from cs2_ai.ml.training.training_ledger import TrainingRoundLedger, collect_round_usage
 from cs2_ai.ml.training.shape_assertions import assert_shape, assert_temporal_features
 from cs2_ai.ml.utils.tensorboard_utils import close_summary_writer, create_summary_writer, log_scalar_dict, tensorboard_available
 from cs2_ai.ml.utils.torch_utils import build_dataloader_kwargs, configure_torch_runtime, get_device, set_seed, torch_available
@@ -596,6 +604,10 @@ def save_checkpoint(
     schema: FeatureSchema,
     demo_names: list[str],
     action_names: tuple[str, ...],
+    *,
+    round_dataset_format: str | None = None,
+    train_round_usage: list[dict[str, object]],
+    val_round_usage: list[dict[str, object]],
 ) -> None:
     save_path.parent.mkdir(parents=True, exist_ok=True)
     model_type = 'movement_gru_chunk' if args.model == MOVEMENT_MODEL_GRU else 'decision_dqn_movement'
@@ -618,12 +630,20 @@ def save_checkpoint(
         'gru_dropout': args.dropout,
         'feature_schema': schema.to_metadata(),
         'dataset_source': dataset_label,
+        'dataset_dir': str(resolve_shared_dataset_root(args, PROJECT_ROOT)),
+        'dataset_subdir': args.dataset_subdir,
+        'round_dataset_format': round_dataset_format,
         'demo_names': demo_names,
         'demo_count': len(demo_names),
         'split_mode': args.split_mode,
         'train_metrics': {k: v for k, v in train_metrics.items() if k not in MOVEMENT_METRIC_DICT_KEYS},
         'val_metrics': {k: v for k, v in val_metrics.items() if k not in MOVEMENT_METRIC_DICT_KEYS},
         'feature_order': list(schema.feature_names),
+        'train_round_count': len(train_round_usage),
+        'val_round_count': len(val_round_usage),
+        'train_round_uids': [item['round_uid'] for item in train_round_usage],
+        'val_round_uids': [item['round_uid'] for item in val_round_usage],
+        'rounds_ledger_path': str(args.rounds_ledger_path),
     }
     torch.save(checkpoint, save_path)
 
@@ -690,9 +710,7 @@ def compute_pos_weight(dataset: MovementSequenceTorchDataset, mode: str, explici
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Train a supervised movement model from clean_play_ticks')
-    parser.add_argument('--data-dir', type=Path, default=PROJECT_ROOT / 'data')
-    parser.add_argument('--dataset-subdir', type=str, default='clean_play_ticks')
-    parser.add_argument('--dataset-dir', type=Path, default=None, help=argparse.SUPPRESS)
+    add_common_training_data_args(parser, project_root=PROJECT_ROOT, legacy_dataset_dir=True)
     parser.add_argument('--trainset-dir', type=Path, default=None)
     parser.add_argument('--train-data', type=Path, default=None)
     parser.add_argument('--val-data', type=Path, default=None)
@@ -735,15 +753,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def resolve_dataset_root(args: argparse.Namespace) -> Path:
-    if args.dataset_dir is not None:
-        return args.dataset_dir
-    candidate = Path(args.data_dir)
-    legacy = PROJECT_ROOT / 'dataset'
-    if candidate.exists():
-        return candidate
-    if legacy.exists():
-        return legacy
-    return candidate
+    return resolve_shared_dataset_root(args, PROJECT_ROOT)
 
 
 def build_dataset(args: argparse.Namespace) -> MovementSequenceTorchDataset:
@@ -863,6 +873,21 @@ def main() -> int:
     if dataset_len == 0:
         print('Movement training dataset is empty. Try smaller seq_len/stride or another demo set.')
         return 1
+    if args.skip_trained_rounds:
+        dataset, skip_info = filter_dataset_by_trained_rounds(
+            dataset,
+            ledger_path=args.rounds_ledger_path,
+            module_name='movement',
+            model_name=args.model,
+            checkpoint_path=str(args.save_path),
+            match_mode=args.ledger_match_mode,
+        )
+        print(f'total rounds before skip: {skip_info["total_rounds_before_skip"]}')
+        print(f'skipped rounds count: {skip_info["skipped_rounds_count"]}')
+        print(f'remaining rounds count: {skip_info["remaining_rounds_count"]}')
+        if len(dataset) == 0:
+            print('Dataset is empty after --skip-trained-rounds filtering.')
+            return 1
 
     print('Building train/val split...')
     using_prebuilt_trainset = args.trainset_dir is not None or args.train_data is not None
@@ -874,6 +899,33 @@ def main() -> int:
         test_dataset = build_prebuilt_split_dataset(test_path, args) if test_path is not None and test_path.exists() else None
     else:
         train_dataset, val_dataset = split_dataset_by_group(dataset, args.val_split, args.seed, mode=args.split_mode)
+    train_round_usage = collect_round_usage(train_dataset)
+    val_round_usage = collect_round_usage(val_dataset)
+    ledger = TrainingRoundLedger.load(args.rounds_ledger_path)
+    run_id = resolve_run_id(args, 'movement')
+    dataset_root = resolve_dataset_root(args)
+    ledger.append_run_rounds(
+        run_id=run_id,
+        module_name='movement',
+        model_name=args.model,
+        checkpoint_path=str(args.save_path),
+        dataset_dir=str(dataset_root),
+        dataset_subdir=args.dataset_subdir,
+        split_mode=args.split_mode,
+        split='train',
+        round_usage=train_round_usage,
+    )
+    ledger.append_run_rounds(
+        run_id=run_id,
+        module_name='movement',
+        model_name=args.model,
+        checkpoint_path=str(args.save_path),
+        dataset_dir=str(dataset_root),
+        dataset_subdir=args.dataset_subdir,
+        split_mode=args.split_mode,
+        split='val',
+        round_usage=val_round_usage,
+    )
     train_expected_counts = collect_expected_demo_counts(train_dataset)
     val_expected_counts = collect_expected_demo_counts(val_dataset)
     print('Computing movement target statistics...')
@@ -956,7 +1008,7 @@ def main() -> int:
     )
 
     demo_names = dataset.base_dataset.get_demo_names()
-    dataset_label = str(args.trainset_dir) if using_prebuilt_trainset and args.trainset_dir is not None else str(resolve_dataset_root(args) / args.dataset_subdir)
+    dataset_label = str(args.trainset_dir) if using_prebuilt_trainset and args.trainset_dir is not None else build_dataset_label(args, PROJECT_ROOT)
     epoch_log_path = args.save_path.with_name(f'{args.save_path.stem}_epoch_metrics.jsonl')
     writer = None
     run_dir = None
@@ -1095,7 +1147,20 @@ def main() -> int:
                 best_val_loss = val_metrics['loss']
                 best_train_metrics = train_metrics
                 best_val_metrics = val_metrics
-                save_checkpoint(args.save_path, model, args, train_metrics, val_metrics, dataset_label, feature_schema, demo_names, dataset.action_names)
+                save_checkpoint(
+                    args.save_path,
+                    model,
+                    args,
+                    train_metrics,
+                    val_metrics,
+                    dataset_label,
+                    feature_schema,
+                    demo_names,
+                    dataset.action_names,
+                    round_dataset_format=getattr(dataset.base_dataset, 'dataset_format', 'prebuilt') if hasattr(dataset, 'base_dataset') else None,
+                    train_round_usage=train_round_usage,
+                    val_round_usage=val_round_usage,
+                )
                 print(f'  saved checkpoint -> {args.save_path}')
     finally:
         close_summary_writer(writer)

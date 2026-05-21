@@ -29,6 +29,14 @@ from cs2_ai.schemas.module_outputs import EnemyTrackerOutput
 from cs2_ai.schemas.game_state import GameStateSequence
 from cs2_ai.ml.models.decision_dqn import DecisionDQN
 from cs2_ai.ml.reporting import build_base_training_report, write_training_report
+from cs2_ai.ml.training.training_dataset_utils import (
+    add_common_training_data_args,
+    build_dataset_label,
+    filter_dataset_by_trained_rounds,
+    resolve_dataset_root as resolve_shared_dataset_root,
+    resolve_run_id,
+)
+from cs2_ai.ml.training.training_ledger import TrainingRoundLedger, collect_round_usage
 from cs2_ai.ml.utils.tensorboard_utils import close_summary_writer, create_summary_writer, log_scalar_dict, tensorboard_available
 from cs2_ai.ml.utils.torch_utils import build_dataloader_kwargs, configure_torch_runtime, get_device, set_seed, torch_available
 
@@ -334,6 +342,10 @@ def save_checkpoint(
     dataset_label: str,
     input_dim: int,
     demo_names: list[str],
+    *,
+    train_round_usage: list[dict[str, object]],
+    val_round_usage: list[dict[str, object]],
+    round_dataset_format: str | None = None,
 ) -> None:
     save_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
@@ -344,12 +356,20 @@ def save_checkpoint(
         'seq_len': args.seq_len,
         'stride': args.stride,
         'dataset_source': dataset_label,
+        'dataset_dir': str(resolve_shared_dataset_root(args, PROJECT_ROOT)),
+        'dataset_subdir': args.dataset_subdir,
+        'round_dataset_format': round_dataset_format,
         'demo_names': demo_names,
         'demo_count': len(demo_names),
         'split_mode': args.split_mode,
         'train_metrics': {k: v for k, v in train_metrics.items() if k not in {'seen_sample_ids', 'per_demo_loss', 'per_demo_seen_counts'}},
         'val_metrics': {k: v for k, v in val_metrics.items() if k not in {'seen_sample_ids', 'per_demo_loss', 'per_demo_seen_counts'}},
         'feature_order': 'DecisionFeatureExtractor end step vector',
+        'train_round_count': len(train_round_usage),
+        'val_round_count': len(val_round_usage),
+        'train_round_uids': [item['round_uid'] for item in train_round_usage],
+        'val_round_uids': [item['round_uid'] for item in val_round_usage],
+        'rounds_ledger_path': str(args.rounds_ledger_path),
     }
     torch.save(checkpoint, save_path)
 
@@ -366,7 +386,7 @@ def load_checkpoint_if_available(policy_net: torch.nn.Module, target_net: torch.
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Train an offline DecisionDQN model from transitions')
-    parser.add_argument('--dataset-dir', type=Path, default=PROJECT_ROOT / 'dataset')
+    add_common_training_data_args(parser, project_root=PROJECT_ROOT, legacy_dataset_dir=True)
     parser.add_argument('--seq-len', type=int, default=64)
     parser.add_argument('--stride', type=int, default=8)
     parser.add_argument('--batch-size', type=int, default=32)
@@ -405,7 +425,8 @@ def main() -> int:
     
     # Load MultiDemoSequenceDataset
     base_dataset = MultiDemoSequenceDataset(
-        dataset_dir=args.dataset_dir,
+        dataset_dir=resolve_shared_dataset_root(args, PROJECT_ROOT),
+        subdir=args.dataset_subdir,
         seq_len=args.seq_len,
         stride=args.stride,
         max_samples_total=args.max_samples,
@@ -416,6 +437,21 @@ def main() -> int:
     if len(base_dataset) == 0:
         print("Dataset is empty. Ensure you have parquet files in dataset/clean_play_ticks")
         return 1
+    if args.skip_trained_rounds:
+        base_dataset, skip_info = filter_dataset_by_trained_rounds(
+            base_dataset,
+            ledger_path=args.rounds_ledger_path,
+            module_name='decision',
+            model_name='decision_dqn_offline',
+            checkpoint_path=str(args.save_path),
+            match_mode=args.ledger_match_mode,
+        )
+        print(f'total rounds before skip: {skip_info["total_rounds_before_skip"]}')
+        print(f'skipped rounds count: {skip_info["skipped_rounds_count"]}')
+        print(f'remaining rounds count: {skip_info["remaining_rounds_count"]}')
+        if len(base_dataset) == 0:
+            print('Dataset is empty after --skip-trained-rounds filtering.')
+            return 1
         
     print(f"Total base samples: {len(base_dataset)}")
     
@@ -429,6 +465,33 @@ def main() -> int:
     
     train_dataset = DecisionRLTransitionDataset(train_subset)
     val_dataset = DecisionRLTransitionDataset(val_subset)
+    train_round_usage = collect_round_usage(train_subset)
+    val_round_usage = collect_round_usage(val_subset)
+    ledger = TrainingRoundLedger.load(args.rounds_ledger_path)
+    run_id = resolve_run_id(args, 'decision')
+    dataset_root = resolve_shared_dataset_root(args, PROJECT_ROOT)
+    ledger.append_run_rounds(
+        run_id=run_id,
+        module_name='decision',
+        model_name='decision_dqn_offline',
+        checkpoint_path=str(args.save_path),
+        dataset_dir=str(dataset_root),
+        dataset_subdir=args.dataset_subdir,
+        split_mode=args.split_mode,
+        split='train',
+        round_usage=train_round_usage,
+    )
+    ledger.append_run_rounds(
+        run_id=run_id,
+        module_name='decision',
+        model_name='decision_dqn_offline',
+        checkpoint_path=str(args.save_path),
+        dataset_dir=str(dataset_root),
+        dataset_subdir=args.dataset_subdir,
+        split_mode=args.split_mode,
+        split='val',
+        round_usage=val_round_usage,
+    )
     
     print(f"Train size: {len(train_dataset)}, Val size: {len(val_dataset)}")
     train_loader_kwargs = build_dataloader_kwargs(device, args.num_workers, is_training=True)
@@ -472,7 +535,7 @@ def main() -> int:
     )
     
     demo_names = base_dataset.get_demo_names()
-    dataset_label = str(args.dataset_dir / 'clean_play_ticks')
+    dataset_label = build_dataset_label(args, PROJECT_ROOT)
     epoch_log_path = args.save_path.with_name(f'{args.save_path.stem}_epoch_metrics.jsonl')
     
     # Remove old epoch log if exists
@@ -534,7 +597,19 @@ def main() -> int:
                 best_val_loss = val_metrics['loss']
                 best_train_metrics = train_metrics
                 best_val_metrics = val_metrics
-                save_checkpoint(args.save_path, policy_net, args, train_metrics, val_metrics, dataset_label, input_dim, demo_names)
+                save_checkpoint(
+                    args.save_path,
+                    policy_net,
+                    args,
+                    train_metrics,
+                    val_metrics,
+                    dataset_label,
+                    input_dim,
+                    demo_names,
+                    train_round_usage=train_round_usage,
+                    val_round_usage=val_round_usage,
+                    round_dataset_format=getattr(base_dataset, 'dataset_format', None),
+                )
                 print(f'  saved checkpoint -> {args.save_path}')
     finally:
         if writer is not None:
