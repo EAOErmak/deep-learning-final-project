@@ -33,6 +33,7 @@ from cs2_ai.features.movement_features import (
     build_movement_action_chunk_target_from_tick_rows,
     build_movement_target_from_tick_rows,
     movement_action_names_for_target_mode,
+    normalize_movement_target_mode,
 )
 from cs2_ai.ml.models.decision_dqn import DecisionDQN
 from cs2_ai.ml.models.movement_gru import MovementGRU
@@ -87,7 +88,7 @@ class MovementSequenceTorchDataset(Dataset):
     ):
         self.base_dataset = base_dataset
         self.feature_extractor = MovementFeatureExtractor(seq_len=getattr(base_dataset, "seq_len", None))
-        self.target_mode = target_mode
+        self.target_mode = normalize_movement_target_mode(target_mode)
         self.chunk_len = int(chunk_len)
         if self.chunk_len <= 0:
             raise ValueError('chunk_len must be positive.')
@@ -240,6 +241,7 @@ class MovementTrainer:
         per_action_tn = np.zeros(action_dim, dtype=np.float64)
         per_action_pred_pos = np.zeros(action_dim, dtype=np.float64)
         per_action_target_pos = np.zeros(action_dim, dtype=np.float64)
+        exact_chunk_matches = 0.0
         total_steps = 0
         per_demo_sum: dict[str, float] = {}
         per_demo_count: dict[str, int] = {}
@@ -303,6 +305,7 @@ class MovementTrainer:
             per_action_tn += ((1.0 - pred_binary) * (1.0 - target_binary)).sum(dim=(0, 1)).detach().cpu().numpy()
             per_action_pred_pos += pred_binary.sum(dim=(0, 1)).detach().cpu().numpy()
             per_action_target_pos += target_binary.sum(dim=(0, 1)).detach().cpu().numpy()
+            exact_chunk_matches += float((pred_binary == target_binary).all(dim=(1, 2)).sum().item())
             total_steps += int(binary_targets.shape[0] * binary_targets.shape[1])
 
             if training and writer is not None:
@@ -352,14 +355,31 @@ class MovementTrainer:
                 'per_action_accuracy': {},
                 'per_action_precision': {},
                 'per_action_recall': {},
+                'per_action_f1': {},
                 'per_action_pred_positive_rate': {},
                 'per_action_target_positive_rate': {},
+                'chunk_exact_match': 0.0,
                 'seen_sample_ids': set(),
                 'per_demo_loss': {},
                 'per_demo_seen_counts': {},
             }
 
         action_names = self._resolve_action_names(loader.dataset)
+        per_action_precision = {
+            name: float(per_action_tp[idx] / max(per_action_tp[idx] + per_action_fp[idx], 1.0))
+            for idx, name in enumerate(action_names)
+        }
+        per_action_recall = {
+            name: float(per_action_tp[idx] / max(per_action_tp[idx] + per_action_fn[idx], 1.0))
+            for idx, name in enumerate(action_names)
+        }
+        per_action_f1 = {
+            name: float(
+                (2.0 * per_action_precision[name] * per_action_recall[name])
+                / max(per_action_precision[name] + per_action_recall[name], 1e-8)
+            )
+            for name in action_names
+        }
         return {
             'loss': total_loss / total_samples,
             'binary_loss': total_binary_loss / total_samples,
@@ -371,14 +391,9 @@ class MovementTrainer:
                 name: float((per_action_tp[idx] + per_action_tn[idx]) / max(per_action_tp[idx] + per_action_fp[idx] + per_action_fn[idx] + per_action_tn[idx], 1.0))
                 for idx, name in enumerate(action_names)
             },
-            'per_action_precision': {
-                name: float(per_action_tp[idx] / max(per_action_tp[idx] + per_action_fp[idx], 1.0))
-                for idx, name in enumerate(action_names)
-            },
-            'per_action_recall': {
-                name: float(per_action_tp[idx] / max(per_action_tp[idx] + per_action_fn[idx], 1.0))
-                for idx, name in enumerate(action_names)
-            },
+            'per_action_precision': per_action_precision,
+            'per_action_recall': per_action_recall,
+            'per_action_f1': per_action_f1,
             'per_action_pred_positive_rate': {
                 name: float(per_action_pred_pos[idx] / max(total_steps, 1))
                 for idx, name in enumerate(action_names)
@@ -387,6 +402,7 @@ class MovementTrainer:
                 name: float(per_action_target_pos[idx] / max(total_steps, 1))
                 for idx, name in enumerate(action_names)
             },
+            'chunk_exact_match': float(exact_chunk_matches / max(total_samples, 1)),
             'seen_sample_ids': seen_sample_ids,
             'per_demo_loss': {demo: per_demo_sum[demo] / per_demo_count[demo] for demo in sorted(per_demo_sum)},
             'per_demo_seen_counts': {demo: len(ids) for demo, ids in sorted(seen_demo_sample_ids.items())},
@@ -494,6 +510,7 @@ MOVEMENT_METRIC_DICT_KEYS = {
     'per_action_accuracy',
     'per_action_precision',
     'per_action_recall',
+    'per_action_f1',
     'per_action_pred_positive_rate',
     'per_action_target_positive_rate',
 }
@@ -531,7 +548,7 @@ def save_checkpoint(
     save_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
         'model_state_dict': model.state_dict(),
-        'model_type': 'movement_gru' if args.model == MOVEMENT_MODEL_GRU else 'decision_dqn_movement',
+        'model_type': 'movement_gru_chunk' if args.model == MOVEMENT_MODEL_GRU else 'decision_dqn_movement',
         'input_dim': schema.feature_dim,
         'action_dim': len(action_names),
         'action_names': list(action_names),
@@ -541,8 +558,10 @@ def save_checkpoint(
         'seq_len': args.seq_len,
         'stride': args.stride,
         'hidden_dim': args.hidden_dim,
-        'gru_num_layers': args.gru_num_layers,
-        'gru_dropout': args.gru_dropout,
+        'num_layers': args.num_layers,
+        'dropout': args.dropout,
+        'gru_num_layers': args.num_layers,
+        'gru_dropout': args.dropout,
         'feature_schema': schema.to_metadata(),
         'dataset_source': dataset_label,
         'demo_names': demo_names,
@@ -621,14 +640,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--model', choices=[MOVEMENT_MODEL_DECISION_DQN, MOVEMENT_MODEL_GRU], default=MOVEMENT_MODEL_DECISION_DQN)
     parser.add_argument('--seq-len', type=int, default=64)
     parser.add_argument('--stride', type=int, default=8)
-    parser.add_argument('--target-mode', choices=[MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE, MOVEMENT_TARGET_MODE_ACTION_CHUNK], default=MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE)
+    parser.add_argument('--target-mode', choices=[MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE, 'next_tick_sequence', MOVEMENT_TARGET_MODE_ACTION_CHUNK], default=MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE)
     parser.add_argument('--chunk-len', type=int, default=8)
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--epochs', type=int, default=3)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--hidden-dim', type=int, default=256)
-    parser.add_argument('--gru-num-layers', type=int, default=2)
-    parser.add_argument('--gru-dropout', type=float, default=0.1)
+    parser.add_argument('--num-layers', type=int, default=2)
+    parser.add_argument('--dropout', type=float, default=0.1)
+    parser.add_argument('--gru-num-layers', dest='num_layers', type=int, help=argparse.SUPPRESS)
+    parser.add_argument('--gru-dropout', dest='dropout', type=float, help=argparse.SUPPRESS)
     parser.add_argument('--val-split', type=float, default=0.1)
     parser.add_argument('--split-mode', choices=['demo', 'round', 'random'], default='demo')
     parser.add_argument('--alive-only', action='store_true', default=True)
@@ -640,7 +661,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--show-index-progress', action='store_true')
     parser.add_argument('--disable-batch-progress', action='store_true')
     parser.add_argument('--log-every', type=int, default=25)
-    parser.add_argument('--pos-weight-mode', choices=['auto', 'none'], default='auto')
+    parser.add_argument('--movement-pos-weight-mode', choices=['auto', 'none'], default='auto')
+    parser.add_argument('--pos-weight-mode', dest='movement_pos_weight_mode', choices=['auto', 'none'], help=argparse.SUPPRESS)
     parser.add_argument('--pos-weight-values', type=str, default=None)
     parser.add_argument('--runs-dir', type=Path, default=PROJECT_ROOT / 'runs')
     parser.add_argument('--tensorboard-run-name', type=str, default=None)
@@ -667,7 +689,7 @@ def build_dataset(args: argparse.Namespace) -> MovementSequenceTorchDataset:
     print(f'Base sequence samples built: {len(base_dataset)}')
     dataset = MovementSequenceTorchDataset(
         base_dataset,
-        target_mode=args.target_mode,
+        target_mode=normalize_movement_target_mode(args.target_mode),
         chunk_len=args.chunk_len,
     )
     print(f'Filtered movement samples: {len(dataset)}')
@@ -680,6 +702,7 @@ def main() -> int:
         return 0
 
     args = parse_args()
+    args.target_mode = normalize_movement_target_mode(args.target_mode)
     set_seed(args.seed)
     device = get_device()
     runtime_info = configure_torch_runtime(device)
@@ -703,7 +726,7 @@ def main() -> int:
     val_expected_counts = collect_expected_demo_counts(val_dataset)
     print('Computing movement target statistics...')
     dataset_stats = compute_action_ratios(dataset)
-    train_pos_weight_np = compute_pos_weight(train_dataset, args.pos_weight_mode, args.pos_weight_values) if len(train_dataset) > 0 else None
+    train_pos_weight_np = compute_pos_weight(train_dataset, args.movement_pos_weight_mode, args.pos_weight_values) if len(train_dataset) > 0 else None
     print(f'Target mode: {args.target_mode}')
     print(f'Chunk len: {dataset.target_len}')
     print(f'Target shape: [batch, {dataset.target_len}, {dataset.action_dim}]')
@@ -742,8 +765,8 @@ def main() -> int:
         action_dim=dataset.action_dim,
         hidden_dim=args.hidden_dim,
         target_len=dataset.target_len,
-        gru_num_layers=args.gru_num_layers,
-        gru_dropout=args.gru_dropout,
+        gru_num_layers=args.num_layers,
+        gru_dropout=args.dropout,
         device=device,
     )
     load_checkpoint_if_available(model, args.resume_from, device)
@@ -814,8 +837,10 @@ def main() -> int:
                 'per_action_accuracy': dict(train_metrics['per_action_accuracy']),
                 'per_action_precision': dict(train_metrics['per_action_precision']),
                 'per_action_recall': dict(train_metrics['per_action_recall']),
+                'per_action_f1': dict(train_metrics['per_action_f1']),
                 'per_action_pred_positive_rate': dict(train_metrics['per_action_pred_positive_rate']),
                 'per_action_target_positive_rate': dict(train_metrics['per_action_target_positive_rate']),
+                'chunk_exact_match': float(train_metrics['chunk_exact_match']),
                 'seen_sample_ids': set(),
                 'per_demo_loss': {},
                 'per_demo_seen_counts': {},
@@ -832,12 +857,13 @@ def main() -> int:
                 print(
                     f'  {action_name}: '
                     f'loss={train_metrics["per_action_loss"].get(action_name, 0.0):.4f} '
-                    f'acc={train_metrics["per_action_accuracy"].get(action_name, 0.0):.4f} '
                     f'prec={train_metrics["per_action_precision"].get(action_name, 0.0):.4f} '
                     f'recall={train_metrics["per_action_recall"].get(action_name, 0.0):.4f} '
+                    f'f1={train_metrics["per_action_f1"].get(action_name, 0.0):.4f} '
                     f'pred_pos={train_metrics["per_action_pred_positive_rate"].get(action_name, 0.0):.4f} '
                     f'tgt_pos={train_metrics["per_action_target_positive_rate"].get(action_name, 0.0):.4f}'
                 )
+            print(f'Chunk exact match: train={train_metrics["chunk_exact_match"]:.4f} val={val_metrics["chunk_exact_match"]:.4f}')
 
             train_coverage = build_coverage_summary(train_metrics, train_expected_counts)
             val_coverage = build_coverage_summary(val_metrics, val_expected_counts)
@@ -856,8 +882,10 @@ def main() -> int:
                         'per_action_accuracy': train_metrics['per_action_accuracy'],
                         'per_action_precision': train_metrics['per_action_precision'],
                         'per_action_recall': train_metrics['per_action_recall'],
+                        'per_action_f1': train_metrics['per_action_f1'],
                         'per_action_pred_positive_rate': train_metrics['per_action_pred_positive_rate'],
                         'per_action_target_positive_rate': train_metrics['per_action_target_positive_rate'],
+                        'chunk_exact_match': train_metrics['chunk_exact_match'],
                         'coverage': train_coverage,
                     },
                     'val': {
@@ -867,8 +895,10 @@ def main() -> int:
                         'per_action_accuracy': val_metrics['per_action_accuracy'],
                         'per_action_precision': val_metrics['per_action_precision'],
                         'per_action_recall': val_metrics['per_action_recall'],
+                        'per_action_f1': val_metrics['per_action_f1'],
                         'per_action_pred_positive_rate': val_metrics['per_action_pred_positive_rate'],
                         'per_action_target_positive_rate': val_metrics['per_action_target_positive_rate'],
+                        'chunk_exact_match': val_metrics['chunk_exact_match'],
                         'coverage': val_coverage,
                     },
                 },

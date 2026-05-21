@@ -24,9 +24,16 @@ class MovementGRUTests(unittest.TestCase):
         if not torch_available():
             self.skipTest("PyTorch not available")
         model = MovementGRU(input_dim=37, action_dim=7, chunk_len=8, hidden_dim=32, num_layers=2, dropout=0.1)
-        x = torch.zeros((4, 16, 37), dtype=torch.float32)
+        x = torch.zeros((2, 16, 37), dtype=torch.float32)
         logits = model(x)
-        self.assertEqual(tuple(logits.shape), (4, 8, 7))
+        self.assertEqual(tuple(logits.shape), (2, 8, 7))
+
+    def test_movement_gru_invalid_shape_gives_clear_error(self):
+        if not torch_available():
+            self.skipTest("PyTorch not available")
+        model = MovementGRU(input_dim=37, action_dim=7, chunk_len=8, hidden_dim=32, num_layers=2, dropout=0.1)
+        with self.assertRaisesRegex(ValueError, "expects input with shape"):
+            model(torch.zeros((16, 37), dtype=torch.float32))
 
     def test_build_model_keeps_decision_dqn_available(self):
         if not torch_available():

@@ -69,6 +69,7 @@ class NeuralAIPipeline:
         self._full_ready_logged = False
         self._debug_step_counter = 0
         self._last_vision_signature: tuple[float, ...] | None = None
+        self.movement_threshold = 0.5
 
     def get_module_readiness(self) -> dict[str, dict[str, int | bool]]:
         readiness: dict[str, dict[str, int | bool]] = {}
@@ -154,19 +155,18 @@ class NeuralAIPipeline:
         movement_sequence = self._build_sequence('movement', game_state)
         movement_features = torch.tensor(self.movement_extractor.extract(movement_sequence), dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
-            movement_logits = self.movement_model(movement_features)
-            # movement_logits is [1, SeqLen, 6], we only need the last timestep
-            movement_logits = movement_logits[:, -1, :].squeeze(0)
+            movement_output = self.movement_model(movement_features)
+            movement_logits = self._normalize_movement_outputs(movement_output, movement_features).squeeze(0)
             
         binary_probs = torch.sigmoid(movement_logits)
-        
-        # parse binary logits [FORWARD, BACK, LEFT, RIGHT, WALK, ducking]
-        forward = bool(binary_probs[0] > 0.5)
-        back = bool(binary_probs[1] > 0.5)
-        left = bool(binary_probs[2] > 0.5)
-        right = bool(binary_probs[3] > 0.5)
-        walk = bool(binary_probs[4] > 0.5)
-        ducking = bool(binary_probs[5] > 0.5)
+
+        forward = bool(binary_probs[0] > self.movement_threshold)
+        back = bool(binary_probs[1] > self.movement_threshold)
+        left = bool(binary_probs[2] > self.movement_threshold)
+        right = bool(binary_probs[3] > self.movement_threshold)
+        walk = bool(binary_probs[4] > self.movement_threshold)
+        ducking = bool(binary_probs[5] > self.movement_threshold)
+        should_jump = bool(binary_probs[6] > self.movement_threshold) if int(binary_probs.shape[0]) >= 7 else False
         
         move_dir = [0.0, 0.0]
         if forward: move_dir[0] += 1.0
@@ -178,7 +178,7 @@ class NeuralAIPipeline:
             move_direction=move_dir,
             movement_mode="walk" if walk else "run",
             target_position=None,
-            should_jump=False,
+            should_jump=should_jump,
             should_crouch=ducking
         )
         
@@ -266,6 +266,18 @@ class NeuralAIPipeline:
         shoot = bool(torch.sigmoid(shoot_logits).squeeze(0).item() > 0.5)
         rightclick = bool(torch.sigmoid(rightclick_logits).squeeze(0).item() > 0.5)
         return mouse_delta, shoot, rightclick
+
+    def _normalize_movement_outputs(self, movement_output, movement_features):
+        if movement_output.ndim == 2:
+            return movement_output
+        if movement_output.ndim != 3:
+            raise ValueError(
+                f'Unsupported movement output shape for live inference: {tuple(movement_output.shape)}'
+            )
+        input_seq_len = int(movement_features.shape[1])
+        if int(movement_output.shape[1]) == input_seq_len:
+            return movement_output[:, -1, :]
+        return movement_output[:, 0, :]
 
     def _resolve_prediction_roster(self, game_state: GameState, roster_size: int) -> list[int]:
         sorted_enemies = sorted(game_state.enemies, key=lambda item: int(item.steamid))

@@ -26,6 +26,8 @@ class ActionCoordinator:
             keyboard_inputs.append(InputCommand("keyboard", "SHIFT", True, duration_ms))
         if movement.should_crouch or movement.movement_mode == "crouch":
             keyboard_inputs.append(InputCommand("keyboard", "CTRL", True, duration_ms))
+        if movement.should_jump:
+            keyboard_inputs.append(InputCommand("keyboard", "SPACE", True, duration_ms))
         mouse_inputs.append(InputCommand("mouse", "mouse_move_yaw", float(aim.aim_delta[0]), duration_ms))
         mouse_inputs.append(InputCommand("mouse", "mouse_move_pitch", float(aim.aim_delta[1]), duration_ms))
         if aim.shoot:

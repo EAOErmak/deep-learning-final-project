@@ -21,7 +21,11 @@ import numpy as np
 import pandas as pd
 
 from cs2_ai.dataset.multi_demo_sequence_dataset import MultiDemoSequenceDataset
-from cs2_ai.features.movement_features import MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE, movement_action_names_for_target_mode
+from cs2_ai.features.movement_features import (
+    MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE,
+    movement_action_names_for_target_mode,
+    normalize_movement_target_mode,
+)
 from cs2_ai.ml.training.shape_assertions import assert_shape
 from cs2_ai.ml.training.train_movement import (
     MOVEMENT_MODEL_DECISION_DQN,
@@ -93,7 +97,7 @@ def load_checkpoint(path: Path, device: str) -> dict[str, object]:
 def build_eval_dataset(checkpoint: dict[str, object], config: ReplayEvalConfig) -> MovementSequenceTorchDataset:
     seq_len = int(checkpoint.get('seq_len', 64))
     stride = int(checkpoint.get('stride', 8))
-    target_mode = str(checkpoint.get('target_mode', MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE))
+    target_mode = normalize_movement_target_mode(checkpoint.get('target_mode', MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE))
     chunk_len = int(checkpoint.get('chunk_len', 8))
     base_dataset = MultiDemoSequenceDataset(
         dataset_dir=config.dataset_dir,
@@ -125,20 +129,20 @@ def filter_sample_indices(dataset: MovementSequenceTorchDataset, round_number: i
 
 def build_model_from_checkpoint(checkpoint: dict[str, object], device: str):
     model_name = str(checkpoint.get('movement_model_name') or checkpoint.get('model_type') or MOVEMENT_MODEL_DECISION_DQN)
-    if model_name == 'movement_gru':
+    if model_name in {'movement_gru', 'movement_gru_chunk'}:
         model_name = MOVEMENT_MODEL_GRU
     if model_name == 'decision_dqn_movement':
         model_name = MOVEMENT_MODEL_DECISION_DQN
     input_dim = int(checkpoint['input_dim'])
     action_names = checkpoint.get('action_names')
     if not isinstance(action_names, list) or not action_names:
-        target_mode = str(checkpoint.get('target_mode', MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE))
+        target_mode = normalize_movement_target_mode(checkpoint.get('target_mode', MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE))
         action_names = list(movement_action_names_for_target_mode(target_mode))
     action_dim = int(checkpoint.get('action_dim', len(action_names)))
     chunk_len = int(checkpoint.get('chunk_len', 8))
     hidden_dim = int(checkpoint.get('hidden_dim', 256))
-    gru_num_layers = int(checkpoint.get('gru_num_layers', 2))
-    gru_dropout = float(checkpoint.get('gru_dropout', 0.1))
+    gru_num_layers = int(checkpoint.get('num_layers', checkpoint.get('gru_num_layers', 2)))
+    gru_dropout = float(checkpoint.get('dropout', checkpoint.get('gru_dropout', 0.1)))
     model = build_model(
         model_name=model_name,
         input_dim=input_dim,

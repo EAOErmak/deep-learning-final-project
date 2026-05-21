@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from cs2_ai.ml.models.decision_dqn import DecisionDQN
+from cs2_ai.ml.models.movement_gru import MovementGRU
 from cs2_ai.ml.utils.torch_utils import get_device, set_seed, torch_available
 from cs2_ai.features.feature_contract import validate_checkpoint_schema
 from game_state import GameState
@@ -161,7 +162,7 @@ class FullNeuralRuntimeAgent:
             raise ValueError('neural-pipeline requires --aim-checkpoint, --movement-checkpoint, and --tracker-checkpoint.')
         checkpoints = {
             'aim': self._load_checkpoint(Path(aim_checkpoint), expected_model_type='aim_attention'),
-            'movement': self._load_checkpoint(Path(movement_checkpoint), expected_model_type='decision_dqn_movement'),
+            'movement': self._load_checkpoint(Path(movement_checkpoint), expected_model_type={'decision_dqn_movement', 'movement_gru_chunk', 'movement_gru'}),
             'tracker': self._load_checkpoint(Path(tracker_checkpoint), expected_model_type='enemy_tracker_lstm'),
         }
         if not aim_schema_supports_vision_metadata(checkpoints['aim'].get('feature_schema')):
@@ -184,7 +185,7 @@ class FullNeuralRuntimeAgent:
             input_dim=self.aim_extractor.feature_dim(),
             head_mode=str(checkpoints['aim'].get('aim_head_mode', AIM_HEAD_MODE_LEGACY)),
         ).to(self.device)
-        self.movement_model = DecisionDQN(input_dim=self.movement_extractor.feature_dim(), action_dim=6).to(self.device)
+        self.movement_model = self._build_movement_model(checkpoints['movement']).to(self.device)
         self.tracker_model = EnemyTrackerLSTM(
             input_dim=self.tracker_extractor.feature_dim(),
             hidden_dim=int(checkpoints['tracker'].get('hidden_dim', 128)),
@@ -225,7 +226,7 @@ class FullNeuralRuntimeAgent:
             
         self.logger.info('FullNeuralRuntimeAgent initialized | seq_lens=%s', seq_lens)
 
-    def _load_checkpoint(self, checkpoint_path: Path, expected_model_type: str) -> dict[str, Any]:
+    def _load_checkpoint(self, checkpoint_path: Path, expected_model_type: str | set[str]) -> dict[str, Any]:
         if not checkpoint_path.exists():
             raise FileNotFoundError(f'Checkpoint not found: {checkpoint_path}')
         import torch
@@ -233,11 +234,30 @@ class FullNeuralRuntimeAgent:
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         if not isinstance(checkpoint, dict) or 'model_state_dict' not in checkpoint:
             raise ValueError(f'Unsupported checkpoint format: {checkpoint_path}')
-        if checkpoint.get('model_type') != expected_model_type:
+        expected_types = {expected_model_type} if isinstance(expected_model_type, str) else set(expected_model_type)
+        if checkpoint.get('model_type') not in expected_types:
             raise ValueError(
-                f'Checkpoint {checkpoint_path} has model_type={checkpoint.get("model_type")!r}, expected {expected_model_type!r}.'
+                f'Checkpoint {checkpoint_path} has model_type={checkpoint.get("model_type")!r}, expected one of {sorted(expected_types)!r}.'
             )
         return checkpoint
+
+    def _build_movement_model(self, checkpoint: dict[str, Any]):
+        model_type = str(checkpoint.get('model_type', 'decision_dqn_movement'))
+        action_dim = int(checkpoint.get('action_dim', 6))
+        if model_type in {'movement_gru_chunk', 'movement_gru'}:
+            return MovementGRU(
+                input_dim=self.movement_extractor.feature_dim(),
+                action_dim=action_dim,
+                chunk_len=int(checkpoint.get('chunk_len', 8)),
+                hidden_dim=int(checkpoint.get('hidden_dim', 256)),
+                num_layers=int(checkpoint.get('num_layers', checkpoint.get('gru_num_layers', 2))),
+                dropout=float(checkpoint.get('dropout', checkpoint.get('gru_dropout', 0.1))),
+            )
+        return DecisionDQN(
+            input_dim=self.movement_extractor.feature_dim(),
+            action_dim=action_dim,
+            hidden_dim=int(checkpoint.get('hidden_dim', 256)),
+        )
 
     def predict_state(self, game_state: GameState, _features: dict[str, float | int | bool] | None = None) -> ActionDict:
         from runtime_agent import PipelineRuntimeAgent

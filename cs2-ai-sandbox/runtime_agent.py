@@ -158,6 +158,8 @@ class PipelineRuntimeAgent:
                 action['walk'] = True
             elif command.command == 'CTRL':
                 action['crouch'] = True
+            elif command.command == 'SPACE':
+                action['jump'] = True
         for command in action_plan.mouse_inputs:
             if command.command == 'mouse_move_yaw':
                 action['mouse_dx'] = int(round(float(command.value)))

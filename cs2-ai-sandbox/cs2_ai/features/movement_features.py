@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pandas as pd
 
@@ -10,7 +12,8 @@ from cs2_ai.schemas.game_state import GameState
 from cs2_ai.schemas.module_outputs import BeliefStateData, DecisionOutput
 
 
-MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE = "next_tick_sequence"
+MOVEMENT_TARGET_MODE_NEXT_TICK = "next_tick"
+MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE = MOVEMENT_TARGET_MODE_NEXT_TICK
 MOVEMENT_TARGET_MODE_ACTION_CHUNK = "action_chunk"
 
 MOVEMENT_FEATURE_NAMES = (
@@ -72,6 +75,9 @@ JUMP_COLUMNS = (
     "usercmd_jump",
     "jump_pressed",
 )
+
+logger = logging.getLogger(__name__)
+_missing_jump_warning_emitted = False
 
 
 class MovementFeatureExtractor:
@@ -135,10 +141,20 @@ class MovementFeatureExtractor:
 
 
 def movement_action_names_for_target_mode(target_mode: str) -> tuple[str, ...]:
+    target_mode = normalize_movement_target_mode(target_mode)
     if target_mode == MOVEMENT_TARGET_MODE_ACTION_CHUNK:
         return MOVEMENT_ACTION_CHUNK_NAMES
     if target_mode == MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE:
         return MOVEMENT_ACTION_NAMES
+    raise ValueError(f"Unsupported movement target mode: {target_mode}")
+
+
+def normalize_movement_target_mode(target_mode: str | None) -> str:
+    normalized = str(target_mode or MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE).strip().lower()
+    if normalized in {MOVEMENT_TARGET_MODE_NEXT_TICK, "next_tick_sequence"}:
+        return MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE
+    if normalized == MOVEMENT_TARGET_MODE_ACTION_CHUNK:
+        return MOVEMENT_TARGET_MODE_ACTION_CHUNK
     raise ValueError(f"Unsupported movement target mode: {target_mode}")
 
 
@@ -175,6 +191,7 @@ def build_movement_target_from_tick_rows(tick_rows: pd.DataFrame, perspective_st
 
 
 def extract_jump_target_from_tick_rows(tick_rows: pd.DataFrame, perspective_steamid: int) -> float:
+    global _missing_jump_warning_emitted
     if tick_rows.empty or "steamid" not in tick_rows.columns:
         return 0.0
     steamids = pd.to_numeric(tick_rows["steamid"], errors="coerce")
@@ -189,6 +206,12 @@ def extract_jump_target_from_tick_rows(tick_rows: pd.DataFrame, perspective_stea
     buttons_value = self_row.get("buttons")
     if isinstance(buttons_value, str) and "jump" in buttons_value.lower():
         return 1.0
+    if not _missing_jump_warning_emitted:
+        _missing_jump_warning_emitted = True
+        logger.warning(
+            "Movement jump target is missing explicit jump/button fields for at least one sample. "
+            "Falling back to 0.0 for jump."
+        )
     return 0.0
 
 

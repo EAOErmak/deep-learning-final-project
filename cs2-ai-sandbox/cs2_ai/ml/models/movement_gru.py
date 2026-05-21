@@ -11,8 +11,8 @@ if torch_available():
         def __init__(
             self,
             input_dim: int,
-            action_dim: int,
-            chunk_len: int,
+            action_dim: int = 7,
+            chunk_len: int = 8,
             hidden_dim: int = 256,
             num_layers: int = 2,
             dropout: float = 0.1,
@@ -40,8 +40,16 @@ if torch_available():
             )
 
         def forward(self, x):
-            output, hidden = self.gru(x)
-            last_hidden = hidden[-1]
+            if x.ndim != 3:
+                raise ValueError(
+                    f"MovementGRU expects input with shape [batch, seq_len, input_dim], got {tuple(x.shape)}."
+                )
+            if int(x.shape[-1]) != self.input_dim:
+                raise ValueError(
+                    f"MovementGRU expected input_dim={self.input_dim}, got last dimension={int(x.shape[-1])}."
+                )
+            output, _hidden = self.gru(x)
+            last_hidden = output[:, -1, :]
             logits = self.head(last_hidden)
             return logits.view(x.size(0), self.chunk_len, self.action_dim)
 else:

@@ -267,6 +267,57 @@ CSV содержит:
 - хорошему `accuracy`, но плохому `recall`
 - длинным участкам в PNG, где target меняется, а prediction остается плоским
 
+## MovementGRU action chunk training
+
+Для temporal movement imitation теперь поддерживается отдельная модель `MovementGRU`, которая принимает:
+
+- `features`: `[batch, seq_len, feature_dim]`
+- `targets`: `[batch, chunk_len, 7]`
+- `logits`: `[batch, chunk_len, 7]`
+
+Порядок actions:
+- `forward`
+- `back`
+- `left`
+- `right`
+- `walk`
+- `crouch`
+- `jump`
+
+Пример train запуска:
+
+```powershell
+python -m cs2_ai.ml.training.train_movement `
+  --model movement_gru `
+  --target-mode action_chunk `
+  --chunk-len 8 `
+  --seq-len 32 `
+  --epochs 5 `
+  --save-path checkpoints/movement_gru_chunk.pt
+```
+
+Старый movement path остается доступен:
+
+```powershell
+python -m cs2_ai.ml.training.train_movement `
+  --model decision_dqn `
+  --target-mode next_tick `
+  --save-path checkpoints/movement_dqn.pt
+```
+
+Пример runtime:
+
+```powershell
+python main.py `
+  --state-source gsi `
+  --agent-mode neural-pipeline `
+  --aim-checkpoint checkpoints/aim_vision_like.pt `
+  --movement-checkpoint checkpoints/movement_gru_chunk.pt `
+  --tracker-checkpoint checkpoints/enemy_tracker_stream.pt `
+  --yolo-weights weights/yolov10s_cs2.pt `
+  --min-live-readiness spatial
+```
+
 ## Training reports
 
 После train/eval запусков offline trainers сохраняют experiment reports в:
