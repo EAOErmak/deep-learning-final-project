@@ -146,12 +146,12 @@ class FullNeuralRuntimeAgent:
             raise RuntimeError('PyTorch is not available.')
 
         import torch
-        from cs2_ai.ml.models.aim_attention import AimAttentionModel
+        from cs2_ai.ml.models.aim_attention import AIM_HEAD_MODE_LEGACY, AimAttentionModel
         from cs2_ai.ml.models.enemy_tracker_lstm import EnemyTrackerLSTM
         from cs2_ai.pipeline.neural_ai_pipeline import NeuralAIPipeline
         from cs2_ai.features.enemy_tracker_features import EnemyTrackerFeatureExtractor
         from cs2_ai.features.movement_features import MovementFeatureExtractor
-        from cs2_ai.features.aim_features import AimFeatureExtractor
+        from cs2_ai.features.aim_features import AIM_FEATURE_MODE_VISION_LIKE, AimFeatureExtractor, aim_schema_supports_vision_metadata
         from cs2_ai.config import MAX_ENEMIES
 
         set_seed(seed)
@@ -164,6 +164,8 @@ class FullNeuralRuntimeAgent:
             'movement': self._load_checkpoint(Path(movement_checkpoint), expected_model_type='decision_dqn_movement'),
             'tracker': self._load_checkpoint(Path(tracker_checkpoint), expected_model_type='enemy_tracker_lstm'),
         }
+        if not aim_schema_supports_vision_metadata(checkpoints['aim'].get('feature_schema')):
+            raise ValueError('Aim checkpoint was trained without vision features; retrain aim model with vision-enabled schema.')
         seq_lens = {name: int(checkpoint['feature_schema']['seq_len']) for name, checkpoint in checkpoints.items()}
         self.logger.info(
             'Loaded neural pipeline seq_len metadata | aim=%s movement=%s tracker=%s',
@@ -171,16 +173,26 @@ class FullNeuralRuntimeAgent:
             seq_lens['movement'],
             seq_lens['tracker'],
         )
-        self.aim_extractor = AimFeatureExtractor(seq_len=seq_lens['aim'])
+        self.aim_extractor = AimFeatureExtractor(seq_len=seq_lens['aim'], feature_mode=AIM_FEATURE_MODE_VISION_LIKE)
         self.movement_extractor = MovementFeatureExtractor(seq_len=seq_lens['movement'])
         self.tracker_extractor = EnemyTrackerFeatureExtractor(seq_len=seq_lens['tracker'])
         validate_checkpoint_schema(checkpoints['aim'], self.aim_extractor.schema(), str(aim_checkpoint))
         validate_checkpoint_schema(checkpoints['movement'], self.movement_extractor.schema(), str(movement_checkpoint))
         validate_checkpoint_schema(checkpoints['tracker'], self.tracker_extractor.schema(), str(tracker_checkpoint))
 
-        self.aim_model = AimAttentionModel(input_dim=self.aim_extractor.feature_dim()).to(self.device)
+        self.aim_model = AimAttentionModel(
+            input_dim=self.aim_extractor.feature_dim(),
+            head_mode=str(checkpoints['aim'].get('aim_head_mode', AIM_HEAD_MODE_LEGACY)),
+        ).to(self.device)
         self.movement_model = DecisionDQN(input_dim=self.movement_extractor.feature_dim(), action_dim=6).to(self.device)
-        self.tracker_model = EnemyTrackerLSTM(input_dim=self.tracker_extractor.feature_dim(), output_enemies=MAX_ENEMIES).to(self.device)
+        self.tracker_model = EnemyTrackerLSTM(
+            input_dim=self.tracker_extractor.feature_dim(),
+            hidden_dim=int(checkpoints['tracker'].get('hidden_dim', 128)),
+            num_layers=int(checkpoints['tracker'].get('num_layers', 2)),
+            output_enemies=int(checkpoints['tracker'].get('output_enemies', MAX_ENEMIES)),
+            dropout=float(checkpoints['tracker'].get('dropout', 0.1)),
+            output_mode=str(checkpoints['tracker'].get('output_mode', 'each_tick')),
+        ).to(self.device)
         self.aim_model.load_state_dict(checkpoints['aim']['model_state_dict'])
         self.movement_model.load_state_dict(checkpoints['movement']['model_state_dict'])
         self.tracker_model.load_state_dict(checkpoints['tracker']['model_state_dict'])
@@ -206,6 +218,10 @@ class FullNeuralRuntimeAgent:
             self.vision_module.start()
         else:
             self.vision_module = None
+            if yolo_weights:
+                self.logger.warning('YOLO weights path not found or unavailable: %s', yolo_weights)
+            else:
+                self.logger.warning('YOLO vision disabled: aim runtime will receive vision_target=None and suppress live firing.')
             
         self.logger.info('FullNeuralRuntimeAgent initialized | seq_lens=%s', seq_lens)
 
@@ -232,11 +248,13 @@ class FullNeuralRuntimeAgent:
         ai_state = self.runtime_adapter.to_ai_game_state(game_state)
         
         vision_target = None
-        if self.vision_module:
+        if self.vision_module and getattr(self.vision_module, 'is_running', False):
             controlled = game_state.controlled_player
             team_name = (controlled.team or '') if controlled is not None else ''
             self.vision_module.update_context(team_name)
             vision_target = self.vision_module.get_latest_target()
+        elif self.vision_module:
+            self.logger.debug('Vision module exists but is not running; aim will use vision_target=None.')
             
         action_plan = self.pipeline.step(ai_state, vision_target=vision_target)
         action = self.runtime_adapter.action_plan_to_action_dict(action_plan)

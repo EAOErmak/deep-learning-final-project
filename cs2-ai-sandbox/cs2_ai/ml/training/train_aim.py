@@ -16,9 +16,19 @@ import numpy as np
 from torch.utils.data import DataLoader, Dataset
 
 from cs2_ai.dataset.multi_demo_sequence_dataset import MultiDemoSequenceDataset, split_dataset_by_group
-from cs2_ai.features.aim_features import AimFeatureExtractor, build_aim_target
+from cs2_ai.features.aim_features import (
+    AIM_BINARY_ACTION_NAMES,
+    AIM_FEATURE_MODE_DEMO_PROJECTED,
+    AIM_FEATURE_MODE_VISION_LIKE,
+    AimFeatureExtractor,
+    AimStructuredTarget,
+    build_aim_structured_target,
+    build_demo_projected_vision_target,
+)
 from cs2_ai.features.feature_contract import FeatureSchema
-from cs2_ai.ml.models.aim_attention import AimAttentionModel
+from cs2_ai.ml.models.aim_attention import AIM_HEAD_MODE_LEGACY, AIM_HEAD_MODE_MULTI_HEAD, AimAttentionModel
+from cs2_ai.ml.reporting import build_base_training_report, write_training_report
+from cs2_ai.ml.training.shape_assertions import assert_shape, assert_temporal_features
 from cs2_ai.ml.utils.tensorboard_utils import close_summary_writer, create_summary_writer, log_scalar_dict, tensorboard_available
 from cs2_ai.ml.utils.torch_utils import build_dataloader_kwargs, configure_torch_runtime, get_device, set_seed, torch_available
 
@@ -30,23 +40,24 @@ else:
     F = None
 
 
+AIM_METRIC_DICT_KEYS = {
+    'seen_sample_ids',
+    'per_demo_loss',
+    'per_demo_seen_counts',
+    'fire_precision',
+    'fire_recall',
+    'fire_f1',
+}
+
+
 @dataclass(slots=True)
 class AimTrainingBatch:
     features: 'torch.Tensor'
-    targets: 'torch.Tensor'
-    visible_enemy_mask: 'torch.Tensor'
+    aim_delta_targets: 'torch.Tensor'
+    binary_action_targets: 'torch.Tensor'
+    valid_aim_mask: 'torch.Tensor'
     sample_ids: list[str]
     demo_names: list[str]
-
-
-@dataclass(slots=True)
-class AimBaselinePrior:
-    mouse_mean: np.ndarray
-    fire_prob: float
-    rightclick_prob: float
-
-
-AIM_TARGET_EPS = 1e-6
 
 
 def get_base_dataset_and_index(dataset: Any, idx: int) -> tuple[Any, int]:
@@ -59,10 +70,23 @@ def get_base_dataset_and_index(dataset: Any, idx: int) -> tuple[Any, int]:
 
 
 class AimSequenceTorchDataset(Dataset):
-    def __init__(self, base_dataset, seq_len: int, require_spotted_enemy: bool = True):
+    def __init__(
+        self,
+        base_dataset,
+        seq_len: int,
+        require_spotted_enemy: bool = True,
+        feature_mode: str = AIM_FEATURE_MODE_DEMO_PROJECTED,
+        vision_dropout_prob: float = 0.15,
+        vision_noise_std: float = 0.03,
+        vision_confidence_jitter: float = 0.1,
+    ):
         self.base_dataset = base_dataset
-        self.feature_extractor = AimFeatureExtractor(seq_len=seq_len)
+        self.feature_extractor = AimFeatureExtractor(seq_len=seq_len, feature_mode=feature_mode)
         self.require_spotted_enemy = require_spotted_enemy
+        self.feature_mode = feature_mode
+        self.vision_dropout_prob = float(max(0.0, min(1.0, vision_dropout_prob)))
+        self.vision_noise_std = float(max(0.0, vision_noise_std))
+        self.vision_confidence_jitter = float(max(0.0, vision_confidence_jitter))
         self.valid_indices = self._build_valid_indices()
 
     def __len__(self) -> int:
@@ -76,7 +100,6 @@ class AimSequenceTorchDataset(Dataset):
     def _build_valid_indices(self) -> list[int]:
         if not self.require_spotted_enemy:
             return list(range(len(self.base_dataset)))
-
         valid_indices: list[int] = []
         for idx in range(len(self.base_dataset)):
             sample_metadata = self.get_base_sample_metadata(idx)
@@ -103,7 +126,7 @@ class AimSequenceTorchDataset(Dataset):
                 return True
         return False
 
-    def build_target(self, idx: int | None = None, sample_metadata: dict[str, object] | None = None) -> np.ndarray:
+    def build_target(self, idx: int | None = None, sample_metadata: dict[str, object] | None = None) -> AimStructuredTarget:
         if sample_metadata is None:
             if idx is None:
                 raise ValueError('Either idx or sample_metadata must be provided')
@@ -120,28 +143,67 @@ class AimSequenceTorchDataset(Dataset):
             next_state = ds.build_state_for_sample_tick(sample_metadata, target_tick + 1)
         except Exception:
             next_state = target_state
-        return build_aim_target(target_state, next_state).astype(np.float32)
+        return build_aim_structured_target(target_state, next_state)
 
-    def __getitem__(self, idx: int) -> tuple[np.ndarray, np.ndarray, dict[str, str]]:
+    def __getitem__(self, idx: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, str]]:
         base_idx = self.valid_indices[idx]
         sequence_sample = self.base_dataset[base_idx]
-        features = self.feature_extractor.extract(sequence_sample.sequence)
         sample_metadata = self.get_sample_metadata(idx)
+        vision_target = self._build_training_vision_target(sequence_sample.sequence)
+        features = self.feature_extractor.extract(sequence_sample.sequence, vision_target=vision_target)
         target = self.build_target(sample_metadata=sample_metadata)
-        visible_enemy_mask = np.asarray([1.0 if self.sample_has_spotted_enemy(sample_metadata) else 0.0], dtype=np.float32)
+        assert_shape(features, (len(sample_metadata['tick_indices']), self.feature_extractor.feature_dim()), 'aim sample features')
+        assert_shape(target.aim_delta, (4,), 'aim sample aim_delta')
+        assert_shape(target.binary_actions, (3,), 'aim sample binary_actions')
+        assert_shape(target.valid_aim_mask, (1,), 'aim sample valid_aim_mask')
         meta = {
             'sample_id': str(sample_metadata['sample_id']),
             'demo_name': str(sample_metadata['demo_name']),
         }
-        return features.astype(np.float32), target.astype(np.float32), visible_enemy_mask, meta
+        return (
+            features.astype(np.float32),
+            target.aim_delta.astype(np.float32),
+            target.binary_actions.astype(np.float32),
+            target.valid_aim_mask.astype(np.float32),
+            meta,
+        )
+
+    def _build_training_vision_target(self, sequence) -> object | None:
+        if self.feature_mode != AIM_FEATURE_MODE_VISION_LIKE:
+            return None
+        synthetic_target = build_demo_projected_vision_target(sequence.states[-1])
+        if synthetic_target is None:
+            return None
+        if np.random.random() < self.vision_dropout_prob:
+            return None
+        synthetic_target.screen_dx = float(synthetic_target.screen_dx + np.random.normal(0.0, self.vision_noise_std))
+        synthetic_target.screen_dy = float(synthetic_target.screen_dy + np.random.normal(0.0, self.vision_noise_std))
+        synthetic_target.confidence = float(np.clip(synthetic_target.confidence + np.random.uniform(-self.vision_confidence_jitter, self.vision_confidence_jitter), 0.0, 1.0))
+        return synthetic_target
 
 
 class AimTrainer:
-    def __init__(self, model: 'torch.nn.Module', device: str, learning_rate: float, log_interval: int = 100):
+    def __init__(
+        self,
+        model: 'torch.nn.Module',
+        device: str,
+        learning_rate: float,
+        head_mode: str,
+        aim_weight: float = 1.0,
+        binary_weight: float = 1.0,
+        confidence_weight: float = 0.25,
+        log_interval: int = 100,
+        binary_pos_weight: 'torch.Tensor | None' = None,
+    ):
         self.model = model
         self.device = device
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
+        self.head_mode = head_mode
+        self.aim_weight = float(aim_weight)
+        self.binary_weight = float(binary_weight)
+        self.confidence_weight = float(confidence_weight)
         self.log_interval = log_interval
+        self.binary_pos_weight = binary_pos_weight.to(device) if binary_pos_weight is not None else None
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=learning_rate)
 
     def train_epoch(self, loader: DataLoader, epoch: int, writer: Any | None = None) -> dict[str, object]:
         self.model.train()
@@ -155,10 +217,8 @@ class AimTrainer:
     def _run_epoch(self, loader: DataLoader, training: bool, epoch: int, writer: Any | None = None) -> dict[str, object]:
         total_loss = 0.0
         total_aim_loss = 0.0
-        total_shoot_bce = 0.0
-        total_rightclick_bce = 0.0
-        total_active_aim_loss = 0.0
-        total_active_aim_samples = 0
+        total_binary_loss = 0.0
+        total_confidence_loss = 0.0
         total_samples = 0
         total_batches = len(loader)
         phase_name = 'Train' if training else 'Val'
@@ -167,6 +227,14 @@ class AimTrainer:
         seen_sample_ids: set[str] = set()
         seen_demo_sample_ids: dict[str, set[str]] = {}
         first_batch_loaded = False
+        fire_tp = 0.0
+        fire_fp = 0.0
+        fire_fn = 0.0
+        pred_fire_sum = 0.0
+        target_fire_sum = 0.0
+        valid_sum = 0.0
+        mouse_abs_sum = np.zeros(2, dtype=np.float64)
+        angle_abs_sum = np.zeros(2, dtype=np.float64)
 
         print(f'{phase_name} epoch {epoch} | Preparing first batch...')
 
@@ -175,20 +243,33 @@ class AimTrainer:
                 print(f'{phase_name} epoch {epoch} | First batch loaded.')
                 first_batch_loaded = True
             batch = self._to_training_batch(batch)
-            aim_delta, shoot_logits, rightclick_logits = self.model(batch.features)
-            mouse_targets = batch.targets[:, 5:7]
-            fire_targets = batch.targets[:, 2].unsqueeze(1)
-            rightclick_targets = batch.targets[:, 3].unsqueeze(1)
+            outputs = self.model(batch.features)
+            regression_pred, binary_logits, confidence_logits = self._normalize_model_outputs(outputs)
 
-            aim_loss_raw = F.mse_loss(torch.tanh(aim_delta), mouse_targets, reduction='none')
-            shoot_loss_raw = F.binary_cross_entropy_with_logits(shoot_logits, fire_targets, reduction='none')
-            rightclick_loss_raw = F.binary_cross_entropy_with_logits(rightclick_logits, rightclick_targets, reduction='none')
-            aim_loss_per_sample = aim_loss_raw.mean(dim=1)
-            shoot_bce_per_sample = shoot_loss_raw.squeeze(1)
-            rightclick_bce_per_sample = rightclick_loss_raw.squeeze(1)
-            loss_per_sample = aim_loss_per_sample + shoot_bce_per_sample + rightclick_bce_per_sample
+            regression_targets = batch.aim_delta_targets[:, 2:4] if self.head_mode == AIM_HEAD_MODE_LEGACY else batch.aim_delta_targets
+            regression_mask = batch.valid_aim_mask.expand(-1, regression_targets.shape[1])
+            aim_loss_raw = F.smooth_l1_loss(regression_pred, regression_targets, reduction='none')
+            aim_loss_per_sample = self._masked_mean(aim_loss_raw, regression_mask)
+
+            binary_loss_raw = F.binary_cross_entropy_with_logits(
+                binary_logits,
+                batch.binary_action_targets[:, :binary_logits.shape[1]],
+                reduction='none',
+                pos_weight=self.binary_pos_weight[:binary_logits.shape[1]] if self.binary_pos_weight is not None else None,
+            )
+            binary_loss_per_sample = binary_loss_raw.mean(dim=1)
+
+            confidence_loss_per_sample = torch.zeros_like(aim_loss_per_sample)
+            if confidence_logits is not None:
+                confidence_loss_raw = F.binary_cross_entropy_with_logits(confidence_logits, batch.valid_aim_mask, reduction='none')
+                confidence_loss_per_sample = confidence_loss_raw.squeeze(1)
+
+            loss_per_sample = (
+                aim_loss_per_sample * self.aim_weight
+                + binary_loss_per_sample * self.binary_weight
+                + confidence_loss_per_sample * self.confidence_weight
+            )
             loss = loss_per_sample.mean()
-            active_aim_mask = torch.any(torch.abs(mouse_targets) > AIM_TARGET_EPS, dim=1) & (batch.visible_enemy_mask.squeeze(1) > 0.5)
 
             if training:
                 self.optimizer.zero_grad(set_to_none=True)
@@ -200,21 +281,39 @@ class AimTrainer:
             total_samples += batch_size
             total_loss += float(loss_per_sample.sum().item())
             total_aim_loss += float(aim_loss_per_sample.sum().item())
-            total_shoot_bce += float(shoot_bce_per_sample.sum().item())
-            total_rightclick_bce += float(rightclick_bce_per_sample.sum().item())
-            if torch.any(active_aim_mask):
-                total_active_aim_loss += float(aim_loss_per_sample[active_aim_mask].sum().item())
-                total_active_aim_samples += int(active_aim_mask.sum().item())
+            total_binary_loss += float(binary_loss_per_sample.sum().item())
+            total_confidence_loss += float(confidence_loss_per_sample.sum().item())
+
+            fire_probs = torch.sigmoid(binary_logits[:, 0])
+            fire_pred = (fire_probs > 0.5).to(dtype=batch.binary_action_targets.dtype)
+            fire_target = batch.binary_action_targets[:, 0]
+            fire_tp += float((fire_pred * fire_target).sum().item())
+            fire_fp += float((fire_pred * (1.0 - fire_target)).sum().item())
+            fire_fn += float(((1.0 - fire_pred) * fire_target).sum().item())
+            pred_fire_sum += float(fire_pred.sum().item())
+            target_fire_sum += float(fire_target.sum().item())
+
+            valid_mask_bool = batch.valid_aim_mask.squeeze(1) > 0.5
+            valid_sum += float(valid_mask_bool.sum().item())
+            if torch.any(valid_mask_bool):
+                if self.head_mode == AIM_HEAD_MODE_MULTI_HEAD:
+                    mouse_abs_sum += np.abs(
+                        (regression_pred[valid_mask_bool, 2:4] - batch.aim_delta_targets[valid_mask_bool, 2:4]).detach().cpu().numpy()
+                    ).sum(axis=0)
+                    angle_abs_sum += np.abs(
+                        (regression_pred[valid_mask_bool, 0:2] - batch.aim_delta_targets[valid_mask_bool, 0:2]).detach().cpu().numpy()
+                    ).sum(axis=0)
+                else:
+                    mouse_abs_sum += np.abs(
+                        (regression_pred[valid_mask_bool, 0:2] - batch.aim_delta_targets[valid_mask_bool, 2:4]).detach().cpu().numpy()
+                    ).sum(axis=0)
 
             if training and writer is not None:
                 global_step = (epoch - 1) * total_batches + batch_idx
                 writer.add_scalar('train/loss_step', loss.item(), global_step)
                 writer.add_scalar('train/aim_loss_step', aim_loss_per_sample.mean().item(), global_step)
-                writer.add_scalar('train/shoot_bce_step', shoot_bce_per_sample.mean().item(), global_step)
-                writer.add_scalar('train/rightclick_bce_step', rightclick_bce_per_sample.mean().item(), global_step)
-                writer.add_scalar('train/active_aim_rate_step', active_aim_mask.float().mean().item(), global_step)
-                if torch.any(active_aim_mask):
-                    writer.add_scalar('train/active_aim_loss_step', aim_loss_per_sample[active_aim_mask].mean().item(), global_step)
+                writer.add_scalar('train/binary_loss_step', binary_loss_per_sample.mean().item(), global_step)
+                writer.add_scalar('train/confidence_loss_step', confidence_loss_per_sample.mean().item(), global_step)
                 if batch_idx % 10 == 0:
                     writer.flush()
 
@@ -233,37 +332,106 @@ class AimTrainer:
                 print(f'{phase_name} epoch {epoch} | Batch {batch_idx + 1}/{total_batches} | Loss: {loss.item():.4f} | Seen: {len(seen_sample_ids)}')
 
         if total_samples == 0:
-            return {'loss': 0.0, 'aim_loss': 0.0, 'shoot_bce': 0.0, 'rightclick_bce': 0.0, 'active_aim_loss': 0.0, 'active_aim_rate': 0.0, 'seen_sample_ids': set(), 'per_demo_loss': {}, 'per_demo_seen_counts': {}}
+            return self._empty_metrics()
 
+        fire_precision = float(fire_tp / max(fire_tp + fire_fp, 1.0))
+        fire_recall = float(fire_tp / max(fire_tp + fire_fn, 1.0))
+        fire_f1 = float((2.0 * fire_precision * fire_recall) / max(fire_precision + fire_recall, 1e-8))
+        metric_count = max(valid_sum, 1.0)
         return {
             'loss': total_loss / total_samples,
             'aim_loss': total_aim_loss / total_samples,
-            'shoot_bce': total_shoot_bce / total_samples,
-            'rightclick_bce': total_rightclick_bce / total_samples,
-            'active_aim_loss': (total_active_aim_loss / total_active_aim_samples) if total_active_aim_samples else 0.0,
-            'active_aim_rate': float(total_active_aim_samples / total_samples),
+            'binary_loss': total_binary_loss / total_samples,
+            'confidence_loss': total_confidence_loss / total_samples,
+            'mouse_dx_mae': float(mouse_abs_sum[0] / metric_count),
+            'mouse_dy_mae': float(mouse_abs_sum[1] / metric_count),
+            'mean_angular_error': float(angle_abs_sum.mean() / metric_count) if self.head_mode == AIM_HEAD_MODE_MULTI_HEAD else 0.0,
+            'fire_precision': {'fire': fire_precision},
+            'fire_recall': {'fire': fire_recall},
+            'fire_f1': {'fire': fire_f1},
+            'predicted_fire_rate': float(pred_fire_sum / total_samples),
+            'target_fire_rate': float(target_fire_sum / total_samples),
+            'valid_aim_rate': float(valid_sum / total_samples),
             'seen_sample_ids': seen_sample_ids,
             'per_demo_loss': {demo: per_demo_sum[demo] / per_demo_count[demo] for demo in sorted(per_demo_sum)},
             'per_demo_seen_counts': {demo: len(ids) for demo, ids in sorted(seen_demo_sample_ids.items())},
         }
 
-    def _to_training_batch(self, batch: tuple['torch.Tensor', 'torch.Tensor', 'torch.Tensor', list[dict[str, str]]]) -> AimTrainingBatch:
-        features, targets, visible_enemy_mask, metas = batch
+    def _empty_metrics(self) -> dict[str, object]:
+        return {
+            'loss': 0.0,
+            'aim_loss': 0.0,
+            'binary_loss': 0.0,
+            'confidence_loss': 0.0,
+            'mouse_dx_mae': 0.0,
+            'mouse_dy_mae': 0.0,
+            'mean_angular_error': 0.0,
+            'fire_precision': {'fire': 0.0},
+            'fire_recall': {'fire': 0.0},
+            'fire_f1': {'fire': 0.0},
+            'predicted_fire_rate': 0.0,
+            'target_fire_rate': 0.0,
+            'valid_aim_rate': 0.0,
+            'seen_sample_ids': set(),
+            'per_demo_loss': {},
+            'per_demo_seen_counts': {},
+        }
+
+    def _normalize_model_outputs(self, outputs):
+        if self.head_mode == AIM_HEAD_MODE_MULTI_HEAD:
+            aim_delta, binary_logits, confidence_logits = outputs
+            assert_shape(aim_delta, (None, 4), 'aim multi_head regression output')
+            assert_shape(binary_logits, (None, 3), 'aim multi_head binary output')
+            assert_shape(confidence_logits, (None, 1), 'aim multi_head confidence output')
+            return aim_delta, binary_logits, confidence_logits
+        aim_delta, shoot_logits, rightclick_logits = outputs
+        binary_logits = torch.cat([shoot_logits, rightclick_logits], dim=1)
+        assert_shape(aim_delta, (None, 2), 'aim legacy regression output')
+        assert_shape(binary_logits, (None, 2), 'aim legacy binary output')
+        return aim_delta, binary_logits, None
+
+    def _masked_mean(self, values: 'torch.Tensor', mask: 'torch.Tensor') -> 'torch.Tensor':
+        weighted = values * mask
+        denom = torch.clamp(mask.sum(dim=1), min=1.0)
+        return weighted.sum(dim=1) / denom
+
+    def _to_training_batch(
+        self,
+        batch: tuple['torch.Tensor', 'torch.Tensor', 'torch.Tensor', 'torch.Tensor', list[dict[str, str]]],
+    ) -> AimTrainingBatch:
+        features, aim_delta_targets, binary_action_targets, valid_aim_mask, metas = batch
+        feature_shape = assert_temporal_features(
+            features,
+            seq_len=int(features.shape[1]),
+            feature_dim=self.model.input_dim,
+            name='aim batch features',
+        )
+        assert_shape(aim_delta_targets, (feature_shape[0], 4), 'aim batch aim_delta_targets')
+        assert_shape(binary_action_targets, (feature_shape[0], 3), 'aim batch binary_action_targets')
+        assert_shape(valid_aim_mask, (feature_shape[0], 1), 'aim batch valid_aim_mask')
         return AimTrainingBatch(
             features=features.to(self.device, non_blocking=True),
-            targets=targets.to(self.device, non_blocking=True),
-            visible_enemy_mask=visible_enemy_mask.to(self.device, non_blocking=True),
+            aim_delta_targets=aim_delta_targets.to(self.device, non_blocking=True),
+            binary_action_targets=binary_action_targets.to(self.device, non_blocking=True),
+            valid_aim_mask=valid_aim_mask.to(self.device, non_blocking=True),
             sample_ids=[str(meta['sample_id']) for meta in metas],
             demo_names=[str(meta['demo_name']) for meta in metas],
         )
 
 
-def collate_aim_batch(batch: list[tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, str]]]) -> tuple['torch.Tensor', 'torch.Tensor', 'torch.Tensor', list[dict[str, str]]]:
+def collate_aim_batch(
+    batch: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, str]]]
+) -> tuple['torch.Tensor', 'torch.Tensor', 'torch.Tensor', 'torch.Tensor', list[dict[str, str]]]:
     features = torch.from_numpy(np.stack([item[0] for item in batch]).astype(np.float32, copy=False))
-    targets = torch.from_numpy(np.stack([item[1] for item in batch]).astype(np.float32, copy=False))
-    visible_enemy_mask = torch.from_numpy(np.stack([item[2] for item in batch]).astype(np.float32, copy=False))
-    metas = [item[3] for item in batch]
-    return features, targets, visible_enemy_mask, metas
+    aim_delta_targets = torch.from_numpy(np.stack([item[1] for item in batch]).astype(np.float32, copy=False))
+    binary_action_targets = torch.from_numpy(np.stack([item[2] for item in batch]).astype(np.float32, copy=False))
+    valid_aim_mask = torch.from_numpy(np.stack([item[3] for item in batch]).astype(np.float32, copy=False))
+    batch_size, _, _ = assert_temporal_features(features, seq_len=int(features.shape[1]), feature_dim=int(features.shape[2]), name='aim collated features')
+    assert_shape(aim_delta_targets, (batch_size, 4), 'aim collated aim_delta_targets')
+    assert_shape(binary_action_targets, (batch_size, 3), 'aim collated binary_action_targets')
+    assert_shape(valid_aim_mask, (batch_size, 1), 'aim collated valid_aim_mask')
+    metas = [item[4] for item in batch]
+    return features, aim_delta_targets, binary_action_targets, valid_aim_mask, metas
 
 
 def collect_expected_demo_counts(dataset) -> dict[str, int]:
@@ -281,89 +449,10 @@ def collect_expected_demo_counts(dataset) -> dict[str, int]:
     return counts
 
 
-def resolve_indexed_dataset(dataset) -> tuple[AimSequenceTorchDataset, list[int]]:
-    if hasattr(dataset, 'indices') and hasattr(dataset, 'dataset'):
-        return dataset.dataset, [int(idx) for idx in dataset.indices]
-    return dataset, list(range(len(dataset)))
-
-
-def _iter_aim_targets(dataset):
-    source_dataset, indices = resolve_indexed_dataset(dataset)
-    for idx in indices:
-        sample_metadata = source_dataset.get_sample_metadata(idx)
-        yield source_dataset.build_target(sample_metadata=sample_metadata)
-
-
-def _clip_probability(probability: float) -> float:
-    return float(np.clip(probability, 1e-6, 1.0 - 1e-6))
-
-
-def _binary_cross_entropy_from_probability(target: float, probability: float) -> float:
-    clipped_probability = _clip_probability(probability)
-    return float(-(target * np.log(clipped_probability) + (1.0 - target) * np.log(1.0 - clipped_probability)))
-
-
-def _is_active_mouse_target(mouse_target: np.ndarray) -> bool:
-    return bool(np.any(np.abs(mouse_target) > AIM_TARGET_EPS))
-
-
-def build_aim_baseline_prior(dataset) -> AimBaselinePrior:
-    total_targets = 0
-    mouse_sum = np.zeros(2, dtype=np.float64)
-    fire_sum = 0.0
-    rightclick_sum = 0.0
-
-    for target in _iter_aim_targets(dataset):
-        total_targets += 1
-        mouse_sum += target[5:7]
-        fire_sum += float(target[2])
-        rightclick_sum += float(target[3])
-
-    if total_targets == 0:
-        return AimBaselinePrior(mouse_mean=np.zeros(2, dtype=np.float32), fire_prob=0.5, rightclick_prob=0.5)
-
-    return AimBaselinePrior(
-        mouse_mean=(mouse_sum / total_targets).astype(np.float32),
-        fire_prob=float(fire_sum / total_targets),
-        rightclick_prob=float(rightclick_sum / total_targets),
-    )
-
-
-def evaluate_aim_baseline(dataset, prior: AimBaselinePrior) -> dict[str, float]:
-    total_targets = 0
-    total_loss = 0.0
-    total_aim_loss = 0.0
-    total_shoot_bce = 0.0
-    total_rightclick_bce = 0.0
-    total_active_aim_loss = 0.0
-    total_active_aim_samples = 0
-
-    for target in _iter_aim_targets(dataset):
-        mouse_target = target[5:7]
-        aim_loss = float(np.mean(np.square(mouse_target - prior.mouse_mean)))
-        shoot_bce = _binary_cross_entropy_from_probability(float(target[2]), prior.fire_prob)
-        rightclick_bce = _binary_cross_entropy_from_probability(float(target[3]), prior.rightclick_prob)
-
-        total_targets += 1
-        total_loss += aim_loss + shoot_bce + rightclick_bce
-        total_aim_loss += aim_loss
-        total_shoot_bce += shoot_bce
-        total_rightclick_bce += rightclick_bce
-        if _is_active_mouse_target(mouse_target):
-            total_active_aim_samples += 1
-            total_active_aim_loss += aim_loss
-
-    if total_targets == 0:
-        return {'loss': 0.0, 'aim_loss': 0.0, 'shoot_bce': 0.0, 'rightclick_bce': 0.0, 'active_aim_loss': 0.0, 'active_aim_rate': 0.0}
-
-    return {
-        'loss': total_loss / total_targets,
-        'aim_loss': total_aim_loss / total_targets,
-        'shoot_bce': total_shoot_bce / total_targets,
-        'rightclick_bce': total_rightclick_bce / total_targets,
-        'active_aim_loss': (total_active_aim_loss / total_active_aim_samples) if total_active_aim_samples else 0.0,
-        'active_aim_rate': float(total_active_aim_samples / total_targets),
-    }
+def append_epoch_summary(log_path: Path, epoch_summary: dict[str, object]) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open('a', encoding='utf-8') as handle:
+        handle.write(json.dumps(epoch_summary, ensure_ascii=True) + '\n')
 
 
 def build_coverage_summary(metrics: dict[str, object], expected_demo_counts: dict[str, int]) -> dict[str, object]:
@@ -399,13 +488,50 @@ def print_coverage_summary(phase: str, coverage_summary: dict[str, object]) -> N
         print(f"  {phase} demo {demo_name}: {demo_summary['seen']}/{demo_summary['expected']} ({demo_summary['coverage']:.2%}) | avg_loss={demo_summary['avg_loss']:.4f}")
 
 
-def append_epoch_summary(log_path: Path, epoch_summary: dict[str, object]) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open('a', encoding='utf-8') as handle:
-        handle.write(json.dumps(epoch_summary, ensure_ascii=True) + '\n')
+def compute_binary_action_stats(dataset) -> dict[str, object]:
+    if hasattr(dataset, 'indices') and hasattr(dataset, 'dataset'):
+        source_dataset = dataset.dataset
+        indices = [int(idx) for idx in dataset.indices]
+    else:
+        source_dataset = dataset
+        indices = list(range(len(dataset)))
+    positives = np.zeros(3, dtype=np.float64)
+    valid_sum = 0.0
+    for idx in indices:
+        target = source_dataset.build_target(sample_metadata=source_dataset.get_sample_metadata(idx))
+        positives += target.binary_actions
+        valid_sum += float(target.valid_aim_mask[0])
+    total = max(len(indices), 1)
+    return {
+        'positive_ratios': (positives / total).astype(np.float64).tolist(),
+        'positive_counts': positives.astype(np.int64).tolist(),
+        'valid_aim_rate': float(valid_sum / total),
+        'sample_count': int(len(indices)),
+    }
 
 
-def save_checkpoint(save_path: Path, model: 'torch.nn.Module', args: argparse.Namespace, train_metrics: dict[str, object], val_metrics: dict[str, object], dataset_label: str, schema: FeatureSchema, demo_names: list[str]) -> None:
+def compute_binary_pos_weight(dataset, mode: str) -> np.ndarray | None:
+    if mode == 'none':
+        return None
+    stats = compute_binary_action_stats(dataset)
+    ratios = np.asarray(stats['positive_ratios'], dtype=np.float64)
+    pos_weight = np.ones(3, dtype=np.float32)
+    for idx, ratio in enumerate(ratios):
+        ratio = float(np.clip(ratio, 1e-4, 1.0 - 1e-4))
+        pos_weight[idx] = float(np.clip((1.0 - ratio) / ratio, 1.0, 25.0))
+    return pos_weight
+
+
+def save_checkpoint(
+    save_path: Path,
+    model: 'torch.nn.Module',
+    args: argparse.Namespace,
+    train_metrics: dict[str, object],
+    val_metrics: dict[str, object],
+    dataset_label: str,
+    schema: FeatureSchema,
+    demo_names: list[str],
+) -> None:
     save_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
         'model_state_dict': model.state_dict(),
@@ -418,8 +544,10 @@ def save_checkpoint(save_path: Path, model: 'torch.nn.Module', args: argparse.Na
         'demo_names': demo_names,
         'demo_count': len(demo_names),
         'split_mode': args.split_mode,
-        'train_metrics': {k: v for k, v in train_metrics.items() if k not in {'seen_sample_ids', 'per_demo_loss', 'per_demo_seen_counts'}},
-        'val_metrics': {k: v for k, v in val_metrics.items() if k not in {'seen_sample_ids', 'per_demo_loss', 'per_demo_seen_counts'}},
+        'aim_feature_mode': args.aim_feature_mode,
+        'aim_head_mode': args.aim_head_mode,
+        'train_metrics': {k: v for k, v in train_metrics.items() if k not in AIM_METRIC_DICT_KEYS},
+        'val_metrics': {k: v for k, v in val_metrics.items() if k not in AIM_METRIC_DICT_KEYS},
     }
     torch.save(checkpoint, save_path)
 
@@ -452,6 +580,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--show-index-progress', action='store_true')
     parser.add_argument('--log-interval', type=int, default=10)
     parser.add_argument('--allow-no-spotted-enemy', action='store_true')
+    parser.add_argument('--aim-feature-mode', choices=[AIM_FEATURE_MODE_DEMO_PROJECTED, AIM_FEATURE_MODE_VISION_LIKE], default=AIM_FEATURE_MODE_DEMO_PROJECTED)
+    parser.add_argument('--aim-head-mode', choices=[AIM_HEAD_MODE_LEGACY, AIM_HEAD_MODE_MULTI_HEAD], default=AIM_HEAD_MODE_LEGACY)
+    parser.add_argument('--aim-weight', type=float, default=1.0)
+    parser.add_argument('--binary-weight', type=float, default=1.0)
+    parser.add_argument('--confidence-weight', type=float, default=0.25)
+    parser.add_argument('--binary-pos-weight-mode', choices=['auto', 'none'], default='auto')
+    parser.add_argument('--vision-dropout-prob', type=float, default=0.15)
+    parser.add_argument('--vision-noise-std', type=float, default=0.03)
+    parser.add_argument('--vision-confidence-jitter', type=float, default=0.1)
     parser.add_argument('--runs-dir', type=Path, default=PROJECT_ROOT / 'runs')
     parser.add_argument('--tensorboard-run-name', type=str, default=None)
     parser.add_argument('--disable-tensorboard', action='store_true')
@@ -474,7 +611,15 @@ def build_dataset(args: argparse.Namespace) -> AimSequenceTorchDataset:
     )
     print(f'Demo files indexed: {len(base_dataset.demo_paths)}')
     print(f'Sequence samples built: {len(base_dataset)}')
-    return AimSequenceTorchDataset(base_dataset, seq_len=args.seq_len, require_spotted_enemy=not args.allow_no_spotted_enemy)
+    return AimSequenceTorchDataset(
+        base_dataset,
+        seq_len=args.seq_len,
+        require_spotted_enemy=not args.allow_no_spotted_enemy,
+        feature_mode=args.aim_feature_mode,
+        vision_dropout_prob=args.vision_dropout_prob,
+        vision_noise_std=args.vision_noise_std,
+        vision_confidence_jitter=args.vision_confidence_jitter,
+    )
 
 
 def main() -> int:
@@ -500,27 +645,41 @@ def main() -> int:
         print('Aim training dataset is empty. Try smaller seq_len/stride or another demo set.')
         return 1
 
-    print('Building train/val split...')
     train_dataset, val_dataset = split_dataset_by_group(dataset, args.val_split, args.seed, mode=args.split_mode)
     train_expected_counts = collect_expected_demo_counts(train_dataset)
     val_expected_counts = collect_expected_demo_counts(val_dataset)
-    print('Preparing dataloaders...')
+    train_stats = compute_binary_action_stats(train_dataset)
+    train_pos_weight_np = compute_binary_pos_weight(train_dataset, args.binary_pos_weight_mode) if len(train_dataset) > 0 else None
+    print(f'Aim relevance-filtered samples: {dataset_len}')
+    print(f'Valid aim rate: {train_stats["valid_aim_rate"]:.4f}')
+    print('Binary target positive ratios:')
+    for name, ratio in zip(AIM_BINARY_ACTION_NAMES, train_stats['positive_ratios'], strict=True):
+        print(f'  {name}: {float(ratio):.4f}')
+
     train_loader_kwargs = build_dataloader_kwargs(device, args.num_workers, is_training=True)
     val_loader_kwargs = build_dataloader_kwargs(device, args.num_workers, is_training=False)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_aim_batch, **train_loader_kwargs)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_aim_batch, **val_loader_kwargs)
 
-    print('Initializing model and trainer...')
-    feature_extractor = AimFeatureExtractor(seq_len=args.seq_len)
+    feature_extractor = AimFeatureExtractor(seq_len=args.seq_len, feature_mode=args.aim_feature_mode)
     feature_schema = feature_extractor.schema()
-    model = AimAttentionModel(input_dim=feature_extractor.feature_dim()).to(device)
+    model = AimAttentionModel(input_dim=feature_extractor.feature_dim(), head_mode=args.aim_head_mode).to(device)
     load_checkpoint_if_available(model, args.resume_from, device)
-    trainer = AimTrainer(model=model, device=device, learning_rate=args.lr, log_interval=args.log_interval)
+    trainer = AimTrainer(
+        model=model,
+        device=device,
+        learning_rate=args.lr,
+        head_mode=args.aim_head_mode,
+        aim_weight=args.aim_weight,
+        binary_weight=args.binary_weight,
+        confidence_weight=args.confidence_weight,
+        log_interval=args.log_interval,
+        binary_pos_weight=torch.tensor(train_pos_weight_np, dtype=torch.float32) if train_pos_weight_np is not None else None,
+    )
     demo_names = dataset.base_dataset.get_demo_names()
     dataset_label = str(args.dataset_dir / 'clean_play_ticks')
     epoch_log_path = args.save_path.with_name(f'{args.save_path.stem}_epoch_metrics.jsonl')
     writer = None
-    run_dir = None
 
     if args.disable_tensorboard:
         print('TensorBoard: disabled')
@@ -530,12 +689,7 @@ def main() -> int:
             run_name=args.tensorboard_run_name,
             default_prefix='aim',
             save_path=args.save_path,
-            config={
-                'args': vars(args),
-                'device': device,
-                'dataset_source': dataset_label,
-                'demo_names': demo_names,
-            },
+            config={'args': vars(args), 'device': device, 'dataset_source': dataset_label, 'demo_names': demo_names},
         )
         if run_dir is not None:
             print(f'TensorBoard run: {run_dir}')
@@ -553,53 +707,48 @@ def main() -> int:
     print(f'DataLoader workers: train={train_loader_kwargs["num_workers"]} val={val_loader_kwargs["num_workers"]}')
     print(f'CUDA tuning: matmul={runtime_info["matmul_precision"]} cudnn_benchmark={runtime_info["cudnn_benchmark"]} tf32={runtime_info["tf32"]}')
     print(f'Feature dim: {feature_extractor.feature_dim()}')
+    print(f'Aim feature mode: {args.aim_feature_mode}')
+    print(f'Aim head mode: {args.aim_head_mode}')
     print(f'Save path: {args.save_path}')
     print(f'Epoch log: {epoch_log_path}')
-    print('Computing train-prior baseline metrics...')
-    baseline_prior = build_aim_baseline_prior(train_dataset)
-    train_baseline = evaluate_aim_baseline(train_dataset, baseline_prior)
-    val_baseline = evaluate_aim_baseline(val_dataset, baseline_prior) if len(val_dataset) > 0 else dict(train_baseline)
-    print(
-        'Baseline | '
-        f'train_loss={train_baseline["loss"]:.4f} '
-        f'(aim={train_baseline["aim_loss"]:.4f}, shoot_bce={train_baseline["shoot_bce"]:.4f}, active_aim={train_baseline["active_aim_loss"]:.4f}, active_rate={train_baseline["active_aim_rate"]:.2%}) | '
-        f'val_loss={val_baseline["loss"]:.4f} '
-        f'(aim={val_baseline["aim_loss"]:.4f}, shoot_bce={val_baseline["shoot_bce"]:.4f}, active_aim={val_baseline["active_aim_loss"]:.4f}, active_rate={val_baseline["active_aim_rate"]:.2%})'
-    )
 
     best_val_loss = math.inf
+    best_train_metrics: dict[str, object] | None = None
+    best_val_metrics: dict[str, object] | None = None
     try:
         for epoch in range(1, args.epochs + 1):
             print(f'Starting epoch {epoch}/{args.epochs}...')
             train_metrics = trainer.train_epoch(train_loader, epoch=epoch, writer=writer)
-            val_metrics = trainer.eval_epoch(val_loader, epoch=epoch, writer=writer) if len(val_dataset) > 0 else {'loss': train_metrics['loss'], 'aim_loss': train_metrics['aim_loss'], 'shoot_bce': train_metrics['shoot_bce'], 'rightclick_bce': train_metrics['rightclick_bce'], 'active_aim_loss': train_metrics['active_aim_loss'], 'active_aim_rate': train_metrics['active_aim_rate'], 'seen_sample_ids': set(), 'per_demo_loss': {}, 'per_demo_seen_counts': {}}
-            print(f'Epoch {epoch}/{args.epochs} | train_loss={train_metrics["loss"]:.4f} (aim={train_metrics["aim_loss"]:.4f}, shoot_bce={train_metrics["shoot_bce"]:.4f}, rightclick_bce={train_metrics["rightclick_bce"]:.4f}) | val_loss={val_metrics["loss"]:.4f} (aim={val_metrics["aim_loss"]:.4f}, shoot_bce={val_metrics["shoot_bce"]:.4f}, rightclick_bce={val_metrics["rightclick_bce"]:.4f})')
+            val_metrics = trainer.eval_epoch(val_loader, epoch=epoch, writer=writer) if len(val_dataset) > 0 else dict(train_metrics, seen_sample_ids=set(), per_demo_loss={}, per_demo_seen_counts={})
             print(
-                'Aim active | '
-                f'train_rate={train_metrics["active_aim_rate"]:.2%} '
-                f'(loss={train_metrics["active_aim_loss"]:.4f}) | '
-                f'val_rate={val_metrics["active_aim_rate"]:.2%} '
-                f'(loss={val_metrics["active_aim_loss"]:.4f})'
+                f'Epoch {epoch}/{args.epochs} | '
+                f'train_loss={train_metrics["loss"]:.4f} '
+                f'(aim={train_metrics["aim_loss"]:.4f}, binary={train_metrics["binary_loss"]:.4f}, conf={train_metrics["confidence_loss"]:.4f}) | '
+                f'val_loss={val_metrics["loss"]:.4f} '
+                f'(aim={val_metrics["aim_loss"]:.4f}, binary={val_metrics["binary_loss"]:.4f}, conf={val_metrics["confidence_loss"]:.4f})'
             )
             print(
-                'Baseline   | '
-                f'train_loss={train_baseline["loss"]:.4f} '
-                f'(aim={train_baseline["aim_loss"]:.4f}, shoot_bce={train_baseline["shoot_bce"]:.4f}) | '
-                f'val_loss={val_baseline["loss"]:.4f} '
-                f'(aim={val_baseline["aim_loss"]:.4f}, shoot_bce={val_baseline["shoot_bce"]:.4f})'
+                f'  mouse_mae=({train_metrics["mouse_dx_mae"]:.4f}, {train_metrics["mouse_dy_mae"]:.4f}) '
+                f'angular_err={train_metrics["mean_angular_error"]:.4f} '
+                f'fire_f1={train_metrics["fire_f1"]["fire"]:.4f} '
+                f'fire_rate={train_metrics["predicted_fire_rate"]:.4f}/{train_metrics["target_fire_rate"]:.4f}'
             )
-
             train_coverage = build_coverage_summary(train_metrics, train_expected_counts)
             val_coverage = build_coverage_summary(val_metrics, val_expected_counts)
             print_coverage_summary('train', train_coverage)
             if val_expected_counts:
                 print_coverage_summary('val', val_coverage)
-            append_epoch_summary(epoch_log_path, {'epoch': epoch, 'train': {'loss': train_metrics['loss'], 'aim_loss': train_metrics['aim_loss'], 'shoot_bce': train_metrics['shoot_bce'], 'rightclick_bce': train_metrics['rightclick_bce'], 'active_aim_loss': train_metrics['active_aim_loss'], 'active_aim_rate': train_metrics['active_aim_rate'], 'coverage': train_coverage}, 'val': {'loss': val_metrics['loss'], 'aim_loss': val_metrics['aim_loss'], 'shoot_bce': val_metrics['shoot_bce'], 'rightclick_bce': val_metrics['rightclick_bce'], 'active_aim_loss': val_metrics['active_aim_loss'], 'active_aim_rate': val_metrics['active_aim_rate'], 'coverage': val_coverage}, 'baseline': {'train': train_baseline, 'val': val_baseline}})
 
-            log_scalar_dict(writer, 'train', train_metrics, epoch, ignored_keys={'seen_sample_ids', 'per_demo_loss', 'per_demo_seen_counts'})
-            log_scalar_dict(writer, 'val', val_metrics, epoch, ignored_keys={'seen_sample_ids', 'per_demo_loss', 'per_demo_seen_counts'})
-            log_scalar_dict(writer, 'baseline/train', train_baseline, epoch)
-            log_scalar_dict(writer, 'baseline/val', val_baseline, epoch)
+            append_epoch_summary(
+                epoch_log_path,
+                {
+                    'epoch': epoch,
+                    'train': {**{k: v for k, v in train_metrics.items() if k not in {'seen_sample_ids', 'per_demo_loss', 'per_demo_seen_counts'}}, 'coverage': train_coverage},
+                    'val': {**{k: v for k, v in val_metrics.items() if k not in {'seen_sample_ids', 'per_demo_loss', 'per_demo_seen_counts'}}, 'coverage': val_coverage},
+                },
+            )
+            log_scalar_dict(writer, 'train', train_metrics, epoch, ignored_keys=AIM_METRIC_DICT_KEYS)
+            log_scalar_dict(writer, 'val', val_metrics, epoch, ignored_keys=AIM_METRIC_DICT_KEYS)
             log_scalar_dict(writer, 'train_coverage', train_coverage, epoch, ignored_keys={'per_demo'})
             log_scalar_dict(writer, 'val_coverage', val_coverage, epoch, ignored_keys={'per_demo'})
             if writer is not None:
@@ -607,6 +756,8 @@ def main() -> int:
 
             if val_metrics['loss'] < best_val_loss:
                 best_val_loss = val_metrics['loss']
+                best_train_metrics = train_metrics
+                best_val_metrics = val_metrics
                 save_checkpoint(args.save_path, model, args, train_metrics, val_metrics, dataset_label, feature_schema, demo_names)
                 print(f'  saved checkpoint -> {args.save_path}')
     finally:
@@ -614,6 +765,24 @@ def main() -> int:
 
     print('Training finished.')
     print(f'Best val loss: {best_val_loss:.4f}')
+    if best_train_metrics is None or best_val_metrics is None:
+        best_train_metrics = trainer._empty_metrics()
+        best_val_metrics = trainer._empty_metrics()
+    report = build_base_training_report(
+        module_name='aim',
+        model_name=f'aim_attention_{args.aim_head_mode}',
+        dataset_path=dataset_label,
+        split_mode=args.split_mode,
+        seq_len=args.seq_len,
+        feature_dim=feature_extractor.feature_dim(),
+        target_shape='aim_delta:[batch,4], binary_actions:[batch,3], valid_aim_mask:[batch,1]',
+        checkpoint_path=str(args.save_path),
+        config=vars(args),
+        train_metrics=best_train_metrics,
+        val_metrics=best_val_metrics,
+    )
+    report_paths = write_training_report(report)
+    print(f'Reports: {report_paths["json"]} | {report_paths["csv"]} | {report_paths["markdown"]}')
     return 0
 
 

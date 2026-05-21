@@ -11,7 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import pandas as pd
 
-from cs2_ai.features.aim_features import AIM_FEATURE_NAMES, AimFeatureExtractor
+from cs2_ai.features.aim_features import AIM_FEATURE_MODE_VISION_LIKE, AIM_FEATURE_NAMES, AimFeatureExtractor
 from cs2_ai.features.enemy_tracker_features import TRACKER_FEATURE_NAMES, EnemyTrackerFeatureExtractor, build_enemy_confidence_target, build_enemy_position_target, build_enemy_roster
 from cs2_ai.features.feature_contract import validate_checkpoint_schema
 from cs2_ai.features.movement_features import MOVEMENT_FEATURE_NAMES, MovementFeatureExtractor
@@ -19,6 +19,8 @@ from cs2_ai.ml.utils.torch_utils import torch_available
 from cs2_ai.pipeline.neural_ai_pipeline import NeuralAIPipeline
 from cs2_ai.schemas.game_state import GameStateSequence, VisibilityStatus
 from cs2_ai.state.game_state_builder import GameStateBuilder
+from cs2_ai.vision.radar_pipeline import RadarObservation, RadarTeammate, augment_live_state_with_radar
+from game_state import GameState as LiveGameState, LiveCapabilities, MapState, PlayerState, RoundState, Vector3
 from neural_runtime_agent import FullNeuralRuntimeAgent
 
 
@@ -181,6 +183,71 @@ def make_tick_rows(visible_enemy: bool = True, tick: int = 100) -> pd.DataFrame:
 
 
 class DataContractParityTests(unittest.TestCase):
+    def test_radar_augmentation_restores_spatial_capabilities(self):
+        controlled = PlayerState(
+            id="self",
+            name="self",
+            team="CT",
+            position=None,
+            forward=None,
+            health=100,
+            armor=100,
+            money=800,
+            weapon="M4A1-S",
+            ammo=30,
+            is_alive=True,
+            activity="playing",
+        )
+        enemy = PlayerState(
+            id="enemy",
+            name="enemy",
+            team="T",
+            position=Vector3(100.0, 50.0, 0.0),
+            forward=Vector3(0.0, -1.0, 0.0),
+            health=100,
+            armor=0,
+            money=0,
+            weapon="AK-47",
+            ammo=30,
+            is_alive=True,
+            activity="playing",
+        )
+        state = LiveGameState(
+            provider="gsi",
+            timestamp=0.0,
+            controlled_player=controlled,
+            players=[controlled, enemy],
+            raw={},
+            map_state=MapState(name="de_dust2"),
+            round_state=RoundState(phase="live"),
+            capabilities=LiveCapabilities(
+                has_player_position=False,
+                has_player_forward=False,
+                has_allplayers=False,
+                has_enemy_players=True,
+                has_spatial_state=False,
+                has_round_state=True,
+                has_bomb_state=False,
+            ),
+        )
+        radar = RadarObservation(
+            self_position=Vector3(0.0, 0.0, 0.0),
+            self_forward=Vector3(0.0, 1.0, 0.0),
+            teammates=[RadarTeammate(slot=0, rel_x=120.0, rel_y=-40.0, confidence=0.9)],
+            confidence=0.9,
+        )
+
+        augmented = augment_live_state_with_radar(state, radar)
+
+        self.assertIsNotNone(augmented.controlled_player)
+        self.assertEqual(augmented.controlled_player.position, Vector3(0.0, 0.0, 0.0))
+        self.assertEqual(augmented.controlled_player.forward, Vector3(0.0, 1.0, 0.0))
+        self.assertTrue(augmented.capabilities.has_player_position)
+        self.assertTrue(augmented.capabilities.has_player_forward)
+        self.assertTrue(augmented.capabilities.has_spatial_state)
+        self.assertTrue(any(player.id.startswith("radar_teammate_") for player in augmented.players))
+        self.assertTrue(any(player.id == "enemy" for player in augmented.players))
+
     def test_hidden_truth_isolation(self):
         bundle = GameStateBuilder().build_state_bundle_from_tick_rows(make_tick_rows(visible_enemy=True), perspective_steamid=1)
         observed_ids = {enemy.steamid for enemy in bundle.observed_state.enemies}
@@ -247,7 +314,7 @@ class DataContractParityTests(unittest.TestCase):
         from cs2_ai.ml.models.decision_dqn import DecisionDQN
         from cs2_ai.ml.models.enemy_tracker_lstm import EnemyTrackerLSTM
 
-        aim_extractor = AimFeatureExtractor(seq_len=16)
+        aim_extractor = AimFeatureExtractor(seq_len=16, feature_mode=AIM_FEATURE_MODE_VISION_LIKE)
         movement_extractor = MovementFeatureExtractor(seq_len=64)
         tracker_extractor = EnemyTrackerFeatureExtractor(seq_len=16)
 

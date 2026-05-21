@@ -36,6 +36,7 @@ from cs2_ai.features.movement_features import (
 )
 from cs2_ai.ml.models.decision_dqn import DecisionDQN
 from cs2_ai.ml.models.movement_gru import MovementGRU
+from cs2_ai.ml.reporting import build_base_training_report, write_training_report
 from cs2_ai.ml.training.shape_assertions import assert_shape, assert_temporal_features
 from cs2_ai.ml.utils.tensorboard_utils import close_summary_writer, create_summary_writer, log_scalar_dict, tensorboard_available
 from cs2_ai.ml.utils.torch_utils import build_dataloader_kwargs, configure_torch_runtime, get_device, set_seed, torch_available
@@ -893,6 +894,22 @@ def main() -> int:
     print(f'Best val loss: {best_val_loss:.4f}')
     print(f'Best train metrics: {{"loss": {best_train_metrics["loss"]:.4f}, "binary_loss": {best_train_metrics["binary_loss"]:.4f}}}')
     print(f'Best val metrics: {{"loss": {best_val_metrics["loss"]:.4f}, "binary_loss": {best_val_metrics["binary_loss"]:.4f}}}')
+    report = build_base_training_report(
+        module_name='movement',
+        model_name=args.model,
+        dataset_path=dataset_label,
+        split_mode=args.split_mode,
+        seq_len=args.seq_len,
+        chunk_len=dataset.target_len,
+        feature_dim=feature_extractor.feature_dim(),
+        target_shape=f'[batch, {dataset.target_len}, {dataset.action_dim}]',
+        checkpoint_path=str(args.save_path),
+        config=vars(args),
+        train_metrics=best_train_metrics,
+        val_metrics=best_val_metrics,
+    )
+    report_paths = write_training_report(report)
+    print(f'Reports: {report_paths["json"]} | {report_paths["csv"]} | {report_paths["markdown"]}')
     return 0
 
 

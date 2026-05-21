@@ -11,7 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import numpy as np
 
 from cs2_ai.dataset.multi_demo_sequence_dataset import MultiDemoSequenceDataset
-from cs2_ai.features.aim_features import AimFeatureExtractor
+from cs2_ai.features.aim_features import AIM_FEATURE_MODE_DEMO_PROJECTED, AIM_FEATURE_MODE_VISION_LIKE, AimFeatureExtractor
 from cs2_ai.features.enemy_tracker_features import EnemyTrackerFeatureExtractor
 from cs2_ai.features.feature_contract import validate_checkpoint_schema
 from cs2_ai.features.movement_features import MovementFeatureExtractor
@@ -54,6 +54,7 @@ def main() -> int:
     parser.add_argument("--dataset-dir", type=Path, default=PROJECT_ROOT / "dataset")
     parser.add_argument("--sample-index", type=int, default=0)
     parser.add_argument("--seq-len", type=int, default=16)
+    parser.add_argument("--aim-feature-mode", choices=[AIM_FEATURE_MODE_DEMO_PROJECTED, AIM_FEATURE_MODE_VISION_LIKE], default=AIM_FEATURE_MODE_DEMO_PROJECTED)
     parser.add_argument("--aim-checkpoint", type=str, default=None)
     parser.add_argument("--movement-checkpoint", type=str, default=None)
     parser.add_argument("--tracker-checkpoint", type=str, default=None)
@@ -70,8 +71,8 @@ def main() -> int:
     tracker_runtime = EnemyTrackerFeatureExtractor(seq_len=args.seq_len)
     movement_offline = MovementFeatureExtractor(seq_len=args.seq_len)
     movement_runtime = MovementFeatureExtractor(seq_len=args.seq_len)
-    aim_offline = AimFeatureExtractor(seq_len=args.seq_len)
-    aim_runtime = AimFeatureExtractor(seq_len=args.seq_len)
+    aim_offline = AimFeatureExtractor(seq_len=args.seq_len, feature_mode=args.aim_feature_mode)
+    aim_runtime = AimFeatureExtractor(seq_len=args.seq_len, feature_mode=args.aim_feature_mode)
 
     checks: list[str] = []
     schemas = {

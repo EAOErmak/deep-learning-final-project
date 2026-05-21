@@ -224,6 +224,87 @@ action = agent.predict(features)
 
 Этот проект intentionally ограничен обычной пользовательской автоматизацией ввода в локальной среде. Он не предназначен для вмешательства в процесс игры, чтения памяти, обхода античита или использования в online matchmaking.
 
+## Movement replay evaluation
+
+Для movement-модели есть отдельный offline replay evaluator. Он не подключается к live CS2 и нужен только для сравнения predicted action chunk против реального player replay.
+
+Пример запуска:
+
+```powershell
+python scripts/evaluate_movement_replay.py `
+  --checkpoint checkpoints/movement_bc.pt `
+  --demo demo_name `
+  --round 12 `
+  --perspective-steamid 76561198000000000
+```
+
+По умолчанию evaluator сохраняет артефакты в:
+
+```text
+artifacts/movement_replay_eval/<checkpoint_name>/<demo>_round<round>_p<perspective_steamid>/
+```
+
+Файлы:
+- `movement_replay_report.csv` -> по одной строке на target tick внутри predicted chunk
+- `movement_replay_summary.json` -> per-action precision / recall / F1 / confusion
+- `movement_replay_plot.png` -> time plot для `forward`, `left`, `right`, `jump`
+
+Что смотреть:
+- `precision` и `recall` по каждому action
+- `target_positive_ratio` против `predicted_positive_ratio`
+- `tp/fp/fn/tn` для понимания, где модель переактивна или слишком пассивна
+- PNG plot по времени, чтобы увидеть lag, дрожание или систематический missed action
+
+CSV содержит:
+- `demo_name`, `round`, `perspective_steamid`
+- `tick`, `chunk_offset`
+- `target_<action>`
+- `pred_<action>`
+- `confidence_<action>`
+
+Если predicted actions выглядят слишком "липкими" или почти всегда нулевыми, обычно это видно по:
+- низкому `predicted_positive_ratio`
+- хорошему `accuracy`, но плохому `recall`
+- длинным участкам в PNG, где target меняется, а prediction остается плоским
+
+## Training reports
+
+После train/eval запусков offline trainers сохраняют experiment reports в:
+
+```text
+artifacts/reports/
+```
+
+Для каждого запуска пишутся:
+- `<run_id>.json`
+- `<run_id>.csv`
+- `<run_id>.md`
+
+Агрегация лучших запусков:
+
+```powershell
+python scripts/summarize_experiments.py
+```
+
+Пример с экспортом summary CSV:
+
+```powershell
+python scripts/summarize_experiments.py --top-k 5 --export-csv artifacts/reports/summary.csv
+```
+
+В report попадают:
+- module/model name
+- dataset path
+- split mode
+- seq_len и chunk_len если есть
+- feature_dim
+- target shape
+- train/val loss
+- module-specific metrics
+- checkpoint path
+- git commit hash
+- config used
+
 
 ## Live GSI sandbox setup
 
@@ -324,3 +405,37 @@ python scripts/check_live_runtime_ready.py
 ```
 
 If the current GSI payload is not ready enough, the runtime now releases held inputs and waits instead of sending blind actions.
+
+## YOLO -> Aim bridge
+
+Live neural aim now uses a strict screen-space bridge:
+
+`screen capture -> YOLO -> VisionTarget -> AimFeatureExtractor -> AimAttentionModel`
+
+Important constraints:
+- YOLO provides only screen-space targeting features such as `screen_dx`, `screen_dy`, confidence and head-target flags.
+- GSI is not used as an enemy source for live aim.
+- GSI is still used for self state, round state, weapon/ammo, team context and other non-enemy metadata.
+- Hidden enemy world coordinates are not injected into the live aim input.
+
+Aim feature modes:
+- `demo_projected`: legacy offline/demo feature contract without YOLO-specific inputs.
+- `vision_like`: vision-enabled contract with appended `vision_*` features on the last frame of the aim sequence.
+
+Runtime expectation:
+- live neural aim checkpoints must be trained with the vision-enabled aim schema
+- if an aim checkpoint was trained without `vision_*` features, retrain it before using `FullNeuralRuntimeAgent`
+- when YOLO is unavailable and `vision_target=None`, the runtime keeps the vision features zeroed and suppresses live firing
+
+Training example:
+
+```powershell
+python -m cs2_ai.ml.training.train_aim --aim-feature-mode vision_like
+```
+
+Dry-run the bridge without sending inputs:
+
+```powershell
+python scripts/debug_vision_aim_bridge.py --fake-target
+python scripts/debug_vision_aim_bridge.py --yolo-weights weights/yolov10s_cs2.pt
+```

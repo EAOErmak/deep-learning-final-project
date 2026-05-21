@@ -9,6 +9,7 @@ from game_state import GameState
 from gsi_server import GSIServer
 from gsi_state_reader import GSIStateReader
 from visibility_filter import filter_visible_enemies
+from cs2_ai.vision.radar_pipeline import RadarVisionModule, augment_live_state_with_radar
 
 
 @dataclass
@@ -38,10 +39,11 @@ class MockStateReader:
 
 
 class StateReader:
-    def __init__(self, mode: str = 'mock', gsi_server: GSIServer | None = None):
+    def __init__(self, mode: str = 'mock', gsi_server: GSIServer | None = None, radar_vision: RadarVisionModule | None = None):
         self.mode = mode
         self.mock_reader = MockStateReader()
         self.gsi_reader = GSIStateReader(gsi_server) if mode == 'gsi' and gsi_server is not None else None
+        self.radar_vision = radar_vision
 
     def read_state(self) -> dict[str, Any] | GameState | None:
         if self.mode == 'mock':
@@ -52,5 +54,7 @@ class StateReader:
             state = self.gsi_reader.read_state()
             if state is None:
                 return None
+            if self.radar_vision is not None:
+                state = augment_live_state_with_radar(state, self.radar_vision.capture())
             return filter_visible_enemies(state)
         raise ValueError(f'Unsupported state reader mode: {self.mode}')

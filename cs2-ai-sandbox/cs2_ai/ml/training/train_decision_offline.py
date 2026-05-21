@@ -28,6 +28,7 @@ from cs2_ai.state.belief_state import BeliefState
 from cs2_ai.schemas.module_outputs import EnemyTrackerOutput
 from cs2_ai.schemas.game_state import GameStateSequence
 from cs2_ai.ml.models.decision_dqn import DecisionDQN
+from cs2_ai.ml.reporting import build_base_training_report, write_training_report
 from cs2_ai.ml.utils.tensorboard_utils import close_summary_writer, create_summary_writer, log_scalar_dict, tensorboard_available
 from cs2_ai.ml.utils.torch_utils import build_dataloader_kwargs, configure_torch_runtime, get_device, set_seed, torch_available
 
@@ -170,6 +171,10 @@ class DecisionRLTrainer:
         seen_demo_sample_ids: dict[str, set[str]] = {}
         per_demo_sum: dict[str, float] = {}
         per_demo_count: dict[str, int] = {}
+        action_dim = len(STRATEGIC_ACTION_TO_ID)
+        target_action_counts = np.zeros(action_dim, dtype=np.int64)
+        predicted_action_counts = np.zeros(action_dim, dtype=np.int64)
+        confusion = np.zeros((action_dim, action_dim), dtype=np.int64)
         
         for batch_idx, batch in enumerate(loader):
             batch = self._to_batch(batch)
@@ -177,6 +182,7 @@ class DecisionRLTrainer:
             # Predict Q-values
             q_values = self.policy_net(batch.states)
             q_a = q_values.gather(1, batch.actions.unsqueeze(1)).squeeze(1)
+            predicted_actions = q_values.argmax(dim=1)
             
             # Compute targets
             with torch.no_grad():
@@ -197,6 +203,12 @@ class DecisionRLTrainer:
             total_samples += batch_size
             total_loss += float(loss.item() * batch_size)
             total_reward += float(batch.rewards.sum().item())
+            target_np = batch.actions.detach().cpu().numpy()
+            pred_np = predicted_actions.detach().cpu().numpy()
+            for target_id, pred_id in zip(target_np.tolist(), pred_np.tolist(), strict=True):
+                target_action_counts[int(target_id)] += 1
+                predicted_action_counts[int(pred_id)] += 1
+                confusion[int(target_id), int(pred_id)] += 1
             
             if training and writer is not None:
                 global_step = (epoch - 1) * total_batches + batch_idx
@@ -224,6 +236,9 @@ class DecisionRLTrainer:
             return {
                 'loss': 0.0,
                 'reward': 0.0,
+                'class_distribution': {},
+                'predicted_class_distribution': {},
+                'confusion_matrix': {},
                 'seen_sample_ids': set(),
                 'per_demo_loss': {},
                 'per_demo_seen_counts': {},
@@ -232,6 +247,19 @@ class DecisionRLTrainer:
         return {
             'loss': total_loss / total_samples,
             'reward': total_reward / total_samples,
+            'class_distribution': {
+                STRATEGIC_ACTION_FROM_ID[idx]: int(count) for idx, count in enumerate(target_action_counts.tolist())
+            },
+            'predicted_class_distribution': {
+                STRATEGIC_ACTION_FROM_ID[idx]: int(count) for idx, count in enumerate(predicted_action_counts.tolist())
+            },
+            'confusion_matrix': {
+                STRATEGIC_ACTION_FROM_ID[row_idx]: {
+                    STRATEGIC_ACTION_FROM_ID[col_idx]: int(confusion[row_idx, col_idx])
+                    for col_idx in range(action_dim)
+                }
+                for row_idx in range(action_dim)
+            },
             'seen_sample_ids': seen_sample_ids,
             'per_demo_loss': {name: per_demo_sum[name] / per_demo_count[name] for name in per_demo_sum},
             'per_demo_seen_counts': {name: len(seen_demo_sample_ids[name]) for name in seen_demo_sample_ids},
@@ -468,6 +496,8 @@ def main() -> int:
         print(f"TensorBoard run: {run_dir}")
         
     best_val_loss = math.inf
+    best_train_metrics: dict[str, object] | None = None
+    best_val_metrics: dict[str, object] | None = None
     try:
         for epoch in range(1, args.epochs + 1):
             train_metrics = trainer.train_epoch(train_loader, epoch=epoch, writer=writer)
@@ -502,6 +532,8 @@ def main() -> int:
                 
             if val_metrics['loss'] < best_val_loss:
                 best_val_loss = val_metrics['loss']
+                best_train_metrics = train_metrics
+                best_val_metrics = val_metrics
                 save_checkpoint(args.save_path, policy_net, args, train_metrics, val_metrics, dataset_label, input_dim, demo_names)
                 print(f'  saved checkpoint -> {args.save_path}')
     finally:
@@ -509,6 +541,24 @@ def main() -> int:
             close_summary_writer(writer)
             
     print("Training finished.")
+    if best_train_metrics is None or best_val_metrics is None:
+        best_train_metrics = {'loss': 0.0, 'reward': 0.0, 'class_distribution': {}, 'predicted_class_distribution': {}, 'confusion_matrix': {}}
+        best_val_metrics = dict(best_train_metrics)
+    report = build_base_training_report(
+        module_name='macro_decision',
+        model_name='decision_dqn_offline',
+        dataset_path=dataset_label,
+        split_mode=args.split_mode,
+        seq_len=args.seq_len,
+        feature_dim=input_dim,
+        target_shape='[batch] strategic_action_id',
+        checkpoint_path=str(args.save_path),
+        config=vars(args),
+        train_metrics=best_train_metrics,
+        val_metrics=best_val_metrics,
+    )
+    report_paths = write_training_report(report)
+    print(f'Reports: {report_paths["json"]} | {report_paths["csv"]} | {report_paths["markdown"]}')
     return 0
 
 
