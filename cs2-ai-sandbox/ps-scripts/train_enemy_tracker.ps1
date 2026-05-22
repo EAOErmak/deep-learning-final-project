@@ -1,5 +1,6 @@
 param (
-    [string]$DatasetDir = "dataset",
+    [string]$DataDir = "data\processed",
+    [string]$DatasetSubdir = "rounds-dataset",
     [int]$Epochs = 10,
     [int]$BatchSize = 64,
     [int]$SeqLen = 16,
@@ -14,11 +15,12 @@ param (
 )
 
 Write-Host "Training enemy tracker model..." -ForegroundColor Cyan
-Write-Host "DatasetDir=$DatasetDir Epochs=$Epochs BatchSize=$BatchSize SeqLen=$SeqLen Stride=$Stride SplitMode=$SplitMode" -ForegroundColor DarkGray
+Write-Host "DataDir=$DataDir DatasetSubdir=$DatasetSubdir Epochs=$Epochs BatchSize=$BatchSize SeqLen=$SeqLen Stride=$Stride SplitMode=$SplitMode" -ForegroundColor DarkGray
 
 $args = @(
     "cs2_ai/ml/training/train_enemy_tracker.py",
-    "--dataset-dir", $DatasetDir,
+    "--data-dir", $DataDir,
+    "--dataset-subdir", $DatasetSubdir,
     "--epochs", $Epochs,
     "--batch-size", $BatchSize,
     "--seq-len", $SeqLen,

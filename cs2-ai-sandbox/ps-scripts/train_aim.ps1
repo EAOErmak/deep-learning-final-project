@@ -1,5 +1,6 @@
 param (
-    [string]$DatasetDir = "dataset",
+    [string]$DataDir = "data\processed",
+    [string]$DatasetSubdir = "rounds-dataset",
     [int]$Epochs = 10,
     [int]$BatchSize = 64,
     [int]$SeqLen = 16,
@@ -10,15 +11,17 @@ param (
     [int]$MaxSamples = 0,
     [int]$MaxSamplesPerDemo = 0,
     [switch]$ShowIndexProgress,
+    [string]$AimFeatureMode = "vision_like",
     [string]$SavePath = "checkpoints\aim_bc_v1.pt"
 )
 
 Write-Host "Training aim model..." -ForegroundColor Cyan
-Write-Host "DatasetDir=$DatasetDir Epochs=$Epochs BatchSize=$BatchSize SeqLen=$SeqLen Stride=$Stride SplitMode=$SplitMode" -ForegroundColor DarkGray
+Write-Host "DataDir=$DataDir DatasetSubdir=$DatasetSubdir Epochs=$Epochs BatchSize=$BatchSize SeqLen=$SeqLen Stride=$Stride SplitMode=$SplitMode" -ForegroundColor DarkGray
 
 $args = @(
     "cs2_ai/ml/training/train_aim.py",
-    "--dataset-dir", $DatasetDir,
+    "--data-dir", $DataDir,
+    "--dataset-subdir", $DatasetSubdir,
     "--epochs", $Epochs,
     "--batch-size", $BatchSize,
     "--seq-len", $SeqLen,
@@ -26,6 +29,7 @@ $args = @(
     "--split-mode", $SplitMode,
     "--num-workers", $NumWorkers,
     "--log-interval", $LogInterval,
+    "--aim-feature-mode", $AimFeatureMode,
     "--save-path", $SavePath
 )
 

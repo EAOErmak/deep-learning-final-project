@@ -9,6 +9,10 @@ from typing import Any
 from cs2_ai.dataset.round_identity import round_metadata_from_sample
 
 
+def _simple_rounds_path(base_path: Path, module_name: str) -> Path:
+    return base_path.parent / f'{module_name}_trained_rounds.txt'
+
+
 def _resolve_dataset_and_indices(dataset_or_subset) -> tuple[Any, list[int]]:
     if hasattr(dataset_or_subset, 'indices') and hasattr(dataset_or_subset, 'dataset'):
         return dataset_or_subset.dataset, [int(idx) for idx in dataset_or_subset.indices]
@@ -92,6 +96,8 @@ class TrainingRoundLedger:
     ) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         created_at = datetime.now(timezone.utc).isoformat()
+        simple_rounds_path = _simple_rounds_path(self.path, module_name)
+        simple_round_uids = sorted({str(item['round_uid']) for item in round_usage})
         with self.path.open('a', encoding='utf-8') as handle:
             for item in round_usage:
                 record = {
@@ -119,6 +125,12 @@ class TrainingRoundLedger:
                 }
                 handle.write(json.dumps(record, ensure_ascii=True) + '\n')
                 self.entries.append(record)
+        if simple_round_uids:
+            existing: set[str] = set()
+            if simple_rounds_path.exists():
+                existing = {line.strip() for line in simple_rounds_path.read_text(encoding='utf-8').splitlines() if line.strip()}
+            merged = sorted(existing | set(simple_round_uids))
+            simple_rounds_path.write_text('\n'.join(merged) + '\n', encoding='utf-8')
 
     def read_trained_round_uids(
         self,
@@ -130,6 +142,10 @@ class TrainingRoundLedger:
     ) -> set[str]:
         match_mode = str(match_mode).strip().lower()
         result: set[str] = set()
+        if match_mode == 'module' and module_name is not None:
+            simple_rounds_path = _simple_rounds_path(self.path, module_name)
+            if simple_rounds_path.exists():
+                return {line.strip() for line in simple_rounds_path.read_text(encoding='utf-8').splitlines() if line.strip()}
         for entry in self.entries:
             if match_mode == 'module':
                 if module_name is not None and entry.get('module_name') == module_name:

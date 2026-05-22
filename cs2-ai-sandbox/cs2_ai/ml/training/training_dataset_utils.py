@@ -24,7 +24,7 @@ from cs2_ai.ml.training.training_ledger import TrainingRoundLedger
 
 def add_common_training_data_args(parser: argparse.ArgumentParser, *, project_root: Path, legacy_dataset_dir: bool = True) -> None:
     parser.add_argument('--data-dir', type=Path, default=project_root / 'data')
-    parser.add_argument('--dataset-subdir', type=str, default='clean_play_ticks')
+    parser.add_argument('--dataset-subdir', type=str, default='rounds-dataset')
     if legacy_dataset_dir:
         parser.add_argument('--dataset-dir', type=Path, default=None, help=argparse.SUPPRESS)
     parser.add_argument('--rounds-ledger-path', type=Path, default=project_root / 'artifacts' / 'training_ledger' / 'training_rounds.jsonl')

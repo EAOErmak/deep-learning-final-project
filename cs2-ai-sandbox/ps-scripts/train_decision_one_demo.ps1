@@ -26,6 +26,7 @@ if ([string]::IsNullOrWhiteSpace($SavePath)) {
 $args = @(
     "cs2_ai/ml/training/train_decision_offline.py",
     "--dataset-dir", $datasetDir,
+    "--dataset-subdir", "rounds-dataset",
     "--epochs", $Epochs,
     "--batch-size", $BatchSize,
     "--seq-len", $SeqLen,

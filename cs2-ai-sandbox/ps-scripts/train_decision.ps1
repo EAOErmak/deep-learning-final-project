@@ -1,4 +1,6 @@
 param (
+    [string]$DataDir = "data\processed",
+    [string]$DatasetSubdir = "rounds-dataset",
     [int]$Epochs = 3,
     [int]$BatchSize = 32,
     [string]$SplitMode = "demo",
@@ -13,6 +15,8 @@ Write-Host "Training offline Decision DQN model..." -ForegroundColor Cyan
 
 $args = @(
     "cs2_ai/ml/training/train_decision_offline.py",
+    "--data-dir", $DataDir,
+    "--dataset-subdir", $DatasetSubdir,
     "--epochs", $Epochs,
     "--batch-size", $BatchSize,
     "--split-mode", $SplitMode,

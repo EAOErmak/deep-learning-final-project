@@ -1,5 +1,6 @@
 param (
-    [string]$DatasetDir = "dataset_10",
+    [string]$DataDir = "data\processed",
+    [string]$DatasetSubdir = "rounds-dataset",
     [int]$ExpectedDemoCount = 10,
     [int]$Epochs = 10,
     [int]$BatchSize = 64,
@@ -35,19 +36,19 @@ function Invoke-TrainingStep {
     }
 }
 
-$datasetPath = Join-Path $PSScriptRoot $DatasetDir
-$cleanPlayPath = Join-Path $datasetPath 'clean_play_ticks'
-if (-not (Test-Path $cleanPlayPath)) {
-    throw "Dataset directory not found: $cleanPlayPath"
+$datasetPath = Join-Path $PSScriptRoot $DataDir
+$roundsDatasetPath = Join-Path $datasetPath $DatasetSubdir
+if (-not (Test-Path $roundsDatasetPath)) {
+    throw "Dataset directory not found: $roundsDatasetPath"
 }
 
-$demoFiles = Get-ChildItem $cleanPlayPath -File -Filter *.parquet
-$demoCount = @($demoFiles).Count
+$demoDirs = Get-ChildItem $roundsDatasetPath -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'rounds') }
+$demoCount = @($demoDirs).Count
 
 Write-Host "=========================================" -ForegroundColor Cyan
 Write-Host "Training 3 modules on local dataset" -ForegroundColor Cyan
 Write-Host "=========================================" -ForegroundColor Cyan
-Write-Host "DatasetDir=$DatasetDir DemoCount=$demoCount ExpectedDemoCount=$ExpectedDemoCount" -ForegroundColor DarkGray
+Write-Host "DataDir=$DataDir DatasetSubdir=$DatasetSubdir DemoCount=$demoCount ExpectedDemoCount=$ExpectedDemoCount" -ForegroundColor DarkGray
 Write-Host "Epochs=$Epochs BatchSize=$BatchSize SeqLen=$SeqLen Stride=$Stride SplitMode=$SplitMode" -ForegroundColor DarkGray
 Write-Host "AimSavePath=$AimSavePath" -ForegroundColor DarkGray
 Write-Host "TrackerSavePath=$TrackerSavePath" -ForegroundColor DarkGray
@@ -58,7 +59,8 @@ if ($demoCount -ne $ExpectedDemoCount) {
 }
 
 $commonArgs = @{
-    DatasetDir = $DatasetDir
+    DataDir = $DataDir
+    DatasetSubdir = $DatasetSubdir
     Epochs = $Epochs
     BatchSize = $BatchSize
     SeqLen = $SeqLen
@@ -106,7 +108,7 @@ Invoke-TrainingStep -Title "[3/4] Training movement..." -Action {
 Invoke-TrainingStep -Title "[4/4] Running train/runtime parity check..." -Action {
     $args = @(
         "scripts/check_train_runtime_feature_parity.py",
-        "--dataset-dir", $DatasetDir,
+        "--dataset-dir", $DataDir,
         "--sample-index", 0,
         "--seq-len", $SeqLen,
         "--aim-checkpoint", $AimSavePath,

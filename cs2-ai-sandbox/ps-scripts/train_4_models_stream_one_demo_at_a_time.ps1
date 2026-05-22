@@ -1,5 +1,6 @@
 param (
-    [string]$DatasetDir = "dataset",
+    [string]$DataDir = "data\processed",
+    [string]$DatasetSubdir = "rounds-dataset",
     [int]$EpochsPerDemo = 1,
     [int]$TrackerBatchSize = 64,
     [int]$AimBatchSize = 64,
@@ -57,23 +58,23 @@ function Resolve-DemoBaseName {
     return $base
 }
 
-$datasetPath = Join-Path $PSScriptRoot $DatasetDir
-$cleanPlayPath = Join-Path $datasetPath 'clean_play_ticks'
-if (-not (Test-Path -LiteralPath $cleanPlayPath)) {
-    throw "Dataset directory not found: $cleanPlayPath"
+$datasetPath = Join-Path $PSScriptRoot $DataDir
+$roundsDatasetPath = Join-Path $datasetPath $DatasetSubdir
+if (-not (Test-Path -LiteralPath $roundsDatasetPath)) {
+    throw "Dataset directory not found: $roundsDatasetPath"
 }
 
-$demoFiles = Get-ChildItem -Path $cleanPlayPath -File -Filter *.parquet | Sort-Object Name
-if (-not $demoFiles) {
-    throw "No parquet demos found in: $cleanPlayPath"
+$demoDirs = Get-ChildItem -Path $roundsDatasetPath -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'rounds') } | Sort-Object Name
+if (-not $demoDirs) {
+    throw "No round demo directories found in: $roundsDatasetPath"
 }
 
-$demoNames = @($demoFiles | ForEach-Object { Resolve-DemoBaseName -Name $_.Name })
+$demoNames = @($demoDirs | ForEach-Object { Resolve-DemoBaseName -Name $_.Name })
 
 Write-Host "=========================================" -ForegroundColor Cyan
 Write-Host "Streaming training: 1 demo at a time" -ForegroundColor Cyan
 Write-Host "=========================================" -ForegroundColor Cyan
-Write-Host "DatasetDir=$DatasetDir DemoCount=$($demoNames.Count) EpochsPerDemo=$EpochsPerDemo" -ForegroundColor DarkGray
+Write-Host "DataDir=$DataDir DatasetSubdir=$DatasetSubdir DemoCount=$($demoNames.Count) EpochsPerDemo=$EpochsPerDemo" -ForegroundColor DarkGray
 Write-Host "TrackerSavePath=$TrackerSavePath" -ForegroundColor DarkGray
 Write-Host "AimSavePath=$AimSavePath" -ForegroundColor DarkGray
 Write-Host "MovementSavePath=$MovementSavePath" -ForegroundColor DarkGray

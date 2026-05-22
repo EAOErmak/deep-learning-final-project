@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from cs2_ai.navigation.dwell import (
@@ -64,43 +65,87 @@ def distance_3d(ax: float, ay: float, az: float, bx: float, by: float, bz: float
     return float(math.sqrt((ax - bx) ** 2 + (ay - by) ** 2 + (az - bz) ** 2))
 
 
-def choose_target_index(
-    group: pd.DataFrame,
-    current_idx: int,
+def _build_segment_arrays(
+    cell_ids: np.ndarray,
+    ticks: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if len(cell_ids) == 0:
+        empty = np.asarray([], dtype=np.int64)
+        return empty, empty, empty, empty
+    segment_start_mask = np.ones(len(cell_ids), dtype=bool)
+    segment_start_mask[1:] = cell_ids[1:] != cell_ids[:-1]
+    segment_start_indices = np.flatnonzero(segment_start_mask).astype(np.int64)
+    next_start_indices = np.append(segment_start_indices[1:], len(cell_ids)).astype(np.int64)
+    segment_end_indices = (next_start_indices - 1).astype(np.int64)
+    row_to_segment_index = np.empty(len(cell_ids), dtype=np.int64)
+    for segment_idx, (start_idx, end_idx) in enumerate(zip(segment_start_indices, segment_end_indices, strict=True)):
+        row_to_segment_index[start_idx:end_idx + 1] = segment_idx
+    return segment_start_indices, segment_end_indices, row_to_segment_index, ticks[segment_start_indices]
+
+
+def _resolve_target_arrays(
     *,
+    positions: np.ndarray,
+    cell_ids: np.ndarray,
+    cell_centers: np.ndarray,
+    segment_start_indices: np.ndarray,
+    row_to_segment_index: np.ndarray,
     lookahead_ticks: int,
     min_target_distance: float,
-    x_col: str,
-    y_col: str,
-    z_col: str,
-) -> tuple[int, int]:
-    if current_idx >= len(group) - 1:
-        return current_idx, 0
+    progress_label: str | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    total_rows = len(cell_ids)
+    target_indices = np.arange(total_rows, dtype=np.int64)
+    has_target = np.zeros(total_rows, dtype=np.int64)
+    if total_rows == 0:
+        return target_indices, has_target
 
-    current_row = group.iloc[current_idx]
-    current_cell_id = int(current_row['current_cell_id'])
-    preferred_idx = min(current_idx + max(int(lookahead_ticks), 1), len(group) - 1)
+    progress_step = max(1, total_rows // 10)
+    min_distance_sq = float(min_target_distance) ** 2
+    segment_cell_ids = cell_ids[segment_start_indices]
+    segment_centers = cell_centers[segment_start_indices]
+    segment_count = len(segment_start_indices)
+    lookahead_offset = max(int(lookahead_ticks), 1)
 
-    candidate_indices = [preferred_idx] + [idx for idx in range(current_idx + 1, len(group)) if idx != preferred_idx]
-    for idx in candidate_indices:
-        candidate = group.iloc[idx]
-        distance = distance_3d(
-            float(current_row[x_col]),
-            float(current_row[y_col]),
-            float(current_row[z_col]),
-            float(candidate['cell_center_x']),
-            float(candidate['cell_center_y']),
-            float(candidate['cell_center_z']),
-        )
-        if int(candidate['current_cell_id']) != current_cell_id and distance >= float(min_target_distance):
-            return idx, 1
+    for idx in range(total_rows):
+        if idx >= total_rows - 1:
+            if progress_label is not None and ((idx + 1) % progress_step == 0 or idx + 1 == total_rows):
+                progress_pct = (100.0 * float(idx + 1)) / float(total_rows)
+                print(f'    {progress_label}: row {idx + 1}/{total_rows} ({progress_pct:5.1f}%)', flush=True)
+            continue
 
-    for idx in range(current_idx + 1, len(group)):
-        candidate = group.iloc[idx]
-        if int(candidate['current_cell_id']) != current_cell_id:
-            return idx, 1
+        current_cell_id = int(cell_ids[idx])
+        preferred_idx = min(idx + lookahead_offset, total_rows - 1)
+        preferred_segment_idx = int(row_to_segment_index[preferred_idx])
+        current_segment_idx = int(row_to_segment_index[idx])
+        future_segment_slice = slice(current_segment_idx + 1, segment_count)
+        future_start_indices = segment_start_indices[future_segment_slice]
 
-    return current_idx, 0
+        if future_start_indices.size > 0:
+            future_cell_ids = segment_cell_ids[future_segment_slice]
+            future_centers = segment_centers[future_segment_slice]
+            deltas = future_centers - positions[idx]
+            distances_sq = np.sum(deltas * deltas, axis=1)
+            valid_future_mask = (future_cell_ids != current_cell_id) & (distances_sq >= min_distance_sq)
+            if np.any(valid_future_mask):
+                candidate_segment_indices = np.flatnonzero(valid_future_mask) + current_segment_idx + 1
+                target_segment_idx = int(candidate_segment_indices[0])
+                if preferred_segment_idx in candidate_segment_indices:
+                    target_segment_idx = int(preferred_segment_idx)
+                target_indices[idx] = int(segment_start_indices[target_segment_idx])
+                has_target[idx] = 1
+            else:
+                different_future_mask = future_cell_ids != current_cell_id
+                if np.any(different_future_mask):
+                    first_different_offset = int(np.flatnonzero(different_future_mask)[0])
+                    target_indices[idx] = int(future_start_indices[first_different_offset])
+                    has_target[idx] = 1
+
+        if progress_label is not None and ((idx + 1) % progress_step == 0 or idx + 1 == total_rows):
+            progress_pct = (100.0 * float(idx + 1)) / float(total_rows)
+            print(f'    {progress_label}: row {idx + 1}/{total_rows} ({progress_pct:5.1f}%)', flush=True)
+
+    return target_indices, has_target
 
 
 def label_navigation_for_group(
@@ -116,8 +161,12 @@ def label_navigation_for_group(
     progress_label: str | None = None,
 ) -> pd.DataFrame:
     ordered = df_group.sort_values(tick_column).reset_index(drop=True).copy()
+    x_values = pd.to_numeric(ordered[x_col], errors='coerce').to_numpy(dtype=float, copy=False)
+    y_values = pd.to_numeric(ordered[y_col], errors='coerce').to_numpy(dtype=float, copy=False)
+    z_values = pd.to_numeric(ordered[z_col], errors='coerce').to_numpy(dtype=float, copy=False)
+    tick_values = pd.to_numeric(ordered[tick_column], errors='coerce').to_numpy(dtype=np.int64, copy=False)
 
-    current_cells = [grid_map.cell_from_position(row[x_col], row[y_col], row[z_col]) for _, row in ordered.iterrows()]
+    current_cells = [grid_map.cell_from_position(x, y, z) for x, y, z in zip(x_values, y_values, z_values, strict=True)]
     ordered['current_cell_id'] = [cell.cell_id for cell in current_cells]
     ordered['cell_ix'] = [cell.ix for cell in current_cells]
     ordered['cell_iy'] = [cell.iy for cell in current_cells]
@@ -125,43 +174,33 @@ def label_navigation_for_group(
     ordered['cell_center_x'] = [cell.center_x for cell in current_cells]
     ordered['cell_center_y'] = [cell.center_y for cell in current_cells]
     ordered['cell_center_z'] = [cell.center_z for cell in current_cells]
+    current_cell_ids = ordered['current_cell_id'].to_numpy(dtype=np.int64, copy=False)
+    cell_centers = ordered[['cell_center_x', 'cell_center_y', 'cell_center_z']].to_numpy(dtype=float, copy=False)
+    positions = np.column_stack((x_values, y_values, z_values))
+    segment_start_indices, segment_end_indices, row_to_segment_index, _ = _build_segment_arrays(current_cell_ids, tick_values)
 
-    ordered['next_cell_id'] = ordered['current_cell_id']
-    ordered['next_cell_center_x'] = ordered['cell_center_x']
-    ordered['next_cell_center_y'] = ordered['cell_center_y']
-    ordered['next_cell_center_z'] = ordered['cell_center_z']
-    ordered['has_next_cell_target'] = 0
-
-    progress_step = max(1, len(ordered) // 10)
-    for idx in range(len(ordered)):
-        target_idx, has_target = choose_target_index(
-            ordered,
-            idx,
-            lookahead_ticks=lookahead_ticks,
-            min_target_distance=min_target_distance,
-            x_col=x_col,
-            y_col=y_col,
-            z_col=z_col,
-        )
-        target_row = ordered.iloc[target_idx]
-        ordered.loc[idx, 'next_cell_id'] = int(target_row['current_cell_id'])
-        ordered.loc[idx, 'next_cell_center_x'] = float(target_row['cell_center_x'])
-        ordered.loc[idx, 'next_cell_center_y'] = float(target_row['cell_center_y'])
-        ordered.loc[idx, 'next_cell_center_z'] = float(target_row['cell_center_z'])
-        ordered.loc[idx, 'has_next_cell_target'] = int(has_target)
-        if progress_label is not None and ((idx + 1) % progress_step == 0 or idx + 1 == len(ordered)):
-            progress_pct = (100.0 * float(idx + 1)) / float(len(ordered))
-            print(
-                f'    {progress_label}: row {idx + 1}/{len(ordered)} ({progress_pct:5.1f}%)',
-                flush=True,
-            )
-
-    ordered['next_cell_rel_x'] = ordered['next_cell_center_x'] - ordered[x_col].astype(float)
-    ordered['next_cell_rel_y'] = ordered['next_cell_center_y'] - ordered[y_col].astype(float)
-    ordered['next_cell_rel_z'] = ordered['next_cell_center_z'] - ordered[z_col].astype(float)
-    ordered['next_cell_distance'] = (
-        (ordered['next_cell_rel_x'] ** 2 + ordered['next_cell_rel_y'] ** 2 + ordered['next_cell_rel_z'] ** 2) ** 0.5
+    target_indices, has_target = _resolve_target_arrays(
+        positions=positions,
+        cell_ids=current_cell_ids,
+        cell_centers=cell_centers,
+        segment_start_indices=segment_start_indices,
+        row_to_segment_index=row_to_segment_index,
+        lookahead_ticks=lookahead_ticks,
+        min_target_distance=min_target_distance,
+        progress_label=progress_label,
     )
+    target_centers = cell_centers[target_indices]
+    ordered['next_cell_id'] = current_cell_ids[target_indices]
+    ordered['next_cell_center_x'] = target_centers[:, 0]
+    ordered['next_cell_center_y'] = target_centers[:, 1]
+    ordered['next_cell_center_z'] = target_centers[:, 2]
+    ordered['has_next_cell_target'] = has_target
+
+    next_rel = target_centers - positions
+    ordered['next_cell_rel_x'] = next_rel[:, 0]
+    ordered['next_cell_rel_y'] = next_rel[:, 1]
+    ordered['next_cell_rel_z'] = next_rel[:, 2]
+    ordered['next_cell_distance'] = np.sqrt(np.sum(next_rel * next_rel, axis=1))
 
     ordered['segment_start_tick'] = 0
     ordered['segment_end_tick'] = 0
@@ -172,15 +211,16 @@ def label_navigation_for_group(
     ordered['dwell_medium_hold'] = 0.0
     ordered['dwell_long_hold'] = 0.0
 
-    for segment in compress_cell_segments(ordered, tick_column=tick_column):
-        mask = (ordered[tick_column].astype(int) >= segment.segment_start_tick) & (ordered[tick_column].astype(int) <= segment.segment_end_tick)
-        ordered.loc[mask, 'segment_start_tick'] = segment.segment_start_tick
-        ordered.loc[mask, 'segment_end_tick'] = segment.segment_end_tick
-        ordered.loc[mask, 'dwell_ticks'] = segment.dwell_ticks
-        ordered.loc[mask, 'dwell_bucket_id'] = segment.dwell_bucket_id
-        ordered.loc[mask, 'dwell_pass_through'] = 1.0 if segment.dwell_bucket_id == DWELL_BUCKET_PASS_THROUGH else 0.0
-        ordered.loc[mask, 'dwell_short_hold'] = 1.0 if segment.dwell_bucket_id == DWELL_BUCKET_SHORT_HOLD else 0.0
-        ordered.loc[mask, 'dwell_medium_hold'] = 1.0 if segment.dwell_bucket_id == DWELL_BUCKET_MEDIUM_HOLD else 0.0
-        ordered.loc[mask, 'dwell_long_hold'] = 1.0 if segment.dwell_bucket_id == DWELL_BUCKET_LONG_HOLD else 0.0
+    for segment_index, segment in enumerate(compress_cell_segments(ordered, tick_column=tick_column)):
+        start_idx = int(segment_start_indices[segment_index])
+        end_idx = int(segment_end_indices[segment_index]) + 1
+        ordered.loc[start_idx:end_idx - 1, 'segment_start_tick'] = segment.segment_start_tick
+        ordered.loc[start_idx:end_idx - 1, 'segment_end_tick'] = segment.segment_end_tick
+        ordered.loc[start_idx:end_idx - 1, 'dwell_ticks'] = segment.dwell_ticks
+        ordered.loc[start_idx:end_idx - 1, 'dwell_bucket_id'] = segment.dwell_bucket_id
+        ordered.loc[start_idx:end_idx - 1, 'dwell_pass_through'] = 1.0 if segment.dwell_bucket_id == DWELL_BUCKET_PASS_THROUGH else 0.0
+        ordered.loc[start_idx:end_idx - 1, 'dwell_short_hold'] = 1.0 if segment.dwell_bucket_id == DWELL_BUCKET_SHORT_HOLD else 0.0
+        ordered.loc[start_idx:end_idx - 1, 'dwell_medium_hold'] = 1.0 if segment.dwell_bucket_id == DWELL_BUCKET_MEDIUM_HOLD else 0.0
+        ordered.loc[start_idx:end_idx - 1, 'dwell_long_hold'] = 1.0 if segment.dwell_bucket_id == DWELL_BUCKET_LONG_HOLD else 0.0
 
     return ordered

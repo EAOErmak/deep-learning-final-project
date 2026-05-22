@@ -9,9 +9,3 @@ artifacts/*
 !artifacts/.gitkeep
 data/*
 !data/.gitkeep
-!data/processed/
-!data/trainsets/
-data/processed/*
-!data/processed/.gitkeep
-data/trainsets/*
-!data/trainsets/.gitkeep
