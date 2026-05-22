@@ -329,11 +329,105 @@ class AimSequenceTorchDataset(Dataset):
                 return valid_indices
             except Exception as exc:
                 print(f'WARNING: failed to load aim relevance cache {cache_path}: {exc}')
+        import time
+        start_time = time.time()
+        fast_path_used = False
         valid_indices: list[int] = []
-        for idx in range(len(self.base_dataset)):
-            sample_metadata = self.get_base_sample_metadata(idx)
-            if self.sample_has_spotted_enemy(sample_metadata):
-                valid_indices.append(idx)
+        
+        ds = self.base_dataset
+        while hasattr(ds, 'dataset'):
+            ds = ds.dataset
+            
+        if type(ds).__name__ == 'SingleRoundSequenceDataset' and hasattr(ds, 'round_tick_rows'):
+            try:
+                print('AimSequenceTorchDataset: Attempting fast single-round aim relevance path...')
+                lookup = set()
+                round_tick_rows = ds.round_tick_rows
+                
+                has_required_cols = False
+                for round_number, ticks in round_tick_rows.items():
+                    for tick, tick_df in ticks.items():
+                        if not tick_df.empty:
+                            required_cols = {'steamid'}
+                            spotted_col = next((c for c in ('spotted', 'is_spotted') if c in tick_df.columns), None)
+                            if spotted_col:
+                                required_cols.add(spotted_col)
+                            if not required_cols.issubset(tick_df.columns):
+                                raise ValueError("Missing required columns for fast path")
+                            has_required_cols = True
+                            break
+                    if has_required_cols:
+                        break
+                        
+                if not has_required_cols:
+                    raise ValueError("No valid tick rows found to verify columns")
+
+                import pandas as pd
+                import numpy as np
+                for round_number, ticks in round_tick_rows.items():
+                    for tick, tick_df in ticks.items():
+                        if tick_df.empty:
+                            continue
+                        spotted_col = next((c for c in ('spotted', 'is_spotted') if c in tick_df.columns), None)
+                        if not spotted_col:
+                            continue
+                            
+                        steamids = pd.to_numeric(tick_df['steamid'], errors='coerce').fillna(-1).to_numpy(dtype=np.int64)
+                        
+                        team_values = None
+                        if 'team_num' in tick_df.columns:
+                            team_values = pd.to_numeric(tick_df['team_num'], errors='coerce').to_numpy(dtype=np.float64)
+                            
+                        spotted_values = pd.to_numeric(tick_df[spotted_col], errors='coerce').fillna(0).to_numpy(dtype=np.float64) > 0
+                        
+                        if 'is_alive' in tick_df.columns:
+                            alive_values = tick_df['is_alive'].fillna(False).astype(bool).to_numpy(dtype=bool)
+                        else:
+                            alive_values = np.ones(len(tick_df), dtype=bool)
+
+                        for i in range(len(steamids)):
+                            perspective = steamids[i]
+                            if perspective == -1:
+                                continue
+                                
+                            if team_values is not None:
+                                p_team = team_values[i]
+                                if np.isnan(p_team):
+                                    enemy_mask = steamids != perspective
+                                else:
+                                    enemy_mask = (team_values != p_team) & ~np.isnan(team_values)
+                            else:
+                                enemy_mask = steamids != perspective
+                                
+                            if bool(np.any(enemy_mask & spotted_values & alive_values)):
+                                lookup.add((int(tick), int(perspective)))
+                
+                for idx in range(len(self.base_dataset)):
+                    sample_metadata = self.get_base_sample_metadata(idx)
+                    perspective_steamid = int(sample_metadata['perspective_steamid'])
+                    ticks_to_check = [int(t) for t in sample_metadata.get('tick_indices', ())]
+                    ticks_to_check.append(int(sample_metadata['target_tick']))
+                    
+                    if any((t, perspective_steamid) in lookup for t in ticks_to_check):
+                        valid_indices.append(idx)
+
+                fast_path_used = True
+                print(f'AimSequenceTorchDataset: using fast single-round aim relevance path. Found {len(valid_indices)} valid samples. Time spent: {time.time() - start_time:.2f}s.')
+            except Exception as e:
+                print(f'AimSequenceTorchDataset: fallback to slow path ({e})...')
+                
+        if not fast_path_used:
+            valid_indices = []
+            total_samples = len(self.base_dataset)
+            log_interval = max(10000, total_samples // 20)
+            for idx in range(total_samples):
+                if idx > 0 and idx % log_interval == 0:
+                    print(f"  Processed {idx}/{total_samples} samples ({(idx / total_samples):.1%})...", flush=True)
+                sample_metadata = self.get_base_sample_metadata(idx)
+                if self.sample_has_spotted_enemy(sample_metadata):
+                    valid_indices.append(idx)
+            print(f'AimSequenceTorchDataset: fallback to slow path. Found {len(valid_indices)} valid samples. Time spent: {time.time() - start_time:.2f}s.')
+
         if cache_path is not None:
             try:
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -738,9 +832,21 @@ def collect_expected_demo_counts(dataset) -> dict[str, int]:
         indices = list(range(len(dataset)))
         source_dataset = dataset
     counts: dict[str, int] = {}
+    has_samples = hasattr(source_dataset, 'samples')
     for idx in indices:
-        metadata = source_dataset.get_sample_metadata(int(idx))
-        demo_name = str(metadata['demo_name'])
+        demo_name = None
+        if has_samples:
+            try:
+                sample = source_dataset.samples[idx]
+                if hasattr(sample, 'demo_name'):
+                    demo_name = str(sample.demo_name)
+                elif isinstance(sample, dict) and 'demo_name' in sample:
+                    demo_name = str(sample['demo_name'])
+            except Exception:
+                pass
+        if demo_name is None:
+            metadata = source_dataset.get_sample_metadata(int(idx))
+            demo_name = str(metadata['demo_name'])
         counts[demo_name] = counts.get(demo_name, 0) + 1
     return counts
 
@@ -784,13 +890,22 @@ def print_coverage_summary(phase: str, coverage_summary: dict[str, object]) -> N
         print(f"  {phase} demo {demo_name}: {demo_summary['seen']}/{demo_summary['expected']} ({demo_summary['coverage']:.2%}) | avg_loss={demo_summary['avg_loss']:.4f}")
 
 
-def compute_binary_action_stats(dataset) -> dict[str, object]:
+def compute_binary_action_stats(dataset, sample_size: int | None = None, seed: int = 42) -> dict[str, object]:
     if hasattr(dataset, 'indices') and hasattr(dataset, 'dataset'):
         source_dataset = dataset.dataset
         indices = [int(idx) for idx in dataset.indices]
     else:
         source_dataset = dataset
         indices = list(range(len(dataset)))
+        
+    sampled = False
+    total_samples = len(indices)
+    
+    if sample_size is not None and sample_size > 0 and len(indices) > sample_size:
+        rng = random.Random(seed)
+        indices = rng.sample(indices, sample_size)
+        sampled = True
+
     positives = np.zeros(3, dtype=np.float64)
     valid_sum = 0.0
     for idx in indices:
@@ -798,18 +913,25 @@ def compute_binary_action_stats(dataset) -> dict[str, object]:
         positives += target.binary_actions
         valid_sum += float(target.valid_aim_mask[0])
     total = max(len(indices), 1)
+    
+    print(f"compute_binary_action_stats: total={total_samples}, used={len(indices)}, sampled={sampled}", flush=True)
+    
     return {
         'positive_ratios': (positives / total).astype(np.float64).tolist(),
         'positive_counts': positives.astype(np.int64).tolist(),
         'valid_aim_rate': float(valid_sum / total),
-        'sample_count': int(len(indices)),
+        'sample_count_used': int(len(indices)),
+        'sample_count_total': total_samples,
+        'sampled': sampled,
+        'binary_stats_sample_size': sample_size,
     }
 
 
-def compute_binary_pos_weight(dataset, mode: str) -> np.ndarray | None:
+def compute_binary_pos_weight(dataset, mode: str, stats: dict[str, object] | None = None) -> np.ndarray | None:
     if mode == 'none':
         return None
-    stats = compute_binary_action_stats(dataset)
+    if stats is None:
+        stats = compute_binary_action_stats(dataset)
     ratios = np.asarray(stats['positive_ratios'], dtype=np.float64)
     pos_weight = np.ones(3, dtype=np.float32)
     for idx, ratio in enumerate(ratios):
@@ -831,6 +953,7 @@ def save_checkpoint(
     train_round_usage: list[dict[str, object]],
     val_round_usage: list[dict[str, object]],
     round_dataset_format: str | None = None,
+    train_stats: dict[str, object] | None = None,
 ) -> None:
     save_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint = {
@@ -849,6 +972,8 @@ def save_checkpoint(
         'split_mode': args.split_mode,
         'aim_feature_mode': args.aim_feature_mode,
         'aim_head_mode': args.aim_head_mode,
+        'binary_stats_sample_size': train_stats.get('binary_stats_sample_size') if train_stats else getattr(args, 'binary_stats_sample_size', None),
+        'binary_stats_sampled': train_stats.get('sampled') if train_stats else None,
         'train_metrics': {k: v for k, v in train_metrics.items() if k not in AIM_METRIC_DICT_KEYS},
         'val_metrics': {k: v for k, v in val_metrics.items() if k not in AIM_METRIC_DICT_KEYS},
         'train_round_count': len(train_round_usage),
@@ -894,6 +1019,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--binary-weight', type=float, default=1.0)
     parser.add_argument('--confidence-weight', type=float, default=0.25)
     parser.add_argument('--binary-pos-weight-mode', choices=['auto', 'none'], default='auto')
+    parser.add_argument('--binary-stats-sample-size', type=int, default=50000, help='maximum number of samples used to estimate binary action class weights; use 0 or negative to scan all samples')
     parser.add_argument('--vision-dropout-prob', type=float, default=0.15)
     parser.add_argument('--vision-noise-std', type=float, default=0.03)
     parser.add_argument('--vision-confidence-jitter', type=float, default=0.1)
@@ -1062,8 +1188,8 @@ def run_round_stream_training(args: argparse.Namespace, device: str, runtime_inf
                 if dataset_len == 0:
                     print(f'Skipping round with zero aim-relevant samples: {round_path}')
                     continue
-                train_stats = compute_binary_action_stats(dataset)
-                train_pos_weight_np = compute_binary_pos_weight(dataset, args.binary_pos_weight_mode) if dataset_len > 0 else None
+                train_stats = compute_binary_action_stats(dataset, sample_size=args.binary_stats_sample_size, seed=args.seed)
+                train_pos_weight_np = compute_binary_pos_weight(dataset, args.binary_pos_weight_mode, stats=train_stats) if dataset_len > 0 else None
                 trainer.binary_pos_weight = torch.tensor(train_pos_weight_np, dtype=torch.float32).to(device) if train_pos_weight_np is not None else None
                 train_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_aim_batch, **train_loader_kwargs)
                 print(
@@ -1108,6 +1234,7 @@ def run_round_stream_training(args: argparse.Namespace, device: str, runtime_inf
                     train_round_usage=round_usage,
                     val_round_usage=[],
                     round_dataset_format='rounds',
+                    train_stats=train_stats,
                 )
                 rounds_completed += 1
                 processed_in_cycle += 1
@@ -1194,8 +1321,8 @@ def main() -> int:
     )
     train_expected_counts = collect_expected_demo_counts(train_dataset)
     val_expected_counts = collect_expected_demo_counts(val_dataset)
-    train_stats = compute_binary_action_stats(train_dataset)
-    train_pos_weight_np = compute_binary_pos_weight(train_dataset, args.binary_pos_weight_mode) if len(train_dataset) > 0 else None
+    train_stats = compute_binary_action_stats(train_dataset, sample_size=args.binary_stats_sample_size, seed=args.seed)
+    train_pos_weight_np = compute_binary_pos_weight(train_dataset, args.binary_pos_weight_mode, stats=train_stats) if len(train_dataset) > 0 else None
     print(f'Aim relevance-filtered samples: {dataset_len}')
     print(f'Valid aim rate: {train_stats["valid_aim_rate"]:.4f}')
     print('Binary target positive ratios:')
@@ -1316,6 +1443,7 @@ def main() -> int:
                     train_round_usage=train_round_usage,
                     val_round_usage=val_round_usage,
                     round_dataset_format=getattr(dataset.base_dataset, 'dataset_format', None),
+                    train_stats=train_stats,
                 )
                 print(f'  saved checkpoint -> {args.save_path}')
     finally:

@@ -71,13 +71,16 @@ def filter_dataset_by_trained_rounds(
         checkpoint_path=checkpoint_path,
         match_mode=match_mode,
     )
-    round_uids_before = {str(round_metadata_from_sample(dataset.get_sample_metadata(idx))['round_uid']) for idx in range(len(dataset))}
+    round_uids_before = set()
+    remaining_round_uids = set()
     keep_indices: list[int] = []
     for idx in range(len(dataset)):
         round_uid = str(round_metadata_from_sample(dataset.get_sample_metadata(idx))['round_uid'])
+        round_uids_before.add(round_uid)
         if round_uid not in trained_round_uids:
             keep_indices.append(idx)
-    remaining_round_uids = {str(round_metadata_from_sample(dataset.get_sample_metadata(idx))['round_uid']) for idx in keep_indices}
+            remaining_round_uids.add(round_uid)
+            
     skipped_round_count = len(round_uids_before - remaining_round_uids)
     filtered = Subset(dataset, keep_indices)
     return filtered, {
