@@ -1,7 +1,7 @@
 param (
     [string]$RoundsDatasetDir = "data\processed\rounds-dataset-grid",
-    [string]$OutputTrainsetDir = "data\trainsets\movement_solo_grid",
     [int]$Epochs = 10,
+    [int]$EpochsPerRound = 1,
     [int]$BatchSize = 64,
     [int]$SeqLen = 64,
     [int]$Stride = 8,
@@ -10,36 +10,33 @@ param (
     [switch]$ShowIndexProgress,
     [switch]$DisableBatchProgress,
     [int]$LogEvery = 10,
+    [string]$ResumeFrom = '',
     [string]$SavePath = "checkpoints\movement_bc_v1.pt",
-    [string]$Map = "de_dust2",
-    [int]$Seed = 42
+    [int]$MovementStatsSampleSize = 5000,
+    [int]$Seed = 42,
+    [int]$MaxRounds = 0,
+    [switch]$SkipTrainedRounds,
+    [switch]$ShuffleRounds
 )
 
-Write-Host "Building movement trainset from rounds dataset..." -ForegroundColor Cyan
-Write-Host "RoundsDatasetDir=$RoundsDatasetDir OutputTrainsetDir=$OutputTrainsetDir Map=$Map SplitMode=$SplitMode" -ForegroundColor DarkGray
+$resolvedRoundsDatasetDir = (Resolve-Path -LiteralPath $RoundsDatasetDir).Path
+$datasetSubdir = Split-Path -Path $resolvedRoundsDatasetDir -Leaf
+$dataDir = Split-Path -Path $resolvedRoundsDatasetDir -Parent
 
-$buildArgs = @(
-    "-m", "cs2_ai.preprocessing.build_movement_trainset",
-    "--rounds-dataset-dir", $RoundsDatasetDir,
-    "--output-dir", $OutputTrainsetDir,
-    "--map", $Map,
-    "--feature-mode", "solo_grid",
-    "--split-unit", $SplitMode,
-    "--require-grid-labels", "true",
-    "--seed", $Seed
-)
-
-python @buildArgs
-if ($LASTEXITCODE -ne 0) {
-    exit $LASTEXITCODE
+if ($MaxRounds -gt 0) {
+    Write-Host "Movement training max rounds: $MaxRounds" -ForegroundColor Cyan
+} else {
+    Write-Host "Movement training max rounds: unlimited" -ForegroundColor Cyan
 }
-
-Write-Host "Training movement model from prebuilt trainset..." -ForegroundColor Cyan
+Write-Host "Movement skip trained rounds: $([bool]$SkipTrainedRounds)" -ForegroundColor Cyan
+Write-Host "Movement stream dataset: $resolvedRoundsDatasetDir" -ForegroundColor DarkGray
 
 $args = @(
     "cs2_ai/ml/training/train_movement.py",
-    "--trainset-dir", $OutputTrainsetDir,
+    "--data-dir", $dataDir,
+    "--dataset-subdir", $datasetSubdir,
     "--epochs", $Epochs,
+    "--epochs-per-round", $EpochsPerRound,
     "--batch-size", $BatchSize,
     "--seq-len", $SeqLen,
     "--stride", $Stride,
@@ -47,7 +44,10 @@ $args = @(
     "--num-workers", $NumWorkers,
     "--log-every", $LogEvery,
     "--movement-feature-mode", "solo_grid",
-    "--save-path", $SavePath
+    "--movement-stats-sample-size", $MovementStatsSampleSize,
+    "--save-path", $SavePath,
+    "--stream-by-round",
+    "--seed", $Seed
 )
 
 if ($ShowIndexProgress) {
@@ -56,6 +56,22 @@ if ($ShowIndexProgress) {
 
 if ($DisableBatchProgress) {
     $args += "--disable-batch-progress"
+}
+
+if ($ShuffleRounds) {
+    $args += "--shuffle-rounds"
+}
+
+if ($SkipTrainedRounds) {
+    $args += "--skip-trained-rounds"
+}
+
+if ($MaxRounds -gt 0) {
+    $args += @("--max-rounds", "$MaxRounds")
+}
+
+if (-not [string]::IsNullOrWhiteSpace($ResumeFrom)) {
+    $args += @("--resume-from", $ResumeFrom)
 }
 
 python @args

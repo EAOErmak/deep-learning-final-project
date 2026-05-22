@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from cs2_ai.features.movement_features import GRID_NAVIGATION_REQUIRED_COLUMNS, MOVEMENT_FEATURE_MODE_SOLO_GRID
@@ -106,6 +107,51 @@ def coerce_bool_series(series: pd.Series) -> pd.Series:
     return lowered.isin({'1', 'true', 'yes', 'y'}).astype(float)
 
 
+def resolve_airborne_column(df: pd.DataFrame) -> str | None:
+    for column in ('is_airborne', 'airborne', 'self_is_airborne', 'player_is_airborne'):
+        if column in df.columns:
+            return column
+    return None
+
+
+def infer_move_jump_from_state(df: pd.DataFrame) -> pd.Series | None:
+    airborne_column = resolve_airborne_column(df)
+    if airborne_column is None:
+        return None
+    try:
+        _, _, vel_columns, _ = canonicalize_position_and_state_columns(df)
+    except Exception:
+        vel_columns = resolve_velocity_columns(df)
+    _, _, vel_z_col = vel_columns
+    if vel_z_col not in df.columns:
+        return None
+
+    tick_column = resolve_tick_column(df)
+    if tick_column is None:
+        return None
+    group_columns = [column for column in resolve_group_columns(df) if column in df.columns]
+    if 'steamid' in df.columns and 'steamid' not in group_columns:
+        group_columns.append('steamid')
+    if 'name' in df.columns and not group_columns:
+        group_columns.append('name')
+    if not group_columns:
+        return None
+
+    ordered = df.copy()
+    ordered['_movement_row_index'] = np.arange(len(ordered), dtype='int64')
+    ordered['_airborne_numeric'] = coerce_bool_series(ordered[airborne_column])
+    ordered['_vel_z_numeric'] = pd.to_numeric(ordered[vel_z_col], errors='coerce').fillna(0.0)
+    ordered = ordered.sort_values(group_columns + [tick_column, '_movement_row_index']).reset_index(drop=True)
+    previous_airborne = ordered.groupby(group_columns, sort=False)['_airborne_numeric'].shift(1).fillna(0.0)
+    inferred_jump = (
+        (ordered['_airborne_numeric'] > 0.5)
+        & (previous_airborne <= 0.5)
+        & (ordered['_vel_z_numeric'] > 20.0)
+    ).astype(float)
+    inferred_by_original_index = pd.Series(inferred_jump.to_numpy(dtype=float), index=ordered['_movement_row_index'].to_numpy(dtype='int64'))
+    return inferred_by_original_index.reindex(range(len(df)), fill_value=0.0).astype(float)
+
+
 def resolve_movement_target_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, str | None]]:
     candidates = {
         'move_forward': ('move_forward', 'forward', 'FORWARD'),
@@ -114,7 +160,7 @@ def resolve_movement_target_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, dic
         'move_right': ('move_right', 'right', 'RIGHT'),
         'move_walk': ('move_walk', 'walk', 'WALK', 'is_walking'),
         'move_crouch': ('move_crouch', 'crouch', 'duck', 'ducking', 'is_ducking'),
-        'move_jump': ('move_jump', 'jump', 'JUMP', 'is_jumping', 'jump_pressed'),
+        'move_jump': ('move_jump', 'jump', 'JUMP', 'is_jumping', 'jump_pressed', 'IN_JUMP', 'in_jump', 'usercmd_jump'),
     }
     result = df.copy()
     resolved: dict[str, str | None] = {}
@@ -124,6 +170,13 @@ def resolve_movement_target_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, dic
         if source is None:
             if canonical in REQUIRED_MOVE_COLUMNS:
                 raise ValueError(f'Missing required movement target column for {canonical}. Checked: {options}')
+            if canonical == 'move_jump':
+                inferred_jump = infer_move_jump_from_state(result)
+                if inferred_jump is not None:
+                    print('WARNING: explicit move_jump column missing; inferring jump targets from airborne transition and velocity_Z.')
+                    result[canonical] = inferred_jump
+                    resolved[canonical] = 'inferred_from_airborne_velocity'
+                    continue
             print(f'WARNING: optional movement target column missing for {canonical}; filling zeros.')
             result[canonical] = 0.0
             continue

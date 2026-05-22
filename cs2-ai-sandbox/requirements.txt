@@ -16,3 +16,9 @@ opencv-python==4.9.0.80
 # Optional future RL stack:
 # gymnasium==1.2.0
 # stable-baselines3==2.7.0
+
+# Realtime Viewer Dependencies
+PySide6
+pyqtgraph
+PyOpenGL
+PyOpenGL_accelerate
