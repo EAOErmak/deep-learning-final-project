@@ -24,7 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import numpy as np
 import pandas as pd
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 
 from cs2_ai.dataset.multi_demo_sequence_dataset import MultiDemoSequenceDataset, split_dataset_by_group
 from cs2_ai.dataset.parquet_loader import list_parquet_files, load_parquet, parquet_demo_name
@@ -1558,6 +1558,39 @@ def empty_movement_metrics(action_names: tuple[str, ...]) -> dict[str, object]:
     }
 
 
+def split_single_round_dataset_for_validation(
+    dataset: MovementSequenceTorchDataset,
+    val_split: float,
+) -> tuple[Dataset, Dataset]:
+    dataset_len = len(dataset)
+    if dataset_len <= 1:
+        print('WARNING: round has <= 1 valid sample; using the same sample set for train and val.', flush=True)
+        return dataset, dataset
+
+    effective_val_split = float(min(max(val_split, 0.05), 0.5))
+    ordered_indices = sorted(
+        range(dataset_len),
+        key=lambda idx: (
+            int(dataset.get_sample_metadata(idx).get('target_tick', 0)),
+            int(dataset.get_sample_metadata(idx).get('perspective_steamid', 0)),
+            str(dataset.get_sample_metadata(idx).get('sample_id', '')),
+        ),
+    )
+    val_count = max(1, int(round(dataset_len * effective_val_split)))
+    if val_count >= dataset_len:
+        val_count = dataset_len - 1
+    train_count = dataset_len - val_count
+    if train_count <= 0:
+        train_count = dataset_len - 1
+        val_count = 1
+    train_indices = ordered_indices[:train_count]
+    val_indices = ordered_indices[train_count:]
+    if not train_indices or not val_indices:
+        print('WARNING: failed to create a non-empty temporal val split; using the same dataset for train and val.', flush=True)
+        return dataset, dataset
+    return Subset(dataset, train_indices), Subset(dataset, val_indices)
+
+
 def run_round_stream_training(args: argparse.Namespace, device: str, runtime_info: dict[str, object]) -> int:
     round_files = discover_round_training_files(args)
     if not round_files:
@@ -1663,28 +1696,41 @@ def run_round_stream_training(args: argparse.Namespace, device: str, runtime_inf
                 if dataset_len == 0:
                     print(f'Skipping round with zero valid movement samples: {round_path}')
                     continue
+                train_dataset, val_dataset = split_single_round_dataset_for_validation(dataset, args.val_split)
                 dataset_stats = compute_action_ratios(dataset, sample_size=args.movement_stats_sample_size, seed=args.seed)
                 train_pos_weight_np = compute_pos_weight(dataset, args.movement_pos_weight_mode, args.pos_weight_values, stats=dataset_stats) if dataset_len > 0 else None
                 trainer.pos_weight = torch.tensor(train_pos_weight_np, dtype=torch.float32).to(device) if train_pos_weight_np is not None else None
-                train_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_movement_batch, **train_loader_kwargs)
+                val_loader_kwargs = build_dataloader_kwargs(device, args.num_workers, is_training=False)
+                if int(val_loader_kwargs.get('num_workers', 0)) > 0:
+                    val_loader_kwargs['num_workers'] = 0
+                    val_loader_kwargs.pop('persistent_workers', None)
+                    val_loader_kwargs.pop('prefetch_factor', None)
+                train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_movement_batch, **train_loader_kwargs)
+                val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_movement_batch, **val_loader_kwargs)
                 print(
-                    f'Round {round_uid}: samples={dataset_len} epochs_per_round={args.epochs_per_round}',
+                    f'Round {round_uid}: total_samples={dataset_len} train_samples={len(train_dataset)} val_samples={len(val_dataset)} '
+                    f'epochs_per_round={args.epochs_per_round}',
                     flush=True,
                 )
                 for name, ratio in zip(dataset.action_names, dataset_stats['positive_ratios'], strict=True):
                     print(f'  {name}: {float(ratio):.4f}', flush=True)
+                last_val_metrics = empty_movement_metrics(dataset.action_names)
                 for local_epoch in range(1, int(args.epochs_per_round) + 1):
                     global_epoch = rounds_completed * int(args.epochs_per_round) + local_epoch
                     last_train_metrics = trainer.train_epoch(train_loader, epoch_idx=global_epoch, total_epochs=total_epochs_hint, writer=writer)
+                    last_val_metrics = trainer.eval_epoch(val_loader, epoch_idx=global_epoch, total_epochs=total_epochs_hint, writer=writer)
                     print(
                         f'Round {round_uid} | epoch {local_epoch}/{args.epochs_per_round} | '
-                        f'loss={last_train_metrics["loss"]:.4f} binary={last_train_metrics["binary_loss"]:.4f}',
+                        f'train_loss={last_train_metrics["loss"]:.4f} train_binary={last_train_metrics["binary_loss"]:.4f} '
+                        f'val_loss={last_val_metrics["loss"]:.4f} val_binary={last_val_metrics["binary_loss"]:.4f}',
                         flush=True,
                     )
                     log_scalar_dict(writer, 'round_train', last_train_metrics, global_epoch, ignored_keys=MOVEMENT_METRIC_DICT_KEYS)
+                    log_scalar_dict(writer, 'round_val', last_val_metrics, global_epoch, ignored_keys=MOVEMENT_METRIC_DICT_KEYS)
                     if writer is not None:
                         writer.flush()
-                round_usage = collect_round_usage(dataset)
+                train_round_usage = collect_round_usage(train_dataset)
+                val_round_usage = collect_round_usage(val_dataset)
                 ledger.append_run_rounds(
                     run_id=run_id,
                     module_name='movement',
@@ -1694,7 +1740,18 @@ def run_round_stream_training(args: argparse.Namespace, device: str, runtime_inf
                     dataset_subdir=args.dataset_subdir,
                     split_mode='round_stream',
                     split='train',
-                    round_usage=round_usage,
+                    round_usage=train_round_usage,
+                )
+                ledger.append_run_rounds(
+                    run_id=run_id,
+                    module_name='movement',
+                    model_name=args.model,
+                    checkpoint_path=str(args.save_path),
+                    dataset_dir=str(dataset_root),
+                    dataset_subdir=args.dataset_subdir,
+                    split_mode='round_stream',
+                    split='val',
+                    round_usage=val_round_usage,
                 )
                 trained_round_uids.add(round_uid)
                 save_checkpoint(
@@ -1702,19 +1759,20 @@ def run_round_stream_training(args: argparse.Namespace, device: str, runtime_inf
                     model,
                     args,
                     last_train_metrics,
-                    empty_movement_metrics(dataset.action_names),
+                    last_val_metrics,
                     dataset_label,
                     feature_schema,
                     dataset.base_dataset.get_demo_names(),
                     dataset.action_names,
                     round_dataset_format='rounds',
-                    train_round_usage=round_usage,
-                    val_round_usage=[],
+                    train_round_usage=train_round_usage,
+                    val_round_usage=val_round_usage,
                 )
                 rounds_completed += 1
                 processed_in_cycle += 1
                 print(f'Completed round {round_uid}. Total rounds trained: {rounds_completed}', flush=True)
                 del train_loader
+                del val_loader
                 del dataset
             if args.skip_trained_rounds and processed_in_cycle == 0:
                 print('No remaining rounds to train after --skip-trained-rounds filtering.')
