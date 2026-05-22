@@ -113,6 +113,7 @@ def label_navigation_for_group(
     y_col: str,
     z_col: str,
     tick_column: str,
+    progress_label: str | None = None,
 ) -> pd.DataFrame:
     ordered = df_group.sort_values(tick_column).reset_index(drop=True).copy()
 
@@ -131,6 +132,7 @@ def label_navigation_for_group(
     ordered['next_cell_center_z'] = ordered['cell_center_z']
     ordered['has_next_cell_target'] = 0
 
+    progress_step = max(1, len(ordered) // 10)
     for idx in range(len(ordered)):
         target_idx, has_target = choose_target_index(
             ordered,
@@ -147,6 +149,12 @@ def label_navigation_for_group(
         ordered.loc[idx, 'next_cell_center_y'] = float(target_row['cell_center_y'])
         ordered.loc[idx, 'next_cell_center_z'] = float(target_row['cell_center_z'])
         ordered.loc[idx, 'has_next_cell_target'] = int(has_target)
+        if progress_label is not None and ((idx + 1) % progress_step == 0 or idx + 1 == len(ordered)):
+            progress_pct = (100.0 * float(idx + 1)) / float(len(ordered))
+            print(
+                f'    {progress_label}: row {idx + 1}/{len(ordered)} ({progress_pct:5.1f}%)',
+                flush=True,
+            )
 
     ordered['next_cell_rel_x'] = ordered['next_cell_center_x'] - ordered[x_col].astype(float)
     ordered['next_cell_rel_y'] = ordered['next_cell_center_y'] - ordered[y_col].astype(float)

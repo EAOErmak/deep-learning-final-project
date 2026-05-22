@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -262,6 +263,7 @@ def label_grid_navigation_dataframe(
     map_name: str,
     lookahead_ticks: int,
     min_target_distance: float,
+    progress_label: str | None = None,
 ) -> pd.DataFrame:
     if df.empty:
         return df.copy()
@@ -273,7 +275,18 @@ def label_grid_navigation_dataframe(
     group_columns = resolve_group_columns(df)
     labeled_groups: list[pd.DataFrame] = []
     if group_columns:
-        for _, group in df.groupby(group_columns, sort=False, dropna=False):
+        grouped = list(df.groupby(group_columns, sort=False, dropna=False))
+        total_groups = len(grouped)
+        for group_index, (_, group) in enumerate(grouped, start=1):
+            if progress_label is not None:
+                print(
+                    f'  {progress_label}: player-group {group_index}/{total_groups} '
+                    f'({len(group)} rows)',
+                    flush=True,
+                )
+            child_progress_label = None
+            if progress_label is not None:
+                child_progress_label = f'{progress_label} group {group_index}/{total_groups}'
             labeled_groups.append(
                 label_navigation_for_group(
                     group,
@@ -284,9 +297,12 @@ def label_grid_navigation_dataframe(
                     y_col=y_col,
                     z_col=z_col,
                     tick_column=tick_column,
+                    progress_label=child_progress_label,
                 )
             )
     else:
+        if progress_label is not None:
+            print(f'  {progress_label}: single group ({len(df)} rows)', flush=True)
         labeled_groups.append(
             label_navigation_for_group(
                 df,
@@ -297,6 +313,7 @@ def label_grid_navigation_dataframe(
                 y_col=y_col,
                 z_col=z_col,
                 tick_column=tick_column,
+                progress_label=progress_label,
             )
         )
     return pd.concat(labeled_groups, ignore_index=True)

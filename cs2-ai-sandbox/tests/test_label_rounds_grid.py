@@ -46,6 +46,12 @@ def make_round_df(round_number: int) -> pd.DataFrame:
 
 class LabelRoundsGridTests(unittest.TestCase):
     def test_label_rounds_grid_preserves_structure(self):
+        self.run_label_rounds_grid(workers='1')
+
+    def test_label_rounds_grid_parallel_preserves_structure(self):
+        self.run_label_rounds_grid(workers='2')
+
+    def run_label_rounds_grid(self, *, workers: str) -> None:
         tmp_root = PROJECT_ROOT / '.tmp_test_label_rounds_grid'
         shutil.rmtree(tmp_root, ignore_errors=True)
         tmp_root.mkdir(parents=True, exist_ok=True)
@@ -68,6 +74,7 @@ class LabelRoundsGridTests(unittest.TestCase):
                     '--map', 'de_dust2',
                     '--lookahead-ticks', '10',
                     '--min-target-distance', '75',
+                    '--workers', workers,
                 ]
                 result = label_rounds_grid.main()
             finally:
