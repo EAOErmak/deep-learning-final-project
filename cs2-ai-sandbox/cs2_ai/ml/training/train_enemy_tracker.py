@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,10 +14,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
+import pandas as pd
 from torch.utils.data import DataLoader, Dataset
 
 from cs2_ai.config import MAX_ENEMIES
 from cs2_ai.dataset.multi_demo_sequence_dataset import MultiDemoSequenceDataset, split_dataset_by_group
+from cs2_ai.dataset.parquet_loader import list_parquet_files, load_parquet, parquet_demo_name
+from cs2_ai.dataset.round_identity import make_round_uid
 from cs2_ai.features.enemy_tracker_features import (
     TRACKER_FEATURE_NAMES,
     EnemyTrackerFeatureExtractor,
@@ -42,6 +46,9 @@ from cs2_ai.ml.training.training_ledger import TrainingRoundLedger, collect_roun
 from cs2_ai.ml.training.shape_assertions import assert_shape, assert_temporal_features
 from cs2_ai.ml.utils.tensorboard_utils import close_summary_writer, create_summary_writer, log_scalar_dict, tensorboard_available
 from cs2_ai.ml.utils.torch_utils import build_dataloader_kwargs, configure_torch_runtime, get_device, set_seed, torch_available
+from cs2_ai.schemas.game_state import GameStateSequence, StateBundle
+from cs2_ai.schemas.training_samples import SequenceSample
+from cs2_ai.state.game_state_builder import GameStateBuilder
 
 if torch_available():
     import torch
@@ -73,6 +80,8 @@ TRACKER_METRIC_DICT_KEYS = {
     'last_seen_bucket_distance_error',
 }
 
+ROUND_COLUMN_CANDIDATES = ['round_number', 'total_rounds_played']
+
 
 @dataclass(slots=True)
 class TrackerTrainingBatch:
@@ -82,6 +91,207 @@ class TrackerTrainingBatch:
     age_bucket_ids: 'torch.Tensor'
     sample_ids: list[str]
     demo_names: list[str]
+
+
+@dataclass(frozen=True, slots=True)
+class SingleRoundSampleRef:
+    sample_id: str
+    demo_name: str
+    demo_dir: str
+    parquet_path: str
+    round_number: int
+    round_file: str
+    round_uid: str
+    dataset_subdir: str
+    perspective_steamid: int
+    tick_indices: tuple[int, ...]
+    target_tick: int
+
+
+class SingleRoundSequenceDataset(Dataset):
+    def __init__(
+        self,
+        round_file: Path,
+        *,
+        dataset_subdir: str,
+        seq_len: int,
+        stride: int,
+        alive_only: bool,
+    ):
+        self.round_file = Path(round_file)
+        self.dataset_subdir = dataset_subdir
+        self.seq_len = int(seq_len)
+        self.stride = int(stride)
+        self.alive_only = bool(alive_only)
+        self.demo_name = parquet_demo_name(self.round_file, dataset_subdir)
+        self.demo_dir = self.round_file.parent.parent.name
+        self.game_state_builder = GameStateBuilder()
+        self.samples: list[SingleRoundSampleRef] = []
+        self._bundle_cache: dict[tuple[int, int], StateBundle] = {}
+        self.round_tick_rows = self._load_round_tick_rows()
+        self.round_number = next(iter(self.round_tick_rows.keys()), None)
+        self._build_index()
+
+    @staticmethod
+    def build_sample_id(
+        demo_name: str,
+        round_number: int,
+        perspective_steamid: int,
+        tick_indices: tuple[int, ...],
+        target_tick: int,
+    ) -> str:
+        start_tick = int(tick_indices[0]) if tick_indices else -1
+        return f'{demo_name}::r{round_number}::p{perspective_steamid}::s{start_tick}::t{target_tick}'
+
+    def _resolve_round_column(self, columns: list[str] | pd.Index) -> str | None:
+        for column in ROUND_COLUMN_CANDIDATES:
+            if column in columns:
+                return column
+        return None
+
+    def _parse_round_number_from_path(self) -> int:
+        stem = self.round_file.stem
+        if stem.startswith('round_'):
+            return int(stem[len('round_'):])
+        raise ValueError(f'Cannot infer round number from filename: {self.round_file.name}')
+
+    def _load_round_tick_rows(self) -> dict[int, dict[int, pd.DataFrame]]:
+        tick_df = load_parquet(self.round_file)
+        round_column = self._resolve_round_column(tick_df.columns)
+        if round_column is None:
+            tick_df = tick_df.copy()
+            tick_df['round_number'] = self._parse_round_number_from_path()
+            round_column = 'round_number'
+        round_tick_rows: dict[int, dict[int, pd.DataFrame]] = {}
+        for round_number, round_df in tick_df.groupby(round_column, sort=True):
+            round_number_int = int(round_number)
+            round_tick_rows[round_number_int] = {
+                int(tick): rows.copy()
+                for tick, rows in round_df.groupby('tick', sort=True)
+            }
+        return round_tick_rows
+
+    def _build_tick_summary(self, round_df: pd.DataFrame) -> pd.DataFrame:
+        summary_rows: list[dict[str, object]] = []
+        for tick, tick_df in round_df.groupby('tick', sort=True):
+            steamids = pd.to_numeric(tick_df['steamid'], errors='coerce').dropna().astype('int64')
+            all_ids = sorted(set(int(value) for value in steamids.tolist()))
+            if 'is_alive' in tick_df.columns:
+                alive_mask = tick_df['is_alive'].fillna(False).astype(bool)
+                alive_ids_series = pd.to_numeric(tick_df.loc[alive_mask, 'steamid'], errors='coerce').dropna().astype('int64')
+                alive_ids = sorted(set(int(value) for value in alive_ids_series.tolist()))
+            else:
+                alive_ids = list(all_ids)
+            summary_rows.append({'tick': int(tick), 'all_ids': all_ids, 'alive_ids': alive_ids})
+        return pd.DataFrame(summary_rows)
+
+    def _build_index(self) -> None:
+        if not self.round_tick_rows:
+            return
+        round_number, tick_rows = next(iter(self.round_tick_rows.items()))
+        full_round_df = pd.concat(list(tick_rows.values()), ignore_index=True)
+        tick_summary = self._build_tick_summary(full_round_df)
+        ticks = tick_summary['tick'].tolist()
+        if len(ticks) <= self.seq_len:
+            return
+        tick_all_ids = {int(row.tick): set(row.all_ids) for row in tick_summary.itertuples(index=False)}
+        tick_alive_ids = {int(row.tick): set(row.alive_ids) for row in tick_summary.itertuples(index=False)}
+        round_uid = make_round_uid(self.demo_dir, int(round_number), self.round_file.name)
+        for start_idx in range(0, len(ticks) - self.seq_len, self.stride):
+            seq_ticks = tuple(int(tick) for tick in ticks[start_idx:start_idx + self.seq_len])
+            target_tick = int(ticks[start_idx + self.seq_len])
+            available_ids = set(tick_alive_ids[target_tick]) if self.alive_only else set(tick_all_ids[target_tick])
+            if not available_ids:
+                continue
+            for tick in seq_ticks:
+                available_ids &= tick_all_ids[tick]
+                if not available_ids:
+                    break
+            if not available_ids:
+                continue
+            for steamid in sorted(available_ids):
+                sample_id = self.build_sample_id(
+                    demo_name=self.demo_name,
+                    round_number=int(round_number),
+                    perspective_steamid=int(steamid),
+                    tick_indices=seq_ticks,
+                    target_tick=target_tick,
+                )
+                self.samples.append(
+                    SingleRoundSampleRef(
+                        sample_id=sample_id,
+                        demo_name=self.demo_name,
+                        demo_dir=self.demo_dir,
+                        parquet_path=str(self.round_file),
+                        round_number=int(round_number),
+                        round_file=self.round_file.name,
+                        round_uid=round_uid,
+                        dataset_subdir=self.dataset_subdir,
+                        perspective_steamid=int(steamid),
+                        tick_indices=seq_ticks,
+                        target_tick=target_tick,
+                    )
+                )
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def get_demo_names(self) -> list[str]:
+        return [self.demo_name]
+
+    def get_sample_metadata(self, idx: int) -> dict[str, object]:
+        sample = self.samples[idx]
+        return {
+            'sample_id': sample.sample_id,
+            'demo_name': sample.demo_name,
+            'demo_dir': sample.demo_dir,
+            'parquet_path': sample.parquet_path,
+            'source_file': sample.parquet_path,
+            'round_file': sample.round_file,
+            'source_round_file': sample.round_file,
+            'round_uid': sample.round_uid,
+            'round_number': sample.round_number,
+            'dataset_subdir': sample.dataset_subdir,
+            'perspective_steamid': sample.perspective_steamid,
+            'tick_indices': sample.tick_indices,
+            'target_tick': sample.target_tick,
+        }
+
+    def build_bundle_for_sample_tick(self, sample_metadata: dict[str, object], tick: int) -> StateBundle:
+        round_number = int(sample_metadata['round_number'])
+        perspective_steamid = int(sample_metadata['perspective_steamid'])
+        tick_value = int(tick)
+        cache_key = (tick_value, perspective_steamid)
+        cached_bundle = self._bundle_cache.get(cache_key)
+        if cached_bundle is not None:
+            return cached_bundle
+        bundle = self.game_state_builder.build_state_bundle_from_tick_rows(
+            self.round_tick_rows[round_number][tick_value],
+            perspective_steamid,
+        )
+        self._bundle_cache[cache_key] = bundle
+        return bundle
+
+    def build_truth_state_for_sample_tick(self, sample_metadata: dict[str, object], tick: int):
+        return self.build_bundle_for_sample_tick(sample_metadata, tick).truth_state
+
+    def __getitem__(self, idx: int) -> SequenceSample:
+        sample_index = self.get_sample_metadata(idx)
+        round_number = int(sample_index['round_number'])
+        perspective_steamid = int(sample_index['perspective_steamid'])
+        tick_indices = list(sample_index['tick_indices'])
+        target_tick = int(sample_index['target_tick'])
+        states = [self.build_bundle_for_sample_tick(sample_index, int(tick)).observed_state for tick in tick_indices]
+        target_state = self.build_bundle_for_sample_tick(sample_index, target_tick).observed_state
+        sequence = GameStateSequence(perspective_steamid=perspective_steamid, states=states)
+        return SequenceSample(
+            perspective_steamid=perspective_steamid,
+            start_tick=states[0].tick,
+            end_tick=states[-1].tick,
+            round_number=round_number,
+            sequence=sequence,
+            target_input=target_state.self_input,
+        )
 
 
 def get_base_dataset_and_index(dataset: Any, idx: int) -> tuple[Any, int]:
@@ -553,7 +763,7 @@ def save_checkpoint(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Train supervised enemy tracker from clean_play_ticks')
+    parser = argparse.ArgumentParser(description='Train supervised enemy tracker from rounds-dataset or clean_play_ticks')
     add_common_training_data_args(parser, project_root=PROJECT_ROOT, legacy_dataset_dir=True)
     parser.add_argument('--seq-len', type=int, default=16)
     parser.add_argument('--stride', type=int, default=4)
@@ -578,12 +788,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--tensorboard-run-name', type=str, default=None)
     parser.add_argument('--disable-tensorboard', action='store_true')
     parser.add_argument('--save-path', type=Path, default=PROJECT_ROOT / 'checkpoints' / 'enemy_tracker_bc.pt')
+    parser.add_argument('--stream-by-round', action='store_true')
+    parser.add_argument('--epochs-per-round', type=int, default=1)
+    parser.add_argument('--shuffle-rounds', action='store_true')
+    parser.add_argument('--max-rounds', type=int, default=None)
     return parser.parse_args()
+
+
+def resolve_dataset_root(args: argparse.Namespace) -> Path:
+    return resolve_shared_dataset_root(args, PROJECT_ROOT)
 
 
 def build_dataset(args: argparse.Namespace) -> EnemyTrackerSequenceTorchDataset:
     base_dataset = MultiDemoSequenceDataset(
-        dataset_dir=resolve_shared_dataset_root(args, PROJECT_ROOT),
+        dataset_dir=resolve_dataset_root(args),
         subdir=args.dataset_subdir,
         seq_len=args.seq_len,
         stride=args.stride,
@@ -598,6 +816,191 @@ def build_dataset(args: argparse.Namespace) -> EnemyTrackerSequenceTorchDataset:
     return EnemyTrackerSequenceTorchDataset(base_dataset, seq_len=args.seq_len, output_mode=args.output_mode)
 
 
+def build_single_round_dataset(args: argparse.Namespace, round_file: Path) -> EnemyTrackerSequenceTorchDataset:
+    base_dataset = SingleRoundSequenceDataset(
+        round_file=round_file,
+        dataset_subdir=args.dataset_subdir,
+        seq_len=args.seq_len,
+        stride=args.stride,
+        alive_only=args.alive_only,
+    )
+    return EnemyTrackerSequenceTorchDataset(base_dataset, seq_len=args.seq_len, output_mode=args.output_mode)
+
+
+def discover_round_training_files(args: argparse.Namespace) -> list[Path]:
+    if args.dataset_subdir != 'rounds-dataset':
+        raise ValueError('--stream-by-round currently supports only --dataset-subdir rounds-dataset')
+    return list_parquet_files(resolve_dataset_root(args), args.dataset_subdir, recursive=True)
+
+
+def build_round_uid_from_file(round_file: Path) -> str:
+    demo_dir = round_file.parent.parent.name
+    stem = round_file.stem
+    if not stem.startswith('round_'):
+        raise ValueError(f'Cannot infer round uid from filename: {round_file}')
+    return make_round_uid(demo_dir, int(stem[len("round_"):]), round_file.name)
+
+
+def run_round_stream_training(args: argparse.Namespace, device: str, runtime_info: dict[str, object]) -> int:
+    round_files = discover_round_training_files(args)
+    if not round_files:
+        print(f'No round parquet files found under {resolve_dataset_root(args) / args.dataset_subdir}.')
+        return 1
+
+    feature_extractor = EnemyTrackerFeatureExtractor(seq_len=args.seq_len)
+    feature_schema = feature_extractor.schema()
+    model = EnemyTrackerLSTM(
+        input_dim=feature_extractor.feature_dim(),
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        output_enemies=MAX_ENEMIES,
+        dropout=args.dropout,
+        output_mode=args.output_mode,
+    ).to(device)
+    trainer = EnemyTrackerTrainer(model=model, device=device, learning_rate=args.lr, log_interval=args.log_interval)
+    train_loader_kwargs = build_dataloader_kwargs(device, args.num_workers, is_training=True)
+    if int(train_loader_kwargs.get('num_workers', 0)) > 0:
+        print('Stream-by-round mode uses num_workers=0 to avoid multiprocessing startup overhead and worker failures.', flush=True)
+        train_loader_kwargs['num_workers'] = 0
+        train_loader_kwargs.pop('persistent_workers', None)
+        train_loader_kwargs.pop('prefetch_factor', None)
+    dataset_root = resolve_dataset_root(args)
+    dataset_label = build_dataset_label(args, PROJECT_ROOT)
+    run_id = resolve_run_id(args, 'enemy_tracker_stream')
+    ledger = TrainingRoundLedger.load(args.rounds_ledger_path)
+    trained_round_uids = (
+        ledger.read_trained_round_uids(
+            module_name='enemy_tracker',
+            model_name=f'enemy_tracker_lstm_{args.output_mode}',
+            checkpoint_path=str(args.save_path),
+            match_mode=args.ledger_match_mode,
+        )
+        if args.skip_trained_rounds else set()
+    )
+
+    writer = None
+    if args.disable_tensorboard:
+        print('TensorBoard: disabled')
+    elif tensorboard_available():
+        writer, run_dir = create_summary_writer(
+            runs_dir=args.runs_dir,
+            run_name=args.tensorboard_run_name,
+            default_prefix='enemy_tracker_stream',
+            save_path=args.save_path,
+            config={'args': vars(args), 'device': device, 'dataset_source': dataset_label, 'round_count': len(round_files)},
+        )
+        if run_dir is not None:
+            print(f'TensorBoard run: {run_dir}')
+    else:
+        print('TensorBoard: unavailable (install tensorboard to enable event logging)')
+
+    print('train_enemy_tracker.py --stream-by-round')
+    print(f'Device: {device}')
+    print(f'Dataset source: {dataset_label}')
+    print(f'Round files discovered: {len(round_files)}')
+    print(f'DataLoader workers: train={train_loader_kwargs["num_workers"]}')
+    print(f'CUDA tuning: matmul={runtime_info["matmul_precision"]} cudnn_benchmark={runtime_info["cudnn_benchmark"]} tf32={runtime_info["tf32"]}')
+    print(f'Feature dim: {feature_extractor.feature_dim()}')
+    print(f'Output mode: {args.output_mode}')
+    print(f'Save path: {args.save_path}')
+
+    rounds_completed = 0
+    cycle_index = 0
+    try:
+        while True:
+            cycle_index += 1
+            cycle_rounds = list(round_files)
+            if args.shuffle_rounds:
+                random.Random(args.seed + cycle_index).shuffle(cycle_rounds)
+            processed_in_cycle = 0
+            for round_path in cycle_rounds:
+                if args.max_rounds is not None and rounds_completed >= int(args.max_rounds):
+                    print(f'Reached --max-rounds={args.max_rounds}. Stopping.')
+                    return 0
+                round_uid = build_round_uid_from_file(round_path)
+                if args.skip_trained_rounds and round_uid in trained_round_uids:
+                    continue
+                print(f'Loading round: {round_path}')
+                dataset = build_single_round_dataset(args, round_path)
+                dataset_len = len(dataset)
+                if dataset_len == 0:
+                    print(f'Skipping round with zero tracker samples: {round_path}')
+                    continue
+                train_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_tracker_batch, **train_loader_kwargs)
+                print(
+                    f'Round {round_uid}: samples={dataset_len} epochs_per_round={args.epochs_per_round}',
+                    flush=True,
+                )
+                last_train_metrics: dict[str, object] | None = None
+                for local_epoch in range(1, int(args.epochs_per_round) + 1):
+                    global_epoch = rounds_completed * int(args.epochs_per_round) + local_epoch
+                    last_train_metrics = trainer.train_epoch(train_loader, epoch=global_epoch, writer=writer)
+                    print(
+                        f'Round {round_uid} | epoch {local_epoch}/{args.epochs_per_round} | '
+                        f'loss={last_train_metrics["loss"]:.4f} pos={last_train_metrics["pos_loss"]:.4f} '
+                        f'conf={last_train_metrics["conf_loss"]:.4f}',
+                        flush=True,
+                    )
+                if last_train_metrics is None:
+                    continue
+                log_scalar_dict(writer, 'round_train', last_train_metrics, rounds_completed + 1, ignored_keys=TRACKER_METRIC_DICT_KEYS)
+                if writer is not None:
+                    writer.flush()
+                round_usage = collect_round_usage(dataset)
+                checkpoint_val_metrics = {
+                    'loss': last_train_metrics['loss'],
+                    'pos_loss': last_train_metrics['pos_loss'],
+                    'conf_loss': last_train_metrics['conf_loss'],
+                    'mean_distance_error': last_train_metrics['mean_distance_error'],
+                    'top1_enemy_position_error': last_train_metrics['top1_enemy_position_error'],
+                    'confidence_precision': {},
+                    'confidence_recall': {},
+                    'confidence_f1': {},
+                    'last_seen_bucket_distance_error': {},
+                    'seen_sample_ids': set(),
+                    'per_demo_loss': {},
+                    'per_demo_seen_counts': {},
+                }
+                ledger.append_run_rounds(
+                    run_id=run_id,
+                    module_name='enemy_tracker',
+                    model_name=f'enemy_tracker_lstm_{args.output_mode}',
+                    checkpoint_path=str(args.save_path),
+                    dataset_dir=str(dataset_root),
+                    dataset_subdir=args.dataset_subdir,
+                    split_mode='round_stream',
+                    split='train',
+                    round_usage=round_usage,
+                )
+                trained_round_uids.add(round_uid)
+                save_checkpoint(
+                    args.save_path,
+                    model,
+                    args,
+                    last_train_metrics,
+                    checkpoint_val_metrics,
+                    dataset_label,
+                    feature_schema,
+                    dataset.base_dataset.get_demo_names(),
+                    train_round_usage=round_usage,
+                    val_round_usage=[],
+                    round_dataset_format='rounds',
+                )
+                rounds_completed += 1
+                processed_in_cycle += 1
+                print(f'Completed round {round_uid}. Total rounds trained: {rounds_completed}', flush=True)
+                del train_loader
+                del dataset
+            if args.skip_trained_rounds and processed_in_cycle == 0:
+                print('No remaining rounds to train after --skip-trained-rounds filtering.')
+                break
+    except KeyboardInterrupt:
+        print('Training stopped by user.', flush=True)
+    finally:
+        close_summary_writer(writer)
+    return 0
+
+
 def main() -> int:
     if not torch_available():
         print('PyTorch is not available. Install torch to use train_enemy_tracker.py')
@@ -607,13 +1010,15 @@ def main() -> int:
     set_seed(args.seed)
     device = get_device()
     runtime_info = configure_torch_runtime(device)
+    if args.stream_by_round:
+        return run_round_stream_training(args, device, runtime_info)
 
     try:
         print('Building dataset...')
         dataset = build_dataset(args)
     except FileNotFoundError as exc:
         print(exc)
-        print('No clean_play_ticks parquet found. Run parser/cleaner first.')
+        print(f'No parquet files found under {resolve_dataset_root(args) / args.dataset_subdir}. Run parser/cleaner first.')
         return 1
 
     dataset_len = len(dataset)
@@ -642,7 +1047,7 @@ def main() -> int:
     val_round_usage = collect_round_usage(val_dataset)
     ledger = TrainingRoundLedger.load(args.rounds_ledger_path)
     run_id = resolve_run_id(args, 'enemy_tracker')
-    dataset_root = resolve_shared_dataset_root(args, PROJECT_ROOT)
+    dataset_root = resolve_dataset_root(args)
     ledger.append_run_rounds(
         run_id=run_id,
         module_name='enemy_tracker',

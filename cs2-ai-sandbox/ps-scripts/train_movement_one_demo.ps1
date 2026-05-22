@@ -18,7 +18,7 @@ param (
 $ErrorActionPreference = 'Stop'
 
 Write-Host "Training movement model on one demo..." -ForegroundColor Cyan
-$datasetDir = & (Join-Path $PSScriptRoot 'prepare_one_demo_dataset.ps1') -DemoName $DemoName -RequireGridRounds
+$datasetDir = & (Join-Path $PSScriptRoot 'auxiliary\prepare_one_demo_dataset.ps1') -DemoName $DemoName -RequireGridRounds
 $demoBase = Split-Path $datasetDir -Leaf
 if ([string]::IsNullOrWhiteSpace($SavePath)) {
     $SavePath = "checkpoints\movement_$demoBase.pt"

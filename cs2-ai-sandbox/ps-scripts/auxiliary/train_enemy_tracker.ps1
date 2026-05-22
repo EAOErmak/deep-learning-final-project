@@ -11,6 +11,10 @@ param (
     [int]$MaxSamples = 0,
     [int]$MaxSamplesPerDemo = 0,
     [switch]$ShowIndexProgress,
+    [switch]$StreamByRound,
+    [int]$EpochsPerRound = 1,
+    [switch]$ShuffleRounds,
+    [int]$MaxRounds = 0,
     [string]$SavePath = "checkpoints\enemy_tracker_bc_v1.pt"
 )
 
@@ -43,6 +47,19 @@ if ($MaxSamplesPerDemo -gt 0) {
 
 if ($ShowIndexProgress) {
     $args += "--show-index-progress"
+}
+
+if ($StreamByRound) {
+    $args += "--stream-by-round"
+    $args += "--epochs-per-round"
+    $args += $EpochsPerRound
+    if ($ShuffleRounds) {
+        $args += "--shuffle-rounds"
+    }
+    if ($MaxRounds -gt 0) {
+        $args += "--max-rounds"
+        $args += $MaxRounds
+    }
 }
 
 python @args
