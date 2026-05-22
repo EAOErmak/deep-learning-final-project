@@ -372,20 +372,88 @@ class EnemyTrackerSequenceTorchDataset(Dataset):
     def output_len(self) -> int:
         return self.seq_len if self.output_mode == ENEMY_TRACKER_OUTPUT_MODE_EACH_TICK else 1
 
+    def _build_fast_target(self, ds, round_number, tick, perspective_steamid, roster_steamids):
+        import pandas as pd
+        try:
+            tick_rows = ds.round_tick_rows[round_number][tick]
+        except Exception:
+            return None, None
+            
+        if 'steamid' not in tick_rows.columns or 'team_num' not in tick_rows.columns or 'X' not in tick_rows.columns:
+            return None, None
+            
+        steamids = pd.to_numeric(tick_rows['steamid'], errors='coerce').fillna(-1).to_numpy(dtype=np.int64)
+        team_values = pd.to_numeric(tick_rows['team_num'], errors='coerce').to_numpy(dtype=np.float64)
+        
+        self_mask = steamids == perspective_steamid
+        if not np.any(self_mask):
+            return None, None
+            
+        self_team = team_values[self_mask][0]
+        if np.isnan(self_team):
+            return None, None
+            
+        if 'is_alive' in tick_rows.columns:
+            is_alive = tick_rows['is_alive'].fillna(False).astype(bool).to_numpy(dtype=bool)
+        else:
+            is_alive = np.ones(len(tick_rows), dtype=bool)
+            
+        x_vals = pd.to_numeric(tick_rows['X'], errors='coerce').fillna(0).to_numpy(dtype=np.float32)
+        y_vals = pd.to_numeric(tick_rows['Y'], errors='coerce').fillna(0).to_numpy(dtype=np.float32)
+        z_vals = pd.to_numeric(tick_rows['Z'], errors='coerce').fillna(0).to_numpy(dtype=np.float32)
+
+        target_pos = np.zeros((MAX_ENEMIES, 3), dtype=np.float32)
+        target_conf = np.zeros(MAX_ENEMIES, dtype=np.float32)
+        
+        roster_map = {steamid: i for i, steamid in enumerate(roster_steamids)}
+        
+        for i in range(len(steamids)):
+            steamid = steamids[i]
+            if steamid == -1: continue
+            
+            team = team_values[i]
+            if np.isnan(team) or team == self_team:
+                continue
+                
+            enemy_idx = roster_map.get(steamid)
+            if enemy_idx is not None:
+                target_pos[enemy_idx, 0] = x_vals[i]
+                target_pos[enemy_idx, 1] = y_vals[i]
+                target_pos[enemy_idx, 2] = z_vals[i]
+                if is_alive[i]:
+                    target_conf[enemy_idx] = 1.0
+                    
+        return target_pos, target_conf
+
     def __getitem__(self, idx: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, object]]:
+        import time
+        t_start = time.time()
         sequence_sample = self.base_dataset[idx]
+        t_base = time.time()
         features = self.feature_extractor.extract(sequence_sample.sequence).astype(np.float32)
+        t_feat = time.time()
+        
         assert_shape(features, (self.seq_len, self.feature_extractor.feature_dim()), 'enemy tracker sample features')
         ds, real_idx = get_base_dataset_and_index(self.base_dataset, idx)
         sample_metadata = ds.get_sample_metadata(real_idx)
         tick_indices = list(sample_metadata['tick_indices'])
         target_tick = int(sample_metadata['target_tick'])
+        perspective_steamid = int(sample_metadata['perspective_steamid'])
+        round_number = int(sample_metadata['round_number'])
         roster_steamids = build_enemy_roster(sequence_sample.sequence)
 
+        can_fast_path = type(ds).__name__ == 'SingleRoundSequenceDataset' and hasattr(ds, 'round_tick_rows')
+
         if self.output_mode == ENEMY_TRACKER_OUTPUT_MODE_TARGET_TICK:
-            target_state = ds.build_truth_state_for_sample_tick(sample_metadata, target_tick)
-            target_positions = build_enemy_position_target(target_state, roster_steamids)
-            target_confidences = build_enemy_confidence_target(target_state, roster_steamids)
+            tp, tc = None, None
+            if can_fast_path:
+                tp, tc = self._build_fast_target(ds, round_number, target_tick, perspective_steamid, roster_steamids)
+            if tp is None:
+                target_state = ds.build_truth_state_for_sample_tick(sample_metadata, target_tick)
+                tp = build_enemy_position_target(target_state, roster_steamids)
+                tc = build_enemy_confidence_target(target_state, roster_steamids)
+            target_positions = tp
+            target_confidences = tc
             age_bucket_ids = infer_last_seen_bucket_ids(features, self.output_mode)
             assert_shape(target_positions, (MAX_ENEMIES, 3), 'enemy tracker sample target positions')
             assert_shape(target_confidences, (MAX_ENEMIES,), 'enemy tracker sample target confidences')
@@ -395,13 +463,32 @@ class EnemyTrackerSequenceTorchDataset(Dataset):
             target_positions = np.zeros((len(target_ticks), MAX_ENEMIES, 3), dtype=np.float32)
             target_confidences = np.zeros((len(target_ticks), MAX_ENEMIES), dtype=np.float32)
             for t_idx, tick in enumerate(target_ticks):
-                target_state = ds.build_truth_state_for_sample_tick(sample_metadata, tick)
-                target_positions[t_idx] = build_enemy_position_target(target_state, roster_steamids)
-                target_confidences[t_idx] = build_enemy_confidence_target(target_state, roster_steamids)
+                tp, tc = None, None
+                if can_fast_path:
+                    tp, tc = self._build_fast_target(ds, round_number, tick, perspective_steamid, roster_steamids)
+                if tp is None:
+                    target_state = ds.build_truth_state_for_sample_tick(sample_metadata, tick)
+                    tp = build_enemy_position_target(target_state, roster_steamids)
+                    tc = build_enemy_confidence_target(target_state, roster_steamids)
+                target_positions[t_idx] = tp
+                target_confidences[t_idx] = tc
             age_bucket_ids = infer_last_seen_bucket_ids(features, self.output_mode)
             assert_shape(target_positions, (self.seq_len, MAX_ENEMIES, 3), 'enemy tracker sample target positions')
             assert_shape(target_confidences, (self.seq_len, MAX_ENEMIES), 'enemy tracker sample target confidences')
             assert_shape(age_bucket_ids, (self.seq_len, MAX_ENEMIES), 'enemy tracker sample age buckets')
+
+        t_targ = time.time()
+        if not hasattr(self, '_profile_count'):
+            self._profile_count = 0
+            self._profile_stats = {'base': 0.0, 'feat': 0.0, 'targ': 0.0}
+            
+        if self._profile_count < 50:
+            self._profile_stats['base'] += t_base - t_start
+            self._profile_stats['feat'] += t_feat - t_base
+            self._profile_stats['targ'] += t_targ - t_feat
+            self._profile_count += 1
+            if self._profile_count == 50:
+                print(f"EnemyTracker DataLoader Profiling (avg over 50): Base={self._profile_stats['base']/50:.4f}s, Feat={self._profile_stats['feat']/50:.4f}s, Targ={self._profile_stats['targ']/50:.4f}s", flush=True)
 
         meta = {
             'sample_id': str(sample_metadata['sample_id']),

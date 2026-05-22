@@ -12,6 +12,8 @@ param (
     [int]$LogEvery = 10,
     [int]$MaxSamples = 0,
     [int]$MaxSamplesPerDemo = 0,
+    [int]$MaxRounds = 0,
+    [switch]$SkipTrainedRounds,
     [switch]$ShowIndexProgress,
     [switch]$DisableBatchProgress,
     [string]$AimSavePath = "checkpoints\aim_10d_seq16.pt",
@@ -91,6 +93,8 @@ Invoke-TrainingStep -Title "[2/4] Training aim..." -Action {
     foreach ($entry in $commonArgs.GetEnumerator()) { $args[$entry.Key] = $entry.Value }
     $args["LogInterval"] = $LogInterval
     $args["SavePath"] = $AimSavePath
+    if ($MaxRounds -gt 0) { $args["MaxRounds"] = $MaxRounds }
+    if ($SkipTrainedRounds) { $args["SkipTrainedRounds"] = $true }
     & (Join-Path $PSScriptRoot 'train_aim.ps1') @args
 }
 

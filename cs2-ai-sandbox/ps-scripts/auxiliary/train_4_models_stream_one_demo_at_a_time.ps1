@@ -19,6 +19,8 @@ param (
     [int]$LogEvery = 10,
     [int]$MaxSamples = 0,
     [int]$MaxSamplesPerDemo = 20000,
+    [int]$MaxRounds = 0,
+    [switch]$SkipTrainedRounds,
     [switch]$ShowIndexProgress,
     [switch]$DisableBatchProgress,
     [string]$TrackerSavePath = "checkpoints\enemy_tracker_stream.pt",
@@ -120,6 +122,8 @@ foreach ($demoName in $demoNames) {
         if (Test-Path -LiteralPath $AimSavePath) { $args["ResumeFrom"] = $AimSavePath }
         if ($MaxSamples -gt 0) { $args["MaxSamples"] = $MaxSamples }
         if ($MaxSamplesPerDemo -gt 0) { $args["MaxSamplesPerDemo"] = $MaxSamplesPerDemo }
+        if ($MaxRounds -gt 0) { $args["MaxRounds"] = $MaxRounds }
+        if ($SkipTrainedRounds) { $args["SkipTrainedRounds"] = $true }
         if ($ShowIndexProgress) { $args["ShowIndexProgress"] = $true }
         & (Join-Path $PSScriptRoot 'train_aim_one_demo.ps1') @args
     }

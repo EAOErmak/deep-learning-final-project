@@ -5,6 +5,8 @@ param (
     [int]$NumWorkers = -1,
     [int]$MaxSamples = 0,
     [int]$MaxSamplesPerDemo = 0,
+    [int]$MaxRounds = 0,
+    [switch]$SkipTrainedRounds,
     [switch]$ShowIndexProgress,
     [switch]$ShowBuildProgress
 )
@@ -72,6 +74,12 @@ if ($MaxSamplesPerDemo -gt 0) {
 }
 if ($ShowIndexProgress) {
     $aimArgs.Add("ShowIndexProgress", $true)
+}
+if ($MaxRounds -gt 0) {
+    $aimArgs.Add("MaxRounds", $MaxRounds)
+}
+if ($SkipTrainedRounds) {
+    $aimArgs.Add("SkipTrainedRounds", $true)
 }
 & (Join-Path $PSScriptRoot 'train_aim.ps1') @aimArgs
 if ($LASTEXITCODE -ne 0) {

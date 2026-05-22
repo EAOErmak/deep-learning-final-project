@@ -71,6 +71,86 @@ except Exception:
     tqdm = None
 
 
+from collections import OrderedDict
+import time
+
+from cs2_ai.features.encoding import (
+    bool_to_float,
+    normalize_angle,
+    normalize_position,
+    normalize_velocity,
+    pad_or_trim_vector,
+    relative_position,
+)
+from cs2_ai.features.movement_features import JUMP_COLUMNS
+
+PROFILE_DATALOADER = False
+
+def log_memory(stage: str) -> None:
+    try:
+        import psutil
+        process = psutil.Process()
+        mem_info = process.memory_info()
+        rss_mb = mem_info.rss / (1024 * 1024)
+        cuda_str = ""
+        if 'torch' in globals() and torch is not None and torch.cuda.is_available():
+            cuda_mem = torch.cuda.memory_allocated() / (1024 * 1024)
+            cuda_max = torch.cuda.max_memory_allocated() / (1024 * 1024)
+            cuda_str = f" | CUDA: {cuda_mem:.2f} MB (max: {cuda_max:.2f} MB)"
+        print(f"[Memory Profile] {stage} | RSS: {rss_mb:.2f} MB{cuda_str}")
+    except Exception:
+        pass
+
+
+def safe_get(row, column: str, default: Any) -> Any:
+    if hasattr(row, 'index'):
+        if column not in row.index:
+            return default
+        val = row[column]
+    elif isinstance(row, dict):
+        if column not in row:
+            return default
+        val = row[column]
+    else:
+        if not hasattr(row, column):
+            return default
+        val = getattr(row, column)
+    if pd.isna(val):
+        return default
+    return val
+
+
+def get_safe_float(row, column: str, default: float = 0.0) -> float:
+    val = safe_get(row, column, default)
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
+def get_safe_bool(row, column: str, default: bool = False) -> bool:
+    val = safe_get(row, column, default)
+    if isinstance(val, str):
+        return val.strip().lower() in {"1", "true", "yes"}
+    return bool(val)
+
+
+def get_safe_int(row, column: str, default: int = 0) -> int:
+    val = safe_get(row, column, default)
+    if isinstance(val, bool):
+        return int(val)
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(val)
+    try:
+        return int(str(val).strip())
+    except (TypeError, ValueError):
+        try:
+            return int(float(val))
+        except (TypeError, ValueError):
+            return default
+
 MOVEMENT_MODEL_DECISION_DQN = 'decision_dqn'
 MOVEMENT_MODEL_GRU = 'movement_gru'
 
@@ -103,6 +183,7 @@ class MovementSequenceTorchDataset(Dataset):
         chunk_len: int = 8,
         use_grid_navigation_features: bool = False,
         movement_feature_mode: str = MOVEMENT_FEATURE_MODE_LEGACY,
+        profile_dataloader: bool = False,
     ):
         self.base_dataset = base_dataset
         self.feature_extractor = MovementFeatureExtractor(
@@ -117,6 +198,23 @@ class MovementSequenceTorchDataset(Dataset):
         if self.chunk_len <= 0:
             raise ValueError('chunk_len must be positive.')
         self.action_names = movement_action_names_for_target_mode(target_mode)
+        
+        self._player_tick_row_cache = OrderedDict()
+        self._profile_dataloader = profile_dataloader
+        self._profile_stats = {
+            'fast_path_count': 0,
+            'fallback_count': 0,
+            'fallback_reasons': {}
+        }
+        self._profile_samples_count = 0
+        self._profile_times = {
+            'metadata': 0.0,
+            'feature_extraction': 0.0,
+            'target_resolution': 0.0,
+            'target_building': 0.0,
+            'total': 0.0
+        }
+        
         self.valid_indices = self._build_valid_indices()
 
     def __len__(self) -> int:
@@ -138,13 +236,19 @@ class MovementSequenceTorchDataset(Dataset):
         return ds.get_sample_metadata(real_idx)
 
     def _build_valid_indices(self) -> list[int]:
+        import time
+        start_time = time.time()
         if self.target_mode == MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE:
-            return list(range(len(self.base_dataset)))
+            indices = list(range(len(self.base_dataset)))
+            print(f"MovementSequenceTorchDataset: valid indices built in {time.time() - start_time:.2f}s (all {len(indices)} samples)")
+            return indices
+            
         valid_indices: list[int] = []
         for idx in range(len(self.base_dataset)):
             sample_metadata = self._get_base_sample_metadata(idx)
             if self._resolve_target_ticks(sample_metadata) is not None:
                 valid_indices.append(idx)
+        print(f"MovementSequenceTorchDataset: valid indices built in {time.time() - start_time:.2f}s ({len(valid_indices)} valid out of {len(self.base_dataset)})")
         return valid_indices
 
     def _get_base_sample_metadata(self, idx: int) -> dict[str, object]:
@@ -168,18 +272,153 @@ class MovementSequenceTorchDataset(Dataset):
             tick_indices = [int(tick) for tick in sample_metadata['tick_indices']]
             return tick_indices[1:] + [int(sample_metadata['target_tick'])]
 
-        round_tick_rows = self._resolve_round_tick_rows(sample_metadata)
-        round_ticks = sorted(int(tick) for tick in round_tick_rows)
+        if not hasattr(self, '_round_tick_cache'):
+            self._round_tick_cache = {}
+            
+        round_uid = sample_metadata.get('round_uid')
+        source_file = sample_metadata.get('source_file') or sample_metadata.get('parquet_path')
+        if round_uid and source_file:
+            cache_key = (round_uid, str(source_file))
+        else:
+            demo_name = str(sample_metadata.get('demo_name', ''))
+            round_number = int(sample_metadata.get('round_number', 0))
+            cache_key = (demo_name, round_number)
+        
+        if cache_key not in self._round_tick_cache:
+            round_tick_rows = self._resolve_round_tick_rows(sample_metadata)
+            sorted_ticks = sorted(int(tick) for tick in round_tick_rows)
+            tick_to_idx = {tick: idx for idx, tick in enumerate(sorted_ticks)}
+            self._round_tick_cache[cache_key] = (sorted_ticks, tick_to_idx)
+            
+        sorted_ticks, tick_to_idx = self._round_tick_cache[cache_key]
         target_tick = int(sample_metadata['target_tick'])
-        if target_tick not in round_ticks:
+        
+        target_idx = tick_to_idx.get(target_tick)
+        if target_idx is None:
             return None
-        target_idx = round_ticks.index(target_tick)
-        target_ticks = round_ticks[target_idx:target_idx + self.chunk_len]
+            
+        target_ticks = sorted_ticks[target_idx:target_idx + self.chunk_len]
         if len(target_ticks) != self.chunk_len:
             return None
         return target_ticks
 
+    def _build_round_cache(self, round_tick_rows: dict[int, pd.DataFrame], perspective_steamid: int) -> dict[int, dict[str, Any]]:
+        tick_cache = {}
+        for tick, tick_df in round_tick_rows.items():
+            if tick_df.empty or "steamid" not in tick_df.columns:
+                raise ValueError(f"tick_df is empty or missing steamid at tick {tick}")
+            steamids = pd.to_numeric(tick_df["steamid"], errors="coerce")
+            self_mask = (steamids == int(perspective_steamid))
+            self_indices = tick_df.index[self_mask]
+            if len(self_indices) == 0:
+                raise ValueError(f"Perspective player {perspective_steamid} not found on tick {tick}")
+                
+            self_row = tick_df.loc[self_indices[0]]
+            self_team = get_safe_int(self_row, "team_num", 0)
+            
+            self_pos = [get_safe_float(self_row, "X"), get_safe_float(self_row, "Y"), get_safe_float(self_row, "Z")]
+            self_vel = [get_safe_float(self_row, "velocity_X"), get_safe_float(self_row, "velocity_Y"), get_safe_float(self_row, "velocity_Z")]
+            self_yaw = get_safe_float(self_row, "yaw")
+            self_is_walking = get_safe_bool(self_row, "is_walking")
+            self_is_airborne = get_safe_bool(self_row, "is_airborne")
+            self_ducking = get_safe_bool(self_row, "ducking")
+            
+            teammates = []
+            for row_idx, row in tick_df.iterrows():
+                row_steamid = get_safe_int(row, "steamid", 0)
+                if row_steamid == int(perspective_steamid):
+                    continue
+                row_team = get_safe_int(row, "team_num", 0)
+                if row_team == self_team:
+                    teammate_pos = [get_safe_float(row, "X"), get_safe_float(row, "Y"), get_safe_float(row, "Z")]
+                    teammates.append({
+                        'pos': teammate_pos
+                    })
+                    
+            forward = get_safe_bool(self_row, "move_forward", get_safe_bool(self_row, "FORWARD"))
+            back = get_safe_bool(self_row, "move_back", get_safe_bool(self_row, "BACK"))
+            left = get_safe_bool(self_row, "move_left", get_safe_bool(self_row, "LEFT"))
+            right = get_safe_bool(self_row, "move_right", get_safe_bool(self_row, "RIGHT"))
+            walk = get_safe_bool(self_row, "move_walk", get_safe_bool(self_row, "WALK", get_safe_bool(self_row, "is_walking")))
+            crouch = get_safe_bool(self_row, "move_crouch", get_safe_bool(self_row, "ducking"))
+            
+            jump = 0.0
+            if "move_jump" in self_row.index and not pd.isna(self_row["move_jump"]):
+                jump = bool_to_float(bool(self_row["move_jump"]))
+            else:
+                jump_found = False
+                for col in JUMP_COLUMNS:
+                    if col in self_row.index and not pd.isna(self_row[col]):
+                        jump = bool_to_float(bool(self_row[col]))
+                        jump_found = True
+                        break
+                if not jump_found:
+                    buttons_value = self_row.get("buttons")
+                    if isinstance(buttons_value, str) and "jump" in buttons_value.lower():
+                        jump = 1.0
+                        
+            tick_cache[int(tick)] = {
+                'self_pos': self_pos,
+                'self_vel': self_vel,
+                'self_yaw': self_yaw,
+                'self_is_walking': self_is_walking,
+                'self_is_airborne': self_is_airborne,
+                'self_ducking': self_ducking,
+                'teammates': teammates,
+                'target_actions': [
+                    bool_to_float(forward),
+                    bool_to_float(back),
+                    bool_to_float(left),
+                    bool_to_float(right),
+                    bool_to_float(walk),
+                    bool_to_float(crouch),
+                    float(np.clip(jump, 0.0, 1.0))
+                ]
+            }
+        return tick_cache
+
+    def _get_or_build_player_tick_row_cache(self, sample_metadata: dict[str, object]) -> dict[int, dict[str, Any]]:
+        round_uid = sample_metadata.get('round_uid')
+        source_file = sample_metadata.get('source_file') or sample_metadata.get('parquet_path')
+        perspective_steamid = int(sample_metadata['perspective_steamid'])
+        if round_uid and source_file:
+            cache_key = (round_uid, str(source_file), perspective_steamid)
+        else:
+            demo_name = str(sample_metadata.get('demo_name', ''))
+            round_number = int(sample_metadata.get('round_number', 0))
+            cache_key = (demo_name, round_number, perspective_steamid)
+            
+        if cache_key not in self._player_tick_row_cache:
+            while len(self._player_tick_row_cache) >= 3:
+                self._player_tick_row_cache.popitem(last=False)
+            round_tick_rows = self._resolve_round_tick_rows(sample_metadata)
+            self._player_tick_row_cache[cache_key] = self._build_round_cache(round_tick_rows, perspective_steamid)
+            if self._profile_dataloader:
+                print(f"[Profiling] Cached features for key: {cache_key}. Current cache size: {len(self._player_tick_row_cache)}")
+        return self._player_tick_row_cache[cache_key]
+
     def _build_target_for_ticks(self, sample_metadata: dict[str, object], target_ticks: list[int]) -> np.ndarray:
+        is_legacy = (self.movement_feature_mode == MOVEMENT_FEATURE_MODE_LEGACY)
+        is_grid = self.use_grid_navigation_features
+        use_fast_path = is_legacy and not is_grid
+        
+        if use_fast_path:
+            try:
+                tick_cache = self._get_or_build_player_tick_row_cache(sample_metadata)
+                target_list = []
+                for tick in target_ticks:
+                    t_idx = int(tick)
+                    if t_idx not in tick_cache:
+                        raise KeyError(f"Target tick {t_idx} not found in round cache")
+                    actions = tick_cache[t_idx]['target_actions']
+                    if self.target_mode == MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE:
+                        target_list.append(actions[:6])
+                    else:
+                        target_list.append(actions)
+                return np.array(target_list, dtype=np.float32)
+            except Exception as e:
+                pass
+                
         round_tick_rows = self._resolve_round_tick_rows(sample_metadata)
         perspective_steamid = int(sample_metadata['perspective_steamid'])
         if self.target_mode == MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE:
@@ -193,16 +432,149 @@ class MovementSequenceTorchDataset(Dataset):
             target[t_idx] = build_movement_action_chunk_target_from_tick_rows(round_tick_rows[int(tick)], perspective_steamid)
         return target
 
+    def _record_fallback(self, reason: str):
+        self._profile_stats['fallback_count'] += 1
+        self._profile_stats['fallback_reasons'][reason] = self._profile_stats['fallback_reasons'].get(reason, 0) + 1
+
     def __getitem__(self, idx: int) -> tuple[np.ndarray, np.ndarray, dict[str, str]]:
+        is_legacy = (self.movement_feature_mode == MOVEMENT_FEATURE_MODE_LEGACY)
+        is_grid = self.use_grid_navigation_features
+        use_fast_path = is_legacy and not is_grid
+        
+        meta_time = 0.0
+        feat_time = 0.0
+        target_res_time = 0.0
+        target_build_time = 0.0
+        total_start = time.time() if self._profile_dataloader else 0.0
+        
+        meta_start = time.time() if self._profile_dataloader else 0.0
         base_idx = self.valid_indices[idx]
-        sequence_sample = self.base_dataset[base_idx]
         sample_metadata = self.get_sample_metadata(idx)
-        grid_navigation_frames = self._build_grid_navigation_frames(sample_metadata) if self.use_grid_navigation_features else None
-        features = self.feature_extractor.extract(sequence_sample.sequence, grid_navigation_frames=grid_navigation_frames)
-        target_ticks = self._resolve_target_ticks(sample_metadata)
-        if target_ticks is None:
-            raise ValueError(f'No valid future target chunk for sample {sample_metadata["sample_id"]}.')
-        target = self._build_target_for_ticks(sample_metadata, target_ticks)
+        if self._profile_dataloader:
+            meta_time = time.time() - meta_start
+            
+        features = None
+        target = None
+        fallback_reason = None
+        
+        if use_fast_path:
+            try:
+                feat_start = time.time() if self._profile_dataloader else 0.0
+                tick_cache = self._get_or_build_player_tick_row_cache(sample_metadata)
+                
+                features_list = []
+                tick_indices = sample_metadata['tick_indices']
+                for tick in tick_indices:
+                    t_idx = int(tick)
+                    if t_idx not in tick_cache:
+                        raise KeyError(f"Tick {t_idx} not found in round cache")
+                    cached_tick = tick_cache[t_idx]
+                    
+                    self_pos = cached_tick['self_pos']
+                    f_pos = [self_pos[0] / 10000.0, self_pos[1] / 10000.0, self_pos[2] / 10000.0]
+                    f_vel = [cached_tick['self_vel'][0] / 1000.0, cached_tick['self_vel'][1] / 1000.0, cached_tick['self_vel'][2] / 1000.0]
+                    f_yaw = cached_tick['self_yaw'] / 180.0
+                    f_walk = 1.0 if cached_tick['self_is_walking'] else 0.0
+                    f_air = 1.0 if cached_tick['self_is_airborne'] else 0.0
+                    f_duck = 1.0 if cached_tick['self_ducking'] else 0.0
+                    
+                    teammates = cached_tick['teammates']
+                    teammate_features = []
+                    teammate_present = []
+                    for tm in teammates[:4]:
+                        tm_pos = tm['pos']
+                        teammate_features.append((tm_pos[0] - self_pos[0]) / 10000.0)
+                        teammate_features.append((tm_pos[1] - self_pos[1]) / 10000.0)
+                        teammate_features.append((tm_pos[2] - self_pos[2]) / 10000.0)
+                        teammate_present.append(1.0)
+                    while len(teammate_features) < 12:
+                        teammate_features.append(0.0)
+                    while len(teammate_present) < 4:
+                        teammate_present.append(0.0)
+                        
+                    f_target_rel = [-self_pos[0] / 10000.0, -self_pos[1] / 10000.0, -self_pos[2] / 10000.0]
+                    f_belief = [0.0] * 8
+                    
+                    vector = (
+                        f_pos +
+                        f_vel +
+                        [f_yaw] +
+                        [f_walk, f_air, f_duck] +
+                        teammate_features +
+                        teammate_present +
+                        f_target_rel +
+                        f_belief
+                    )
+                    features_list.append(vector)
+                
+                features = np.array(features_list, dtype=np.float32)
+                if self._profile_dataloader:
+                    feat_time = time.time() - feat_start
+                    
+                target_res_start = time.time() if self._profile_dataloader else 0.0
+                target_ticks = self._resolve_target_ticks(sample_metadata)
+                if target_ticks is None:
+                    raise ValueError(f'No valid future target chunk for sample {sample_metadata["sample_id"]}.')
+                if self._profile_dataloader:
+                    target_res_time = time.time() - target_res_start
+                    
+                target_build_start = time.time() if self._profile_dataloader else 0.0
+                target_list = []
+                for tick in target_ticks:
+                    t_idx = int(tick)
+                    if t_idx not in tick_cache:
+                        raise KeyError(f"Target tick {t_idx} not found in round cache")
+                    actions = tick_cache[t_idx]['target_actions']
+                    if self.target_mode == MOVEMENT_TARGET_MODE_NEXT_TICK_SEQUENCE:
+                        target_list.append(actions[:6])
+                    else:
+                        target_list.append(actions)
+                target = np.array(target_list, dtype=np.float32)
+                if self._profile_dataloader:
+                    target_build_time = time.time() - target_build_start
+                    
+                if self._profile_dataloader:
+                    sequence_sample_slow = self.base_dataset[base_idx]
+                    features_slow = self.feature_extractor.extract(sequence_sample_slow.sequence, grid_navigation_frames=None)
+                    target_slow = self._build_target_for_ticks(sample_metadata, target_ticks)
+                    np.testing.assert_allclose(features, features_slow, rtol=1e-6, atol=1e-6)
+                    np.testing.assert_allclose(target, target_slow, rtol=1e-6, atol=1e-6)
+                    
+                self._profile_stats['fast_path_count'] += 1
+                
+            except Exception as e:
+                fallback_reason = f"exception_{type(e).__name__}_{str(e)}"
+                self._record_fallback(fallback_reason)
+                features = None
+                target = None
+        else:
+            if is_grid:
+                fallback_reason = "grid_navigation_enabled"
+            elif not is_legacy:
+                fallback_reason = f"non_legacy_feature_mode_{self.movement_feature_mode}"
+            else:
+                fallback_reason = "other"
+            self._record_fallback(fallback_reason)
+            
+        if features is None or target is None:
+            feat_start = time.time() if self._profile_dataloader else 0.0
+            sequence_sample = self.base_dataset[base_idx]
+            grid_navigation_frames = self._build_grid_navigation_frames(sample_metadata) if self.use_grid_navigation_features else None
+            features = self.feature_extractor.extract(sequence_sample.sequence, grid_navigation_frames=grid_navigation_frames)
+            if self._profile_dataloader:
+                feat_time = time.time() - feat_start
+                
+            target_res_start = time.time() if self._profile_dataloader else 0.0
+            target_ticks = self._resolve_target_ticks(sample_metadata)
+            if target_ticks is None:
+                raise ValueError(f'No valid future target chunk for sample {sample_metadata["sample_id"]}.')
+            if self._profile_dataloader:
+                target_res_time = time.time() - target_res_start
+                
+            target_build_start = time.time() if self._profile_dataloader else 0.0
+            target = self._build_target_for_ticks(sample_metadata, target_ticks)
+            if self._profile_dataloader:
+                target_build_time = time.time() - target_build_start
 
         assert_shape(features, (len(sample_metadata['tick_indices']), self.feature_extractor.feature_dim()), 'movement sample features')
         assert_shape(target, (len(target_ticks), self.action_dim), 'movement sample targets')
@@ -213,6 +585,35 @@ class MovementSequenceTorchDataset(Dataset):
             'sample_id': str(sample_metadata['sample_id']),
             'demo_name': str(sample_metadata['demo_name']),
         }
+        
+        if self._profile_dataloader:
+            total_time = time.time() - total_start
+            self._profile_times['metadata'] += meta_time
+            self._profile_times['feature_extraction'] += feat_time
+            self._profile_times['target_resolution'] += target_res_time
+            self._profile_times['target_building'] += target_build_time
+            self._profile_times['total'] += total_time
+            self._profile_samples_count += 1
+            
+            if self._profile_samples_count == 256:
+                print("\n=== DataLoader Profiling Summary (first 256 samples) ===")
+                print(f"Fast path hits: {self._profile_stats['fast_path_count']}")
+                print(f"Fallback count: {self._profile_stats['fallback_count']}")
+                if self._profile_stats['fallback_count'] > 0:
+                    print("Fallback reasons:")
+                    sorted_reasons = sorted(self._profile_stats['fallback_reasons'].items(), key=lambda x: x[1], reverse=True)
+                    for reason, count in sorted_reasons[:5]:
+                        print(f"  - {reason}: {count}")
+                print(f"Total time spent in __getitem__: {self._profile_times['total']:.4f}s")
+                print(f"Average time per sample:")
+                print(f"  - Metadata resolution: {self._profile_times['metadata'] / 256 * 1000:.3f} ms")
+                print(f"  - Feature extraction:  {self._profile_times['feature_extraction'] / 256 * 1000:.3f} ms")
+                print(f"  - Target resolution:   {self._profile_times['target_resolution'] / 256 * 1000:.3f} ms")
+                print(f"  - Target building:     {self._profile_times['target_building'] / 256 * 1000:.3f} ms")
+                print(f"  - Total:               {self._profile_times['total'] / 256 * 1000:.3f} ms")
+                print(f"Active player row cache keys: {list(self._player_tick_row_cache.keys())}")
+                print("========================================================\n")
+                
         return features.astype(np.float32), target.astype(np.float32), meta
 
     def _build_grid_navigation_frames(self, sample_metadata: dict[str, object]) -> list[dict[str, float]]:
@@ -528,6 +929,19 @@ def collect_expected_demo_counts(dataset) -> dict[str, int]:
         source_dataset = dataset
 
     counts: dict[str, int] = {}
+    
+    if hasattr(source_dataset, 'samples'):
+        try:
+            sample_0 = source_dataset.samples[indices[0]] if indices else None
+            is_dict = isinstance(sample_0, dict)
+            for idx in indices:
+                sample = source_dataset.samples[idx]
+                demo_name = str(sample['demo_name'] if is_dict else getattr(sample, 'demo_name'))
+                counts[demo_name] = counts.get(demo_name, 0) + 1
+            return counts
+        except Exception:
+            pass
+
     for idx in indices:
         metadata = source_dataset.get_sample_metadata(int(idx))
         demo_name = str(metadata['demo_name'])
@@ -666,13 +1080,28 @@ def parse_pos_weight_values(raw_value: str | None, action_dim: int) -> np.ndarra
     return np.asarray(values, dtype=np.float32)
 
 
-def compute_action_ratios(dataset: MovementSequenceTorchDataset) -> dict[str, object]:
+def compute_action_ratios(
+    dataset: MovementSequenceTorchDataset,
+    sample_size: int = -1,
+    seed: int = 42,
+) -> dict[str, object]:
+    import time
+    import random
+    start_time = time.time()
+    
     if hasattr(dataset, 'indices') and hasattr(dataset, 'dataset'):
         source_dataset = dataset.dataset
         indices = [int(idx) for idx in dataset.indices]
     else:
         source_dataset = dataset
         indices = list(range(len(dataset)))
+        
+    sampled = False
+    if 0 < sample_size < len(indices):
+        rng = random.Random(seed)
+        indices = rng.sample(indices, sample_size)
+        sampled = True
+
     positives = np.zeros(source_dataset.action_dim, dtype=np.float64)
     total_steps = 0
     for idx in indices:
@@ -684,6 +1113,8 @@ def compute_action_ratios(dataset: MovementSequenceTorchDataset) -> dict[str, ob
         positives += targets.sum(axis=0)
         total_steps += int(targets.shape[0])
     ratios = positives / max(total_steps, 1)
+    
+    print(f"Movement action ratios computed in {time.time() - start_time:.2f}s (sampled={sampled}, checked={len(indices)})")
     return {
         'action_names': list(source_dataset.action_names),
         'positive_counts': positives.astype(np.int64).tolist(),
@@ -692,14 +1123,20 @@ def compute_action_ratios(dataset: MovementSequenceTorchDataset) -> dict[str, ob
     }
 
 
-def compute_pos_weight(dataset: MovementSequenceTorchDataset, mode: str, explicit_values: str | None) -> np.ndarray | None:
+def compute_pos_weight(
+    dataset: MovementSequenceTorchDataset,
+    mode: str,
+    explicit_values: str | None,
+    stats: dict[str, object] | None = None,
+) -> np.ndarray | None:
     action_dim = dataset.dataset.action_dim if hasattr(dataset, 'dataset') and hasattr(dataset, 'indices') else dataset.action_dim
     explicit = parse_pos_weight_values(explicit_values, action_dim)
     if explicit is not None:
         return explicit
     if mode == 'none':
         return None
-    stats = compute_action_ratios(dataset)
+    if stats is None:
+        stats = compute_action_ratios(dataset)
     ratios = np.asarray(stats['positive_ratios'], dtype=np.float64)
     pos_weight = np.ones(action_dim, dtype=np.float32)
     for idx, ratio in enumerate(ratios):
@@ -744,11 +1181,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--movement-pos-weight-mode', choices=['auto', 'none'], default='auto')
     parser.add_argument('--pos-weight-mode', dest='movement_pos_weight_mode', choices=['auto', 'none'], help=argparse.SUPPRESS)
     parser.add_argument('--pos-weight-values', type=str, default=None)
+    parser.add_argument('--movement-stats-sample-size', type=int, default=50000)
     parser.add_argument('--runs-dir', type=Path, default=PROJECT_ROOT / 'runs')
     parser.add_argument('--tensorboard-run-name', type=str, default=None)
     parser.add_argument('--disable-tensorboard', action='store_true')
     parser.add_argument('--save-path', type=Path, default=PROJECT_ROOT / 'checkpoints' / 'movement_bc.pt')
     parser.add_argument('--resume-from', type=Path, default=None)
+    parser.add_argument('--profile-dataloader', action='store_true', help='Enable DataLoader profiling')
     return parser.parse_args()
 
 
@@ -778,6 +1217,7 @@ def build_dataset(args: argparse.Namespace) -> MovementSequenceTorchDataset:
         chunk_len=args.chunk_len,
         use_grid_navigation_features=args.use_grid_navigation_features,
         movement_feature_mode=args.movement_feature_mode,
+        profile_dataloader=getattr(args, 'profile_dataloader', False),
     )
     print(f'Filtered movement samples: {len(dataset)}')
     return dataset
@@ -798,6 +1238,7 @@ def build_prebuilt_split_dataset(parquet_path: Path, args: argparse.Namespace) -
         chunk_len=args.chunk_len,
         use_grid_navigation_features=args.use_grid_navigation_features,
         movement_feature_mode=args.movement_feature_mode,
+        profile_dataloader=getattr(args, 'profile_dataloader', False),
     )
 
 
@@ -856,6 +1297,17 @@ def main() -> int:
     device = get_device()
     runtime_info = configure_torch_runtime(device)
 
+    first_batch_time = 0.0
+    epoch_time = 0.0
+
+    import psutil
+    try:
+        rss_before = psutil.Process().memory_info().rss / (1024 * 1024)
+    except Exception:
+        rss_before = 0.0
+
+    log_memory("before dataset build")
+
     try:
         print('Building dataset...')
         using_prebuilt_trainset = args.trainset_dir is not None or args.train_data is not None
@@ -864,6 +1316,7 @@ def main() -> int:
             dataset = build_prebuilt_split_dataset(train_path, args)
         else:
             dataset = build_dataset(args)
+        log_memory("after dataset build")
     except FileNotFoundError as exc:
         print(exc)
         print(f'No parquet files found under {resolve_dataset_root(args) / args.dataset_subdir}. Run parser/cleaner first.')
@@ -929,8 +1382,8 @@ def main() -> int:
     train_expected_counts = collect_expected_demo_counts(train_dataset)
     val_expected_counts = collect_expected_demo_counts(val_dataset)
     print('Computing movement target statistics...')
-    dataset_stats = compute_action_ratios(dataset)
-    train_pos_weight_np = compute_pos_weight(train_dataset, args.movement_pos_weight_mode, args.pos_weight_values) if len(train_dataset) > 0 else None
+    dataset_stats = compute_action_ratios(train_dataset, sample_size=args.movement_stats_sample_size, seed=args.seed)
+    train_pos_weight_np = compute_pos_weight(train_dataset, args.movement_pos_weight_mode, args.pos_weight_values, stats=dataset_stats) if len(train_dataset) > 0 else None
     print(f'Target mode: {args.target_mode}')
     print(f'Chunk len: {dataset.target_len}')
     print(f'Target shape: [batch, {dataset.target_len}, {dataset.action_dim}]')
@@ -970,7 +1423,12 @@ def main() -> int:
         movement_feature_mode=args.movement_feature_mode,
     )
     validate_feature_mode(feature_extractor)
+    print("Loading first batch...")
+    first_batch_start = time.time()
     first_batch = next(iter(train_loader))
+    first_batch_time = time.time() - first_batch_start
+    print(f"First batch loaded in {first_batch_time:.4f}s")
+    log_memory("after first batch")
     inspect_movement_batch(first_batch, dataset.action_names, feature_extractor.feature_dim())
     expected_target_len = args.chunk_len if args.target_mode == MOVEMENT_TARGET_MODE_ACTION_CHUNK else args.seq_len
     expected_action_dim = 7 if args.target_mode == MOVEMENT_TARGET_MODE_ACTION_CHUNK else 6
@@ -1061,7 +1519,10 @@ def main() -> int:
     try:
         for epoch in range(1, args.epochs + 1):
             print(f'Starting epoch {epoch}/{args.epochs}...')
+            epoch_start = time.time()
             train_metrics = trainer.train_epoch(train_loader, epoch_idx=epoch, total_epochs=args.epochs, writer=writer)
+            epoch_time = time.time() - epoch_start
+            log_memory(f"after epoch {epoch}")
             val_metrics = trainer.eval_epoch(val_loader, epoch_idx=epoch, total_epochs=args.epochs, writer=writer) if len(val_dataset) > 0 else {
                 'loss': train_metrics['loss'],
                 'binary_loss': train_metrics['binary_loss'],
@@ -1169,6 +1630,53 @@ def main() -> int:
     print(f'Best val loss: {best_val_loss:.4f}')
     print(f'Best train metrics: {{"loss": {best_train_metrics["loss"]:.4f}, "binary_loss": {best_train_metrics["binary_loss"]:.4f}}}')
     print(f'Best val metrics: {{"loss": {best_val_metrics["loss"]:.4f}, "binary_loss": {best_val_metrics["binary_loss"]:.4f}}}')
+
+    try:
+        rss_after = psutil.Process().memory_info().rss / (1024 * 1024)
+    except Exception:
+        rss_after = 0.0
+
+    def get_gpu_utilization() -> str:
+        try:
+            import subprocess
+            output = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+                stderr=subprocess.DEVNULL,
+                text=True
+            )
+            return f"{output.strip()}%"
+        except Exception:
+            return "N/A"
+
+    print("\n=== FINAL PROFILE REPORT ===")
+    if getattr(args, 'profile_dataloader', False):
+        samples_count = dataset._profile_samples_count
+        if samples_count > 0:
+            avg_feat = dataset._profile_times['feature_extraction'] / samples_count
+            avg_tgt = dataset._profile_times['target_building'] / samples_count
+            avg_total = dataset._profile_times['total'] / samples_count
+            print(f"fast_path_count: {dataset._profile_stats['fast_path_count']}")
+            print(f"fallback_count: {dataset._profile_stats['fallback_count']}")
+            print(f"avg feature time: {avg_feat * 1000:.3f} ms")
+            print(f"avg target time: {avg_tgt * 1000:.3f} ms")
+            print(f"avg total __getitem__ time: {avg_total * 1000:.3f} ms")
+        else:
+            print("No samples processed for profiling.")
+            print(f"fast_path_count: {dataset._profile_stats['fast_path_count']}")
+            print(f"fallback_count: {dataset._profile_stats['fallback_count']}")
+            print("avg feature time: N/A")
+            print("avg target time: N/A")
+            print("avg total __getitem__ time: N/A")
+    else:
+        print("DataLoader profiling not enabled (--profile-dataloader).")
+        
+    print(f"first batch time: {first_batch_time:.4f} s")
+    print(f"epoch time: {epoch_time:.4f} s")
+    print(f"RSS memory before: {rss_before:.2f} MB")
+    print(f"RSS memory after: {rss_after:.2f} MB")
+    print(f"GPU utilization: {get_gpu_utilization()}")
+    print("=============================\n")
+
     report = build_base_training_report(
         module_name='movement',
         model_name=args.model,
