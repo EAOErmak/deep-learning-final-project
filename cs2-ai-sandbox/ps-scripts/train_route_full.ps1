@@ -1,13 +1,16 @@
 .venv\Scripts\python.exe -m cs2_ai.ml.training.train_route `
   --train-manifest data/processed/rounds-dataset-grid-splits/train_rounds.txt `
   --val-manifest data/processed/rounds-dataset-grid-splits/val_rounds.txt `
+  --route-output-mode xyz `
+  --max-train-rounds 10 `
+  --max-val-rounds 2 `
   --shuffle-round-files `
-  --history-len 32 `
+  --round-file-seed 42 `
+  --samples-per-epoch 5000 `
+  --max-eval-samples 500 `
+  --history-len 20 `
   --min-subseq-len 2 `
-  --max-subseq-len 64 `
-  --samples-per-epoch 100000 `
-  --max-eval-samples 10000 `
-  --epochs 10 `
-  --batch-size 256 `
-  --lr 1e-3 `
-  --save-path checkpoints/route_gru_full.pt
+  --max-subseq-len 32 `
+  --epochs 10000 `
+  --batch-size 128 `
+  --save-path checkpoints/route_gru.pt

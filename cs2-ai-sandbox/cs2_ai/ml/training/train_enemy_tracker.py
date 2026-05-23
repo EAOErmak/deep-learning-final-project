@@ -879,6 +879,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--epochs-per-round', type=int, default=1)
     parser.add_argument('--shuffle-rounds', action='store_true')
     parser.add_argument('--max-rounds', type=int, default=None)
+    parser.add_argument(
+        '--random-single-round',
+        action='store_true',
+        help='In stream-by-round mode, pick one eligible round parquet at random and train only on that round.',
+    )
     return parser.parse_args()
 
 
@@ -928,6 +933,27 @@ def build_round_uid_from_file(round_file: Path) -> str:
     return make_round_uid(demo_dir, int(stem[len("round_"):]), round_file.name)
 
 
+def select_stream_round_files(
+    round_files: list[Path],
+    *,
+    seed: int,
+    random_single_round: bool,
+    skip_trained_rounds: bool,
+    trained_round_uids: set[str],
+) -> list[Path]:
+    eligible_rounds: list[Path] = []
+    for round_path in round_files:
+        round_uid = build_round_uid_from_file(round_path)
+        if skip_trained_rounds and round_uid in trained_round_uids:
+            continue
+        eligible_rounds.append(round_path)
+    if not random_single_round:
+        return eligible_rounds
+    if not eligible_rounds:
+        return []
+    return [random.Random(seed).choice(eligible_rounds)]
+
+
 def run_round_stream_training(args: argparse.Namespace, device: str, runtime_info: dict[str, object]) -> int:
     round_files = discover_round_training_files(args)
     if not round_files:
@@ -964,6 +990,19 @@ def run_round_stream_training(args: argparse.Namespace, device: str, runtime_inf
         )
         if args.skip_trained_rounds else set()
     )
+    selected_round_files = select_stream_round_files(
+        round_files,
+        seed=args.seed,
+        random_single_round=args.random_single_round,
+        skip_trained_rounds=args.skip_trained_rounds,
+        trained_round_uids=trained_round_uids,
+    )
+    if not selected_round_files:
+        if args.random_single_round:
+            print('No eligible round parquet files remain for --random-single-round.')
+        else:
+            print('No eligible round parquet files remain after filtering.')
+        return 1
 
     writer = None
     if args.disable_tensorboard:
@@ -985,6 +1024,7 @@ def run_round_stream_training(args: argparse.Namespace, device: str, runtime_inf
     print(f'Device: {device}')
     print(f'Dataset source: {dataset_label}')
     print(f'Round files discovered: {len(round_files)}')
+    print(f'Round files selected: {len(selected_round_files)}')
     print(f'DataLoader workers: train={train_loader_kwargs["num_workers"]}')
     print(f'CUDA tuning: matmul={runtime_info["matmul_precision"]} cudnn_benchmark={runtime_info["cudnn_benchmark"]} tf32={runtime_info["tf32"]}')
     print(f'Feature dim: {feature_extractor.feature_dim()}')
@@ -996,8 +1036,8 @@ def run_round_stream_training(args: argparse.Namespace, device: str, runtime_inf
     try:
         while True:
             cycle_index += 1
-            cycle_rounds = list(round_files)
-            if args.shuffle_rounds:
+            cycle_rounds = list(selected_round_files)
+            if args.shuffle_rounds and not args.random_single_round:
                 random.Random(args.seed + cycle_index).shuffle(cycle_rounds)
             processed_in_cycle = 0
             for round_path in cycle_rounds:
@@ -1080,6 +1120,8 @@ def run_round_stream_training(args: argparse.Namespace, device: str, runtime_inf
                 del dataset
             if args.skip_trained_rounds and processed_in_cycle == 0:
                 print('No remaining rounds to train after --skip-trained-rounds filtering.')
+                break
+            if args.random_single_round:
                 break
     except KeyboardInterrupt:
         print('Training stopped by user.', flush=True)

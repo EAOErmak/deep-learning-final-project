@@ -64,6 +64,13 @@ def parse_args() -> argparse.Namespace:
         action='store_true',
         help='Allow trained neural agents to run on basic GSI without spatial fields. Use only for debugging.',
     )
+    parser.add_argument('--route-checkpoint', type=str, default=None)
+    parser.add_argument('--enable-router', action='store_true')
+    parser.add_argument('--route-target-x', type=float, default=None)
+    parser.add_argument('--route-target-y', type=float, default=None)
+    parser.add_argument('--route-target-z', type=float, default=None)
+    parser.add_argument('--route-debug', action='store_true')
+    parser.add_argument('--route-drive-movement', action='store_true')
     return parser.parse_args()
 
 
@@ -119,6 +126,13 @@ def build_agent(state_source: str, agent_mode: str, seed: int, args: argparse.Na
             yolo_weights=args.yolo_weights,
             window_keywords=tuple(args.window_keyword) if args.window_keyword else ('counter-strike', 'cs2'),
             show_yolo_overlay=args.show_yolo_overlay,
+            route_checkpoint=args.route_checkpoint,
+            enable_router=args.enable_router,
+            route_target_x=args.route_target_x,
+            route_target_y=args.route_target_y,
+            route_target_z=args.route_target_z,
+            route_debug=args.route_debug,
+            route_drive_movement=args.route_drive_movement,
         )
     raise ValueError(f'Unsupported agent mode: {agent_mode}')
 

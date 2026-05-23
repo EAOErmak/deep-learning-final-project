@@ -14,6 +14,7 @@ param (
     [int]$EpochsPerRound = 1,
     [switch]$ShuffleRounds,
     [int]$MaxRounds = 0,
+    [switch]$RandomSingleRound,
     [string]$ResumeFrom = '',
     [string]$SavePath = ''
 )
@@ -46,6 +47,7 @@ if ($ShowIndexProgress) { $args += "--show-index-progress" }
 if ($StreamByRound) {
     $args += @("--stream-by-round", "--epochs-per-round", $EpochsPerRound)
     if ($ShuffleRounds) { $args += "--shuffle-rounds" }
+    if ($RandomSingleRound) { $args += "--random-single-round" }
     if ($MaxRounds -gt 0) { $args += @("--max-rounds", $MaxRounds) }
 }
 if (-not [string]::IsNullOrWhiteSpace($ResumeFrom)) { $args += @("--resume-from", $ResumeFrom) }

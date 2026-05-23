@@ -159,10 +159,11 @@ class MovementFeatureExtractor:
         decision: DecisionOutput | None = None,
         belief_state: BeliefStateData | None = None,
         grid_navigation_frames: list[dict[str, float]] | None = None,
+        route_target: list[float] | None = None,
     ) -> np.ndarray:
         frames = []
         for idx, state in enumerate(sequence.states):
-            base_vector = self._state_to_vector(state, decision=None, belief_state=None)
+            base_vector = self._state_to_vector(state, decision=None, belief_state=None, route_target=route_target)
             if self.use_grid_navigation_features:
                 nav_frame = grid_navigation_frames[idx] if grid_navigation_frames is not None and idx < len(grid_navigation_frames) else {}
                 base_vector.extend(self._grid_navigation_vector(nav_frame))
@@ -174,7 +175,7 @@ class MovementFeatureExtractor:
     def feature_dim(self) -> int:
         return len(self.feature_names())
 
-    def _state_to_vector(self, state: GameState, decision: DecisionOutput | None, belief_state: BeliefStateData | None) -> list[float]:
+    def _state_to_vector(self, state: GameState, decision: DecisionOutput | None, belief_state: BeliefStateData | None, route_target: list[float] | None = None) -> list[float]:
         if self.movement_feature_mode == MOVEMENT_FEATURE_MODE_SOLO_GRID:
             self_player = state.self_player
             return [
@@ -195,7 +196,7 @@ class MovementFeatureExtractor:
         for teammate in state.teammates[:MAX_TEAMMATES]:
             teammate_features.extend(normalize_position(v) for v in relative_position(self_player.position, teammate.position))
             teammate_present.append(1.0)
-        target_position = [0.0, 0.0, 0.0]
+        target_position = route_target if route_target is not None else [0.0, 0.0, 0.0]
         top_enemy_rel = [0.0, 0.0, 0.0]
         top_enemy_confidence = 0.0
         predicted_enemy_count = 0.0

@@ -114,7 +114,7 @@ class NeuralAIPipeline:
     def _empty_action_plan(self) -> ActionPlan:
         return ActionPlan(keyboard_inputs=[], mouse_inputs=[], duration_ms=100)
 
-    def step(self, game_state: GameState, vision_target=None):
+    def step(self, game_state: GameState, vision_target=None, route_target=None):
         self._debug_step_counter += 1
         self._push_game_state(game_state)
         self._log_readiness()
@@ -153,7 +153,7 @@ class NeuralAIPipeline:
         
         # 4. Movement
         movement_sequence = self._build_sequence('movement', game_state)
-        movement_features = torch.tensor(self.movement_extractor.extract(movement_sequence), dtype=torch.float32, device=self.device).unsqueeze(0)
+        movement_features = torch.tensor(self.movement_extractor.extract(movement_sequence, route_target=route_target), dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
             movement_output = self.movement_model(movement_features)
             movement_logits = self._normalize_movement_outputs(movement_output, movement_features).squeeze(0)

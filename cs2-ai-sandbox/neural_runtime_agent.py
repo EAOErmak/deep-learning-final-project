@@ -151,6 +151,13 @@ class FullNeuralRuntimeAgent:
         yolo_weights: str | None = None,
         window_keywords: tuple[str, ...] = ('counter-strike', 'cs2'),
         show_yolo_overlay: bool = False,
+        route_checkpoint: str | None = None,
+        enable_router: bool = False,
+        route_target_x: float | None = None,
+        route_target_y: float | None = None,
+        route_target_z: float | None = None,
+        route_debug: bool = False,
+        route_drive_movement: bool = False,
     ) -> None:
         if not torch_available():
             raise RuntimeError('PyTorch is not available.')
@@ -230,6 +237,34 @@ class FullNeuralRuntimeAgent:
             else:
                 self.logger.warning('YOLO vision disabled: aim runtime will receive vision_target=None and suppress live firing.')
             
+        self.route_model = None
+        self.route_history = None
+        self.last_route_pos = None
+        self.route_final_target = None
+        self.route_debug = route_debug
+        self.route_drive_movement = route_drive_movement
+        self.route_step_counter = 0
+
+        if enable_router:
+            if route_checkpoint and Path(route_checkpoint).exists():
+                from cs2_ai.runtime.route_runtime import RouteRuntimeModel
+                self.route_model = RouteRuntimeModel(route_checkpoint)
+                from collections import deque
+                self.route_history = deque(maxlen=self.route_model.history_len)
+                
+                # set target
+                if route_target_x is not None and route_target_y is not None and route_target_z is not None:
+                    self.route_final_target = [route_target_x, route_target_y, route_target_z]
+                else:
+                    self.route_final_target = [0.0, 0.0, 0.0]
+                    self.logger.warning('Router enabled but no valid target specified. Using [0,0,0].')
+                    
+                self.logger.info(f'Router enabled | drive_movement={self.route_drive_movement} | final_target={self.route_final_target}')
+                if self.route_drive_movement:
+                    self.logger.warning("route_drive_movement changes target_rel feature semantics; current movement checkpoint must be trained with route target features for reliable behavior.")
+            else:
+                self.logger.warning(f'Router enabled but checkpoint not found: {route_checkpoint}')
+
         self.logger.info('FullNeuralRuntimeAgent initialized | seq_lens=%s', seq_lens)
 
     def _load_checkpoint(self, checkpoint_path: Path, expected_model_type: str | set[str]) -> dict[str, Any]:
@@ -301,7 +336,55 @@ class FullNeuralRuntimeAgent:
         elif self.vision_module:
             self.logger.debug('Vision module exists but is not running; aim will use vision_target=None.')
             
-        action_plan = self.pipeline.step(ai_state, vision_target=vision_target)
+        route_target = None
+        if self.route_model is not None:
+            self.route_step_counter += 1
+            controlled_p = game_state.controlled_player
+            fallback_reason = "none"
+            predicted_next_xyz = None
+            snapped_next_xyz = None
+            
+            if controlled_p is not None and controlled_p.position is not None:
+                current_xyz = [float(controlled_p.position[i]) for i in range(3)]
+                
+                if self.last_route_pos is None:
+                    self.route_history.append(current_xyz)
+                    self.last_route_pos = current_xyz
+                else:
+                    import math
+                    dist = math.sqrt(sum((current_xyz[i] - self.last_route_pos[i])**2 for i in range(3)))
+                    if dist > 10.0:
+                        self.route_history.append(current_xyz)
+                        self.last_route_pos = current_xyz
+                
+                try:
+                    predicted_next_xyz = self.route_model.predict_next_xyz(
+                        list(self.route_history),
+                        current_xyz,
+                        self.route_final_target
+                    )
+                    from cs2_ai.runtime.route_runtime import snap_to_grid_xyz
+                    snapped_next_xyz = snap_to_grid_xyz(predicted_next_xyz)
+                    
+                    if self.route_drive_movement:
+                        route_target = snapped_next_xyz
+                except Exception as e:
+                    fallback_reason = f"predict_error: {e}"
+            else:
+                fallback_reason = "no current position"
+                
+            if self.route_debug and self.route_step_counter % 10 == 0:
+                self.logger.info(
+                    f"[Route Debug] current={current_xyz if controlled_p else None} "
+                    f"final_target={self.route_final_target} "
+                    f"hist_len={len(self.route_history)} "
+                    f"pred_next={predicted_next_xyz} "
+                    f"snapped={snapped_next_xyz} "
+                    f"drive_mov={self.route_drive_movement} "
+                    f"fallback={fallback_reason}"
+                )
+
+        action_plan = self.pipeline.step(ai_state, vision_target=vision_target, route_target=route_target)
         action = self.runtime_adapter.action_plan_to_action_dict(action_plan)
         
         self.logger.info('FullNeuralRuntimeAgent action dict: %s', action)

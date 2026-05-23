@@ -81,7 +81,8 @@ def test_route_grid_dataset(fake_dataset_root, tmp_path, monkeypatch):
         min_subseq_len=2,
         max_subseq_len=4,
         samples_per_epoch=10,
-        fixed_samples=False
+        fixed_samples=False,
+        route_output_mode="block_id"
     )
     
     assert len(dataset) == 10
@@ -110,7 +111,8 @@ def test_route_grid_dataset(fake_dataset_root, tmp_path, monkeypatch):
         history_len=4,
         min_subseq_len=4,
         max_subseq_len=6,
-        samples_per_epoch=5
+        samples_per_epoch=5,
+        route_output_mode="block_id"
     )
     
     # One trajectory valid
@@ -140,7 +142,8 @@ def test_route_grid_dataset(fake_dataset_root, tmp_path, monkeypatch):
         history_len=4,
         min_subseq_len=4,
         max_subseq_len=6,
-        fixed_samples=True
+        fixed_samples=True,
+        route_output_mode="block_id"
     )
     item1 = ds_fixed[0]
     item2 = ds_fixed[0]
@@ -168,9 +171,71 @@ def test_collate_function():
         }
     ]
     
-    hist, curr, targ, next_b, metas = collate_route_batch(batch)
-    assert hist.shape == (2, 4)
-    assert curr.shape == (2,)
-    assert targ.shape == (2,)
-    assert next_b.shape == (2,)
-    assert len(metas) == 2
+    out = collate_route_batch(batch)
+    assert out["history_blocks"].shape == (2, 4)
+    assert out["current_block"].shape == (2,)
+    assert out["target_block"].shape == (2,)
+    assert out["next_block"].shape == (2,)
+    assert len(out["metas"]) == 2
+
+def test_route_grid_dataset_xyz(tmp_path):
+    big_parquet_dir = tmp_path / "big_dataset_xyz" / "demo1" / "rounds"
+    big_parquet_dir.mkdir(parents=True)
+    df = pd.DataFrame({
+        "tick": list(range(100, 110)),
+        "player_steamid": [1]*10,
+        "block_id": [10, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+        "X": [0, 0, 1, 2, 3, 4, 5, 6, 7, 8],
+        "Y": [0, 0, 1, 2, 3, 4, 5, 6, 7, 8],
+        "Z": [0, 0, 1, 2, 3, 4, 5, 6, 7, 8]
+    })
+    df.to_parquet(big_parquet_dir / "round_0.parquet")
+    
+    big_manifest = tmp_path / "big_manifest_xyz.txt"
+    with open(big_manifest, "w") as f:
+        f.write(str(big_parquet_dir / "round_0.parquet") + "\n")
+        
+    ds = RouteGridSequenceDataset(
+        manifest_path=big_manifest,
+        history_len=4,
+        min_subseq_len=4,
+        max_subseq_len=6,
+        samples_per_epoch=5,
+        route_output_mode="xyz"
+    )
+    
+    item = ds[0]
+    assert "history_xyz" in item
+    assert "history_mask" in item
+    assert item["history_xyz"].shape == (4, 3)
+    assert item["current_xyz"].shape == (3,)
+    assert item["target_xyz"].shape == (3,)
+    assert item["next_xyz"].shape == (3,)
+    assert "current_block_id" in item["meta"]
+
+def test_collate_xyz():
+    batch = [
+        {
+            "history_xyz": torch.zeros((4, 3)),
+            "current_xyz": torch.zeros(3),
+            "target_xyz": torch.zeros(3),
+            "next_xyz": torch.zeros(3),
+            "history_mask": torch.zeros(4),
+            "meta": {"id": 1}
+        },
+        {
+            "history_xyz": torch.ones((4, 3)),
+            "current_xyz": torch.ones(3),
+            "target_xyz": torch.ones(3),
+            "next_xyz": torch.ones(3),
+            "history_mask": torch.ones(4),
+            "meta": {"id": 2}
+        }
+    ]
+    out = collate_route_batch(batch)
+    assert out["history_xyz"].shape == (2, 4, 3)
+    assert out["current_xyz"].shape == (2, 3)
+    assert out["target_xyz"].shape == (2, 3)
+    assert out["next_xyz"].shape == (2, 3)
+    assert out["history_mask"].shape == (2, 4)
+    assert len(out["metas"]) == 2

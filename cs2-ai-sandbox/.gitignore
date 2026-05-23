@@ -3,8 +3,9 @@ demos/
 .cache/
 __pycache__/
 *.py[cod]
-checkpoints/*
-!checkpoints/.gitkeep
+# Keep trained checkpoints in git.
+!checkpoints/
+!checkpoints/**
 artifacts/*
 !artifacts/.gitkeep
 data/*
